@@ -482,7 +482,7 @@ func realMain() error {
 	var byteLimit, corpusMax, ctxCap, maxPayload, batchBytes sizeFlag
 	corpusMax, ctxCap, maxPayload, batchBytes = 1<<30, 500_000, 1<<20, 3<<20
 	mix := "simple=0.50,chat=0.25,task=0.17,coding=0.08"
-	var startStr, outFile, endpoint string
+	var startStr, outFile, endpoint, compression string
 	flag.Uint64Var(&c.seed, "seed", 1, "seed for all randomness")
 	flag.IntVar(&traces, "traces", 0, "stop after N traces")
 	flag.Uint64Var(&c.spans, "spans", 0, "stop at the first trace boundary at or after N spans")
@@ -502,6 +502,7 @@ func realMain() error {
 	flag.Float64Var(&c.rate, "rate", 0, "gRPC spans per second (0 = unlimited)")
 	flag.StringVar(&outFile, "out-file", "", "write length-prefixed OTLP requests to PATH")
 	flag.StringVar(&endpoint, "otlp-endpoint", "", "send batches to HOST:PORT over OTLP gRPC (insecure)")
+	flag.StringVar(&compression, "compression", "none", "compression of OTLP gRPC requests: none or gzip")
 	flag.Parse()
 
 	if n := b2i(traces > 0) + b2i(byteLimit > 0) + b2i(c.spans > 0); n != 1 {
@@ -535,7 +536,7 @@ func realMain() error {
 	}
 	var gs *grpcSink
 	if endpoint != "" {
-		if gs, err = newGRPCSink(endpoint, c.rate); err != nil {
+		if gs, err = newGRPCSink(endpoint, c.rate, compression); err != nil {
 			return err
 		}
 		c.sinks = append(c.sinks, gs)

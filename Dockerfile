@@ -1,4 +1,4 @@
-FROM rust:1.100.0-bookworm AS build
+FROM rust:1.100.0-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94 AS build
 # The repository's toolchain file asks for rustfmt and clippy, which a release
 # build does not need and would download.
 ENV RUSTUP_TOOLCHAIN=1.100.0
@@ -10,7 +10,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked -p nightswatchdb
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 RUN useradd --system --uid 10001 --home-dir /var/lib/nightswatchdb --shell /usr/sbin/nologin nwdb \
     && mkdir -p /var/lib/nightswatchdb \
     && chown nwdb /var/lib/nightswatchdb

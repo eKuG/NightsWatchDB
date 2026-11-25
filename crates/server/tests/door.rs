@@ -1,0 +1,569 @@
+//! The gRPC door at the protocol level: framing, compression claims, limits
+//! and timeouts. The client is a plain HTTP/2 client so that a test controls
+//! every byte of the call, which a gRPC library would not allow.
+
+use bytes::Bytes;
+use http::Request;
+use http_body_util::BodyExt;
+use hyper::body::{Body, Frame};
+use hyper::client::conn::http2::SendRequest;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use nwdb_server::{MAX_MESSAGE, Server, ServerOptions};
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use prost::Message;
+use std::convert::Infallible;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+use tokio::net::TcpStream as TokioTcp;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
+
+const OK: u8 = 0;
+const INVALID_ARGUMENT: u8 = 3;
+const DEADLINE_EXCEEDED: u8 = 4;
+const RESOURCE_EXHAUSTED: u8 = 8;
+const UNIMPLEMENTED: u8 = 12;
+
+// ---- client ----
+
+/// A request body fed from a channel: it ends when the sender is dropped.
+struct Feed(mpsc::UnboundedReceiver<Bytes>);
+
+impl Body for Feed {
+    type Data = Bytes;
+    type Error = Infallible;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        self.0.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b))))
+    }
+}
+
+async fn connect(addr: SocketAddr) -> SendRequest<Feed> {
+    let io = TokioIo::new(TokioTcp::connect(addr).await.unwrap());
+    let (send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .unwrap();
+    tokio::spawn(conn);
+    send
+}
+
+struct Reply {
+    http: u16,
+    code: u8,
+    message: String,
+    headers: http::HeaderMap,
+    body: Bytes,
+}
+
+/// A call in progress. Dropping `tx` ends the request stream.
+struct Call {
+    tx: Option<mpsc::UnboundedSender<Bytes>>,
+    reply: JoinHandle<Reply>,
+}
+
+impl Call {
+    fn end(&mut self) {
+        self.tx = None;
+    }
+
+    /// The reply, or a panic if there is none within `within`.
+    async fn reply(self, within: Duration) -> Reply {
+        tokio::time::timeout(within, self.reply)
+            .await
+            .expect("no reply in time")
+            .unwrap()
+    }
+}
+
+async fn call_with(
+    send: &mut SendRequest<Feed>,
+    path: &str,
+    content_type: &str,
+    encoding: Option<&str>,
+    chunks: Vec<Bytes>,
+) -> Call {
+    let (tx, rx) = mpsc::unbounded_channel();
+    for c in chunks {
+        tx.send(c).unwrap();
+    }
+    let mut req = Request::post(format!("http://localhost{path}"))
+        .header("content-type", content_type)
+        .header("te", "trailers");
+    if let Some(e) = encoding {
+        req = req.header("grpc-encoding", e);
+    }
+    send.ready().await.unwrap();
+    let fut = send.send_request(req.body(Feed(rx)).unwrap());
+    let reply = tokio::spawn(async move {
+        let resp = fut.await.unwrap();
+        let (parts, mut body) = resp.into_parts();
+        let mut data = Vec::new();
+        let mut trailers = None;
+        while let Some(frame) = body.frame().await {
+            let frame = frame.unwrap();
+            match frame.into_data() {
+                Ok(d) => data.extend_from_slice(&d),
+                Err(f) => trailers = f.into_trailers().ok(),
+            }
+        }
+        let status = |h: &http::HeaderMap| {
+            h.get("grpc-status")
+                .map(|v| v.to_str().unwrap().parse::<u8>().unwrap())
+        };
+        let code = status(&parts.headers)
+            .or_else(|| trailers.as_ref().and_then(status))
+            .expect("no grpc-status");
+        let message = parts
+            .headers
+            .get("grpc-message")
+            .map(|v| v.to_str().unwrap().to_owned())
+            .unwrap_or_default();
+        Reply {
+            http: parts.status.as_u16(),
+            code,
+            message,
+            headers: parts.headers,
+            body: Bytes::from(data),
+        }
+    });
+    Call {
+        tx: Some(tx),
+        reply,
+    }
+}
+
+/// An export call with the given encoding header and whole messages, ended.
+async fn export(send: &mut SendRequest<Feed>, encoding: Option<&str>, chunks: Vec<Bytes>) -> Reply {
+    let mut call = call_with(send, EXPORT, "application/grpc", encoding, chunks).await;
+    call.end();
+    call.reply(Duration::from_secs(20)).await
+}
+
+/// A gRPC message: flag, big-endian length, payload.
+fn message(compressed: bool, payload: &[u8]) -> Bytes {
+    let mut m = vec![u8::from(compressed)];
+    m.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    m.extend_from_slice(payload);
+    m.into()
+}
+
+// ---- payloads ----
+
+fn varint(mut v: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while v >= 0x80 {
+        out.push((v as u8 & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+    out
+}
+
+/// A valid request with no spans: one unknown field of `n` zero bytes.
+fn padding(n: usize) -> Vec<u8> {
+    let mut v = vec![0x7a];
+    v.extend(varint(n));
+    v.resize(v.len() + n, 0);
+    v
+}
+
+fn one_span(trace: u8) -> Vec<u8> {
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![trace; 16],
+                    span_id: vec![1; 8],
+                    name: "s".into(),
+                    start_time_unix_nano: 1_000,
+                    end_time_unix_nano: 2_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// A zstd frame with no content size in its header.
+fn zstd_unsized(data: &[u8]) -> Vec<u8> {
+    zstd::stream::encode_all(data, 3).unwrap()
+}
+
+fn set_gzip_claim(mut gz: Vec<u8>, claim: u32) -> Vec<u8> {
+    let n = gz.len();
+    gz[n - 4..].copy_from_slice(&claim.to_le_bytes());
+    gz
+}
+
+/// A zstd frame whose header says the content is `claim` bytes, followed by
+/// one run-length block of `run` bytes.
+fn zstd_with_claim(claim: u32, run: usize) -> Vec<u8> {
+    // Magic; single segment with a four byte content size.
+    let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0xa0];
+    f.extend_from_slice(&claim.to_le_bytes());
+    // Last block, run-length kind.
+    let h = 1u32 | 1 << 1 | (run as u32) << 3;
+    f.extend_from_slice(&h.to_le_bytes()[..3]);
+    f.push(0);
+    f
+}
+
+// ---- server fixtures ----
+
+fn opts(dir: &Path) -> ServerOptions {
+    let mut o = ServerOptions::new(dir);
+    o.otlp_grpc_addr = "127.0.0.1:0".parse().unwrap();
+    o.api_addr = "127.0.0.1:0".parse().unwrap();
+    o
+}
+
+fn trace_status(api: SocketAddr, trace: u8) -> u16 {
+    let mut s = TcpStream::connect(api).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let id: String = (0..16).map(|_| format!("{trace:02x}")).collect();
+    write!(
+        s,
+        "GET /api/v1/traces/{id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    String::from_utf8_lossy(&raw)
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+// ---- tests ----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_good_export_is_http_200_with_an_empty_message_and_trailers() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let r = export(&mut c, None, vec![message(false, &one_span(0x11))]).await;
+    assert_eq!((r.http, r.code), (200, OK), "{}", r.message);
+    assert_eq!(r.headers["content-type"], "application/grpc");
+    assert_eq!(r.headers["grpc-accept-encoding"], "identity,gzip,zstd");
+    // One length-prefixed message of zero bytes.
+    assert_eq!(r.body.as_ref(), [0, 0, 0, 0, 0]);
+    assert_eq!(trace_status(server.api_addr(), 0x11), 200);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_message_is_refused_before_its_payload_is_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    // Only the five header bytes are sent, and the stream stays open.
+    let mut header = vec![0u8];
+    header.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
+    let call = call_with(
+        &mut c,
+        EXPORT,
+        "application/grpc",
+        None,
+        vec![header.into()],
+    )
+    .await;
+    let r = call.reply(Duration::from_secs(5)).await;
+    assert_eq!((r.http, r.code), (200, RESOURCE_EXHAUSTED), "{}", r.message);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_message_on_the_call_is_an_error_and_nothing_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+
+    // In separate chunks, and in one.
+    let (a, b) = (
+        message(false, &one_span(0x21)),
+        message(false, &one_span(0x22)),
+    );
+    let r = export(&mut c, None, vec![a.clone(), b.clone()]).await;
+    assert_eq!(r.code, INVALID_ARGUMENT, "{}", r.message);
+    assert!(r.message.contains("one%20message") || r.message.contains("one message"));
+    let both = [a, b].concat();
+    let r = export(&mut c, None, vec![both.into()]).await;
+    assert_eq!(r.code, INVALID_ARGUMENT);
+    // A single stray byte after the message is also refused.
+    let mut stray = message(false, &one_span(0x23)).to_vec();
+    stray.push(0);
+    let r = export(&mut c, None, vec![stray.into()]).await;
+    assert_eq!(r.code, INVALID_ARGUMENT);
+
+    for t in [0x21, 0x22, 0x23] {
+        assert_eq!(trace_status(server.api_addr(), t), 404, "{t:#x}");
+    }
+    assert_eq!(server.engine().stats().records_ingested, 0);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sender_that_stalls_is_timed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.stall_timeout = Duration::from_millis(300);
+    let server = Server::start(o).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+
+    // Half of the header.
+    let call = call_with(
+        &mut c,
+        EXPORT,
+        "application/grpc",
+        None,
+        vec![vec![0u8, 0].into()],
+    )
+    .await;
+    let r = call.reply(Duration::from_secs(5)).await;
+    assert_eq!(r.code, DEADLINE_EXCEEDED, "{}", r.message);
+
+    // Part of the payload.
+    let whole = message(false, &one_span(0x31));
+    let call = call_with(
+        &mut c,
+        EXPORT,
+        "application/grpc",
+        None,
+        vec![whole.slice(..20)],
+    )
+    .await;
+    let r = call.reply(Duration::from_secs(5)).await;
+    assert_eq!(r.code, DEADLINE_EXCEEDED);
+
+    // The whole message, but the stream is never ended.
+    let call = call_with(&mut c, EXPORT, "application/grpc", None, vec![whole]).await;
+    let r = call.reply(Duration::from_secs(5)).await;
+    assert_eq!(r.code, DEADLINE_EXCEEDED);
+    assert_eq!(trace_status(server.api_addr(), 0x31), 404);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compressed_messages_that_do_not_match_their_claim_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+
+    let raw = padding(1 << 20);
+    let good_gz = gzip(&raw);
+    let small = padding(1000);
+    let small_gz = gzip(&small);
+    let mut corrupt = good_gz.clone();
+    let mid = corrupt.len() / 2;
+    corrupt[mid] ^= 0xff;
+    let mut trailing = small_gz.clone();
+    trailing.extend_from_slice(&small_gz);
+
+    let cases: Vec<(&str, &str, Vec<u8>, u8)> = vec![
+        ("gzip", "good", good_gz.clone(), OK),
+        (
+            "gzip",
+            "expands past its claim",
+            set_gzip_claim(good_gz.clone(), 100),
+            INVALID_ARGUMENT,
+        ),
+        (
+            "gzip",
+            "claims more than it holds",
+            set_gzip_claim(small_gz.clone(), 5000),
+            INVALID_ARGUMENT,
+        ),
+        (
+            "gzip",
+            "claim over the limit",
+            set_gzip_claim(good_gz, 0xffff_ff00),
+            RESOURCE_EXHAUSTED,
+        ),
+        ("gzip", "corrupt", corrupt, INVALID_ARGUMENT),
+        ("gzip", "two members", trailing, INVALID_ARGUMENT),
+        (
+            "gzip",
+            "too short for a trailer",
+            vec![0x1f, 0x8b, 8],
+            INVALID_ARGUMENT,
+        ),
+        ("zstd", "no content size", zstd_unsized(&raw), OK),
+        (
+            "zstd",
+            "expands past its claim",
+            zstd_with_claim(1000, 100_000),
+            INVALID_ARGUMENT,
+        ),
+        (
+            "zstd",
+            "claim over the limit",
+            {
+                // Eight byte content size, 100 MiB.
+                let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
+                f.extend_from_slice(&(100u64 << 20).to_le_bytes());
+                f
+            },
+            RESOURCE_EXHAUSTED,
+        ),
+        (
+            "zstd",
+            "garbage after the frame",
+            {
+                let mut f = zstd_unsized(&small);
+                f.extend_from_slice(b"garbage");
+                f
+            },
+            INVALID_ARGUMENT,
+        ),
+        (
+            "zstd",
+            "not a frame",
+            b"definitely not zstd".to_vec(),
+            INVALID_ARGUMENT,
+        ),
+    ];
+    for (enc, what, payload, want) in cases {
+        let r = export(&mut c, Some(enc), vec![message(true, &payload)]).await;
+        assert_eq!(
+            (r.http, r.code),
+            (200, want),
+            "{enc}: {what}: {}",
+            r.message
+        );
+    }
+    assert_eq!(server.engine().stats().records_ingested, 0);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encodings_paths_and_content_types_are_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let m = message(false, &one_span(0x41));
+
+    let r = export(&mut c, Some("br"), vec![m.clone()]).await;
+    assert_eq!(r.code, UNIMPLEMENTED);
+    assert_eq!(r.headers["grpc-accept-encoding"], "identity,gzip,zstd");
+    // `identity` is the same as no encoding; a compressed flag without an
+    // encoding is not valid.
+    let r = export(&mut c, Some("identity"), vec![m.clone()]).await;
+    assert_eq!(r.code, OK, "{}", r.message);
+    let r = export(&mut c, None, vec![message(true, &one_span(0x42))]).await;
+    assert_eq!(r.code, INVALID_ARGUMENT);
+    // A flag byte that is neither 0 nor 1.
+    let mut bad = m.to_vec();
+    bad[0] = 2;
+    assert_eq!(
+        export(&mut c, None, vec![bad.into()]).await.code,
+        INVALID_ARGUMENT
+    );
+    // No message at all, and a message shorter than its length.
+    assert_eq!(export(&mut c, None, vec![]).await.code, INVALID_ARGUMENT);
+    assert_eq!(
+        export(&mut c, None, vec![m.slice(..m.len() - 1)])
+            .await
+            .code,
+        INVALID_ARGUMENT
+    );
+
+    let mut call = call_with(
+        &mut c,
+        "/nothing/here",
+        "application/grpc",
+        None,
+        vec![m.clone()],
+    )
+    .await;
+    call.end();
+    let r = call.reply(Duration::from_secs(5)).await;
+    assert_eq!((r.http, r.code), (200, UNIMPLEMENTED));
+    let mut call = call_with(&mut c, EXPORT, "application/json", None, vec![m]).await;
+    call.end();
+    let r = call.reply(Duration::from_secs(5)).await;
+    assert_eq!((r.http, r.code), (200, UNIMPLEMENTED));
+    server.shutdown().await.unwrap();
+}
+
+/// More streams than the door allows on one connection do not run at once;
+/// they wait, and are served when others end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_has_at_most_64_streams_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.stall_timeout = Duration::from_secs(60);
+    let server = Server::start(o).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let m = message(false, &one_span(0x51));
+
+    // 64 calls that are never ended hold every stream.
+    let mut open = Vec::new();
+    for _ in 0..64 {
+        open.push(call_with(&mut c, EXPORT, "application/grpc", None, vec![m.clone()]).await);
+    }
+    let mut c2 = c.clone();
+    let m2 = m.clone();
+    let mut extra = tokio::spawn(async move { export(&mut c2, None, vec![m2]).await });
+    let waited = tokio::time::timeout(Duration::from_millis(700), &mut extra).await;
+    assert!(waited.is_err(), "the 65th stream was served at once");
+    // Ending the others frees streams.
+    for call in &mut open {
+        call.end();
+    }
+    let r = tokio::time::timeout(Duration::from_secs(20), extra)
+        .await
+        .expect("the waiting stream was never served")
+        .unwrap();
+    assert_eq!(r.code, OK, "{}", r.message);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_returns_while_a_stalled_stream_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.drain_timeout = Duration::from_millis(500);
+    o.stall_timeout = Duration::from_secs(600);
+    let server = Server::start(o).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let whole = message(false, &one_span(0x61));
+    let _stalled = call_with(
+        &mut c,
+        EXPORT,
+        "application/grpc",
+        None,
+        vec![whole.slice(..12)],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let began = Instant::now();
+    tokio::time::timeout(Duration::from_secs(10), server.shutdown())
+        .await
+        .expect("shutdown did not return")
+        .unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
+}

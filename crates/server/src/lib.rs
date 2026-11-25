@@ -7,6 +7,7 @@
 mod api;
 pub mod config;
 mod door;
+mod serve;
 
 pub use door::MAX_MESSAGE;
 
@@ -14,11 +15,16 @@ use nwdb_core::{Error, RecordDecoder, Result};
 use nwdb_engine::{Engine, EngineOptions};
 use nwdb_otlp::{RECORD_TAG_OTLP_TRACES, TraceDecoder};
 use std::net::SocketAddr;
+use std::os::unix::fs::DirBuilderExt;
+
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
-use tonic::transport::Server as GrpcServer;
-use tonic::transport::server::TcpIncoming;
 
 /// Settings of [`Server::start`].
 pub struct ServerOptions {
@@ -29,8 +35,21 @@ pub struct ServerOptions {
     /// Listen address of the HTTP query API.
     pub api_addr: SocketAddr,
     /// Bytes of export requests that may be decoded or waiting for the log at
-    /// one time. Default 256 MiB.
+    /// one time. Default 256 MiB; the README says what it bounds.
     pub max_inflight_bytes: usize,
+    /// Host names the API answers to besides `localhost`, the loopback
+    /// addresses and the address it is bound to. Default none.
+    pub api_allowed_hosts: Vec<String>,
+    /// How long shutdown waits for open connections before it drops them.
+    /// Default 5 s.
+    pub drain_timeout: Duration,
+    /// How long a sender may send nothing in the middle of an export before
+    /// the call fails. Default 20 s.
+    pub stall_timeout: Duration,
+    /// Open connections the OTLP door serves at once. Default 1024.
+    pub otlp_max_connections: usize,
+    /// Open connections the API serves at once. Default 256.
+    pub api_max_connections: usize,
 }
 
 impl ServerOptions {
@@ -41,6 +60,11 @@ impl ServerOptions {
             otlp_grpc_addr: SocketAddr::from(([127, 0, 0, 1], 4317)),
             api_addr: SocketAddr::from(([127, 0, 0, 1], 4320)),
             max_inflight_bytes: 256 * 1024 * 1024,
+            api_allowed_hosts: Vec::new(),
+            drain_timeout: Duration::from_secs(5),
+            stall_timeout: Duration::from_secs(20),
+            otlp_max_connections: 1024,
+            api_max_connections: 256,
         }
     }
 }
@@ -52,8 +76,8 @@ pub struct Server {
     api_addr: SocketAddr,
     stop: watch::Sender<bool>,
     fatal: Arc<Notify>,
-    grpc: JoinHandle<Result<()>>,
-    api: JoinHandle<Result<()>>,
+    grpc: JoinHandle<()>,
+    api: JoinHandle<()>,
 }
 
 impl Server {
@@ -62,7 +86,14 @@ impl Server {
     pub async fn start(options: ServerOptions) -> Result<Server> {
         let limits = options.engine.batch_limits;
         let decoder = TraceDecoder::new(limits);
+        let data_dir = options.engine.data_dir.clone();
         let engine = tokio::task::spawn_blocking(move || {
+            // Trace content is private: a directory this process creates is
+            // for its own user only. An existing one is left as it is.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&data_dir)?;
             Engine::open(
                 options.engine,
                 vec![(
@@ -74,42 +105,54 @@ impl Server {
         .await
         .map_err(Error::other)??;
 
-        let budget = options.max_inflight_bytes.clamp(1, u32::MAX as usize);
+        // Half of the budget counts bytes read from the network, half the
+        // memory for expanding and decoding them (see the README).
+        let budget = options.max_inflight_bytes.clamp(2, u32::MAX as usize);
+        let (wire_cap, work_cap) = (budget / 2, budget - budget / 2);
         let fatal = Arc::new(Notify::new());
         let (stop, stopped) = watch::channel(false);
+        let drain = options.drain_timeout;
 
-        let incoming = TcpIncoming::bind(options.otlp_grpc_addr)?;
-        let otlp_grpc_addr = incoming.local_addr()?;
-        let door = door::Door(Arc::new(door::Shared {
+        let listener = TcpListener::bind(options.otlp_grpc_addr).await?;
+        let otlp_grpc_addr = listener.local_addr()?;
+        let shared = Arc::new(door::Shared {
             engine: engine.clone(),
             decoder,
-            budget: Semaphore::new(budget),
-            budget_cap: budget,
+            wire: Arc::new(Semaphore::new(wire_cap)),
+            wire_cap,
+            work: Arc::new(Semaphore::new(work_cap)),
+            work_cap,
             fatal: fatal.clone(),
-        }));
-        let mut rx = stopped.clone();
-        let grpc = tokio::spawn(async move {
-            GrpcServer::builder()
-                .add_service(door)
-                .serve_with_incoming_shutdown(incoming, async move {
-                    let _ = rx.wait_for(|stop| *stop).await;
-                })
-                .await
-                .map_err(Error::other)
+            stall: options.stall_timeout,
         });
+        let service = service_fn(move |req| door::handle(shared.clone(), req));
+        let h2 = serve::h2_builder();
+        let grpc = tokio::spawn(serve::run(
+            listener,
+            options.otlp_max_connections,
+            stopped.clone(),
+            drain,
+            move |sock, stop| {
+                let conn = h2.serve_connection(TokioIo::new(sock), service.clone());
+                serve::drive(conn, stop, |c| c.graceful_shutdown())
+            },
+        ));
 
-        let listener = tokio::net::TcpListener::bind(options.api_addr).await?;
+        let listener = TcpListener::bind(options.api_addr).await?;
         let api_addr = listener.local_addr()?;
-        let router = api::router(engine.clone(), fatal.clone());
-        let mut rx = stopped;
-        let api = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let _ = rx.wait_for(|stop| *stop).await;
-                })
-                .await
-                .map_err(Error::from)
-        });
+        let hosts = api::HostCheck::new(api_addr.ip(), &options.api_allowed_hosts);
+        let service = TowerToHyperService::new(api::router(engine.clone(), fatal.clone(), hosts));
+        let h1 = serve::h1_builder();
+        let api = tokio::spawn(serve::run(
+            listener,
+            options.api_max_connections,
+            stopped,
+            drain,
+            move |sock, stop| {
+                let conn = h1.serve_connection(TokioIo::new(sock), service.clone());
+                serve::drive(conn, stop, |c| c.graceful_shutdown())
+            },
+        ));
 
         Ok(Server {
             engine,
@@ -144,18 +187,16 @@ impl Server {
         self.fatal.notified().await;
     }
 
-    /// Stops accepting, lets requests in progress finish, then flushes and
-    /// closes the engine. Returns the first error met.
+    /// Stops accepting and asks open connections to finish. After
+    /// [`ServerOptions::drain_timeout`] the ones still open are dropped, so
+    /// this always returns. Then it flushes and closes the engine. Returns the
+    /// first error met.
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(true);
         let mut first = None;
         for task in [self.grpc, self.api] {
-            let result = match task.await {
-                Ok(r) => r,
-                Err(e) => Err(Error::other(e)),
-            };
-            if let Err(e) = result {
-                first.get_or_insert(e);
+            if let Err(e) = task.await {
+                first.get_or_insert(Error::other(e));
             }
         }
         let engine = self.engine;

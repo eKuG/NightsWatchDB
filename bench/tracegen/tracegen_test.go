@@ -221,6 +221,18 @@ func (s *countServer) Export(_ context.Context, r ptraceotlp.ExportRequest) (ptr
 }
 
 func TestGRPC(t *testing.T) {
+	for _, compression := range []string{"none", "gzip"} {
+		t.Run(compression, func(t *testing.T) { testGRPC(t, compression) })
+	}
+}
+
+func TestGRPCBadCompression(t *testing.T) {
+	if _, err := newGRPCSink("127.0.0.1:1", 0, "zstd"); err == nil {
+		t.Error("expected an error for an unknown compression")
+	}
+}
+
+func testGRPC(t *testing.T, compression string) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -230,7 +242,7 @@ func TestGRPC(t *testing.T) {
 	go srv.Serve(lis)
 	defer srv.Stop()
 
-	gs, err := newGRPCSink(lis.Addr().String(), 0)
+	gs, err := newGRPCSink(lis.Addr().String(), 0, compression)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -247,7 +259,7 @@ func TestGRPC(t *testing.T) {
 }
 
 func TestGRPCFailureIsLoud(t *testing.T) {
-	gs, err := newGRPCSink("127.0.0.1:1", 0)
+	gs, err := newGRPCSink("127.0.0.1:1", 0, "none")
 	if err != nil {
 		t.Fatal(err)
 	}

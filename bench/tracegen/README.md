@@ -35,6 +35,7 @@ Memory use is the loaded corpus (up to `--corpus-max-bytes`) plus roughly 100 MB
 | `--corpus-max-bytes` | 1GiB | Cap on corpus bytes loaded |
 | `--out-file PATH` | | Write framed OTLP requests (format below) |
 | `--otlp-endpoint HOST:PORT` | | Send the same batches over OTLP gRPC, insecure. Any export error or rejected span aborts the run |
+| `--compression` | none | Compression of the gRPC requests: `none` or `gzip` |
 | `--rate` | 0 | gRPC spans per second, 0 = unlimited |
 | `--seed` | 1 | Seed for everything |
 | `--mix` | `simple=0.50,chat=0.25,task=0.17,coding=0.08` | Profile weights |

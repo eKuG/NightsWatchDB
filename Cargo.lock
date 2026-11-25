@@ -730,6 +730,11 @@ dependencies = [
  "arrow-array",
  "axum",
  "bytes",
+ "flate2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "nwdb-core",
  "nwdb-engine",
  "nwdb-otlp",
@@ -740,6 +745,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "zstd",
 ]
 
 [[package]]
@@ -1321,7 +1327,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2cdfc673aabd30fe8fee92e65837b644c37c5d47f0f97ae6d5e0f1237d15e1b"
 dependencies = [
  "async-trait",
- "axum",
  "base64 0.22.1",
  "bytes",
  "flate2",
@@ -1334,7 +1339,6 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
- "socket2",
  "sync_wrapper",
  "tokio",
  "tokio-stream",

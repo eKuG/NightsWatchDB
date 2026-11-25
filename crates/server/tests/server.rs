@@ -116,7 +116,7 @@ fn http_blocking(addr: SocketAddr, method: &str, target: &str, accept: Option<&s
     let accept = accept.map_or(String::new(), |a| format!("Accept: {a}\r\n"));
     write!(
         s,
-        "{method} {target} HTTP/1.1\r\nHost: test\r\n{accept}Content-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{accept}Content-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
     let mut raw = Vec::new();
@@ -878,5 +878,200 @@ async fn many_concurrent_exporters() {
     );
     assert_eq!(trace_ids(api, "?limit=1000").await.len(), 160);
     assert_eq!(server.engine().stats().records_ingested, 160);
+    server.shutdown().await.unwrap();
+}
+
+// ---- host check, tokens, limits, shutdown ----
+
+/// A GET with the given `Host` header.
+fn http_host_blocking(addr: SocketAddr, host: &str, target: &str) -> Resp {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(
+        s,
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8(raw[..split].to_vec()).unwrap();
+    Resp {
+        status: head.split(' ').nth(1).unwrap().parse().unwrap(),
+        headers: head.to_lowercase(),
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+async fn http_host(addr: SocketAddr, host: &str, target: &str) -> Resp {
+    let (host, target) = (host.to_owned(), target.to_owned());
+    tokio::task::spawn_blocking(move || http_host_blocking(addr, &host, &target))
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_header_is_checked_on_a_loopback_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.api_allowed_hosts = vec!["traces.internal".into()];
+    let server = Server::start(o).await.unwrap();
+    let api = server.api_addr();
+    let port = api.port();
+
+    for host in [
+        "localhost".to_string(),
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        format!("traces.internal:{port}"),
+        "TRACES.INTERNAL".to_string(),
+    ] {
+        let r = http_host(api, &host, "/healthz").await;
+        assert_eq!(r.status, 200, "{host}");
+    }
+    for host in [
+        format!("evil.example:{port}"),
+        "evil.example".to_string(),
+        format!("10.1.2.3:{port}"),
+        "localhost.evil.example".to_string(),
+        String::new(),
+    ] {
+        let r = http_host(api, &host, "/healthz").await;
+        assert_eq!(r.status, 421, "{host:?}");
+        assert!(r.headers.contains("content-type: application/json"));
+        assert!(r.json()["error"].is_string());
+    }
+    // The refusal covers every path, existing or not.
+    assert_eq!(http_host(api, "evil.example", "/nothing").await.status, 421);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_check_is_off_on_a_non_loopback_bind_without_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.api_addr = "0.0.0.0:0".parse().unwrap();
+    let server = Server::start(o).await.unwrap();
+    let api = SocketAddr::from(([127, 0, 0, 1], server.api_addr().port()));
+    assert_eq!(
+        http_host(api, "anything.example", "/healthz").await.status,
+        200
+    );
+    server.shutdown().await.unwrap();
+    // With names configured it is on again.
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.api_addr = "0.0.0.0:0".parse().unwrap();
+    o.api_allowed_hosts = vec!["ok.example".into()];
+    let server = Server::start(o).await.unwrap();
+    let api = SocketAddr::from(([127, 0, 0, 1], server.api_addr().port()));
+    assert_eq!(http_host(api, "ok.example", "/healthz").await.status, 200);
+    assert_eq!(
+        http_host(api, "anything.example", "/healthz").await.status,
+        421
+    );
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tokens_are_ordered_limited_and_marked_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = started(dir.path()).await;
+    let ch = channel(server.otlp_grpc_addr()).await;
+    let start = now_ns() - 10_000_000_000;
+    // Spans per model: a 1, b 3, c 3, d 2.
+    let mut spans = Vec::new();
+    for (i, model) in ["a", "b", "b", "b", "c", "c", "c", "d", "d"]
+        .iter()
+        .enumerate()
+    {
+        let (id, at) = (i as u8 + 1, start + i as u64);
+        spans.push(llm_span(7, id, None, at, model, "chat", (1, 1), false));
+    }
+    export(&ch, request("s", spans), None).await.unwrap();
+    let api = server.api_addr();
+
+    let r = http(api, "/api/v1/tokens").await.json();
+    let names: Vec<&str> = r["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["b", "c", "d", "a"]);
+    assert!(r.get("truncated").is_none());
+
+    let r = http(api, "/api/v1/tokens?limit=2").await.json();
+    assert_eq!(r["models"].as_array().unwrap().len(), 2);
+    assert_eq!(r["models"][0]["model"], "b");
+    assert_eq!(r["models"][1]["model"], "c");
+    assert_eq!(r["truncated"], true);
+    // A limit that is exactly the number of rows cuts nothing.
+    let r = http(api, "/api/v1/tokens?limit=4").await.json();
+    assert!(r.get("truncated").is_none());
+    for bad in ["0", "10001", "x", "-1"] {
+        let r = http(api, &format!("/api/v1/tokens?limit={bad}")).await;
+        assert_eq!(r.status, 400, "{bad}");
+    }
+    assert_eq!(http(api, "/api/v1/tokens?limit=10000").await.status, 200);
+    server.shutdown().await.unwrap();
+}
+
+/// With room for one connection, a second one is not served until the first
+/// is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_over_the_limit_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.api_max_connections = 1;
+    let server = Server::start(o).await.unwrap();
+    let api = server.api_addr();
+
+    let first = TcpStream::connect(api).unwrap();
+    let waiting = tokio::spawn(http(api, "/healthz"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "served over the connection limit");
+    drop(first);
+    let r = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("not served after the first connection closed")
+        .unwrap();
+    assert_eq!(r.status, 200);
+    server.shutdown().await.unwrap();
+}
+
+/// A client that holds an API connection open in the middle of a request must
+/// not delay shutdown beyond the drain deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_returns_with_an_idle_api_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.drain_timeout = Duration::from_millis(500);
+    let server = Server::start(o).await.unwrap();
+    let mut idle = TcpStream::connect(server.api_addr()).unwrap();
+    idle.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    let began = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(10), server.shutdown())
+        .await
+        .expect("shutdown did not return")
+        .unwrap();
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
+    drop(idle);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_data_directory_that_is_created_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("fresh");
+    let server = started(&dir).await;
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
     server.shutdown().await.unwrap();
 }

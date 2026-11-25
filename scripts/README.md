@@ -18,6 +18,8 @@ CPUS=2 MEM=4g scripts/test.sh   # container limits (defaults: 4 CPUs, 6g)
 The source tree is mounted read-only at `/src`. Build output goes to the
 Docker volume `nwdb-target` and the cargo registry to `nwdb-cargo`, never to
 the host directory. To start from a cold cache, remove those two volumes.
+Engineers working at the same time set `NWDB_TARGET_VOLUME` (and `NWDB_CARGO_VOLUME`)
+to names of their own.
 
 The image has no rustfmt or clippy, so the script installs them at the start
 of each run (a few seconds).
@@ -26,7 +28,8 @@ of each run (a few seconds).
 
 Builds the server image (`Dockerfile`) and the load generator image
 (`bench/tracegen/Dockerfile`), starts the server in a container limited to 2
-CPUs and 1 GB, loads generated traces over OTLP gRPC and checks the data
+CPUs and 1 GB, loads generated traces over OTLP gRPC (half uncompressed, half gzip, from a
+real grpc-go client) and checks the data
 through the HTTP API: the span count must equal what the generator sent, and a
 listed trace must open with as many spans as its summary says. It repeats the
 checks after `kill -9` and after a `docker stop`, which must exit with code 0.

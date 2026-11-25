@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use tokio::signal::unix::{SignalKind, signal};
 
 fn main() -> ExitCode {
-    let args = std::env::args().skip(1);
-    let config = match nwdb_server::config::parse(args, |k| std::env::var(k).ok()) {
+    let args = std::env::args_os().skip(1);
+    let config = match nwdb_server::config::parse(args, |k| std::env::var_os(k)) {
         Ok(Command::Run(c)) => c,
         Ok(Command::Help) => {
             print!("{HELP}");
@@ -49,6 +49,7 @@ async fn run(config: Config) -> ExitCode {
     let mut options = ServerOptions::new(&config.data_dir);
     options.otlp_grpc_addr = config.otlp_grpc_addr;
     options.api_addr = config.api_addr;
+    options.api_allowed_hosts = config.api_allowed_hosts;
     eprintln!(
         "nightswatchdb {}: opening {}",
         env!("CARGO_PKG_VERSION"),
@@ -80,7 +81,16 @@ async fn run(config: Config) -> ExitCode {
         () = server.fatal() => { eprintln!("fatal engine error, shutting down"); true }
     };
     let mut failed = fatal;
-    if let Err(e) = server.shutdown().await {
+    // The write-ahead log makes a quick exit safe: what was acknowledged is
+    // replayed at the next start. A second signal asks for exactly that.
+    let shutdown = server.shutdown();
+    tokio::pin!(shutdown);
+    let result = tokio::select! {
+        r = &mut shutdown => r,
+        _ = term.recv() => quit_now("SIGTERM"),
+        _ = int.recv() => quit_now("SIGINT"),
+    };
+    if let Err(e) = result {
         eprintln!("error during shutdown: {e}");
         failed = true;
     }
@@ -90,4 +100,11 @@ async fn run(config: Config) -> ExitCode {
         eprintln!("shut down cleanly");
         ExitCode::SUCCESS
     }
+}
+
+/// Exits at once. Returning from `run` would wait for the engine's shutdown
+/// thread, which is what the sender of the signal does not want to wait for.
+fn quit_now(signal: &str) -> ! {
+    eprintln!("second {signal} received, exiting now");
+    std::process::exit(130)
 }

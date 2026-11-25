@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/mem"
 )
 
@@ -40,9 +41,18 @@ type grpcSink struct {
 	accepted uint64
 }
 
-func newGRPCSink(endpoint string, rate float64) (*grpcSink, error) {
+// newGRPCSink connects lazily. compression is "none" or "gzip".
+func newGRPCSink(endpoint string, rate float64, compression string) (*grpcSink, error) {
+	calls := []grpc.CallOption{grpc.MaxCallSendMsgSize(64 << 20)}
+	switch compression {
+	case "none":
+	case "gzip":
+		calls = append(calls, grpc.UseCompressor(gzip.Name))
+	default:
+		return nil, fmt.Errorf("--compression must be none or gzip, not %q", compression)
+	}
 	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(64<<20)))
+		grpc.WithDefaultCallOptions(calls...))
 	if err != nil {
 		return nil, err
 	}

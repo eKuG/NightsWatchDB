@@ -13,9 +13,25 @@ ephemeral ports) plus the binary `nightswatchdb`.
 
 There is **no authentication and no TLS**. Trace content includes prompts and
 model output. For that reason both listeners default to the loopback address
-`127.0.0.1`. The container image listens on `0.0.0.0` because a published port
-is the access control there; publish the ports only on a network you trust
-(for example `-p 127.0.0.1:4320:4320`).
+`127.0.0.1`.
+
+- **Host check.** A web page can make a browser send requests to
+  `127.0.0.1` under the page's own host name (DNS rebinding) and read the
+  answers. The API therefore refuses, with 421 and a JSON error, every request
+  whose `Host` header (port ignored) is not `localhost`, a loopback IP address,
+  the IP address the API is bound to, or a name from `--api-allowed-hosts`.
+  If the API is bound to a non-loopback address and no allowed hosts are
+  configured, the check is **off**: whoever exposed it did so on purpose, and
+  the server cannot know which names reach it. Set `--api-allowed-hosts`
+  whenever the API is reachable by a name other than an IP address.
+- **Docker.** The container image listens on `0.0.0.0` inside the container,
+  so the published port is the access control. Publish the ports on the
+  loopback address only: `-p 127.0.0.1:4317:4317 -p 127.0.0.1:4320:4320`.
+  `-p 4320:4320` publishes to every interface of the host. The host check does
+  not protect that case (see above); a network firewall or `-p 127.0.0.1:...`
+  does.
+- **Files.** A data directory that the server creates has mode 0700. An
+  existing directory is not changed.
 
 ## Running it
 
@@ -55,49 +71,108 @@ Both `--flag value` and `--flag=value` work.
 | `--data-dir` | `NWDB_DATA_DIR` | `./data` |
 | `--otlp-grpc-addr` | `NWDB_OTLP_GRPC_ADDR` | `127.0.0.1:4317` |
 | `--api-addr` | `NWDB_API_ADDR` | `127.0.0.1:4320` |
+| `--api-allowed-hosts` | `NWDB_API_ALLOWED_HOSTS` | none; comma-separated host names |
 | `--help` | | print the options |
 | `--version` | | print the version |
 
 Addresses are `IP:PORT`; host names are not resolved. The data directory is
-locked: a second process on the same directory fails to start.
+locked: a second process on the same directory fails to start. An argument or
+a `NWDB_*` variable that is not valid UTF-8 is a usage error (exit code 2).
 
 Logs are plain lines on standard error: the addresses, a recovery summary,
 shutdown and errors. Nothing is logged per request.
 
 ## The OTLP door
 
-Service `opentelemetry.proto.collector.trace.v1.TraceService`, method
-`Export`. Messages up to 64 MiB are accepted (or the log's record limit, if
-that is smaller).
+The door is a small HTTP/2 server of its own (no TLS, prior knowledge only),
+not a gRPC library: it reads the call itself so that every byte is counted
+before it is held. Service `opentelemetry.proto.collector.trace.v1.TraceService`,
+method `Export`. Messages up to 64 MiB are accepted (or the log's record
+limit, if that is smaller), uncompressed or after decompression.
 
-For each request:
+Limits, with their defaults:
 
-1. It takes its size from a budget of bytes in flight (256 MiB), so many large
-   concurrent requests cannot use unbounded memory. Requests wait for room.
-2. It is decoded on a blocking thread.
-3. A request with no spans gets a success reply and nothing is stored or
-   logged.
-4. Otherwise it is handed to the engine. **The reply is sent only after the
-   record is durable in the write-ahead log.**
-5. The reply is an empty `ExportTraceServiceResponse`.
+| Limit | Default |
+|---|---|
+| Open connections | 1024; more wait in the accept queue |
+| Concurrent streams per connection | 64 |
+| Header list size | 16 KiB |
+| Keepalive pings | every 30 s, a connection that does not answer within 10 s is closed |
+| Silence from a sender in the middle of a call | 20 s, then `DEADLINE_EXCEEDED` |
+| Budget (`max_inflight_bytes`) | 256 MiB, see below |
+| Zstd window | at most 8 MiB |
+
+For each call:
+
+1. `grpc-encoding` may be absent, `identity`, `gzip` or `zstd`. Replies always
+   carry `grpc-accept-encoding: identity,gzip,zstd`.
+2. The 5-byte message header is read. A length above the limit is refused at
+   once, before any payload is read.
+3. The length is taken from the budget, then the payload is read.
+4. The stream must end after the message. A second message, or any further
+   byte, is an error and nothing is stored.
+5. A compressed message states its size: the gzip trailer, or the zstd frame's
+   content size (a frame without one is assumed to be as large as the limit).
+   A size above the limit is refused. Decompression stops at the stated size;
+   more output, a different size, bytes after the compressed data, or corrupt
+   data is an error.
+6. The request is decoded on a blocking thread. A request with no spans gets a
+   success reply and nothing is stored.
+7. Otherwise it is handed to the engine. **The reply is sent only after the
+   record is durable in the write-ahead log.** The reply is HTTP 200 with
+   `content-type: application/grpc`, one message (an empty
+   `ExportTraceServiceResponse`) and the trailer `grpc-status: 0`.
+
+Errors are replies with HTTP 200 and `grpc-status` and `grpc-message` in the
+headers and no body:
 
 | Situation | gRPC status | Sender should |
 |---|---|---|
-| The request does not decode | `INVALID_ARGUMENT` | not retry |
-| Buffers full (`Unavailable`) | `UNAVAILABLE` | retry later |
+| Not `TraceService/Export`, not `application/grpc`, unknown `grpc-encoding` | `UNIMPLEMENTED` | not retry |
+| Request does not decode; bad framing; second message; bad or mismatched compressed data | `INVALID_ARGUMENT` | not retry |
+| Message, or its stated decompressed size, above the limit | `RESOURCE_EXHAUSTED` | not retry: it can never succeed |
+| Sender silent for too long in the middle of a call | `DEADLINE_EXCEEDED` | retry |
+| Buffers full (`Unavailable`), or shutting down | `UNAVAILABLE` | retry later |
 | Fatal engine error | `UNAVAILABLE` | retry; the process shuts down and exits with code 1 so a supervisor restarts it and recovery runs |
 | Anything else | `INTERNAL` | |
 
+### What the budget bounds
+
+The budget (256 MiB by default) is split in two halves of one pool each:
+
+- **Bytes read.** A message takes its length from the first half before its
+  payload is read, and keeps it until the reply is sent or the stream is gone.
+  Stalled senders therefore hold only what they have sent, and only up to the
+  budget. Before a message has its bytes, a stream holds at most one HTTP/2
+  frame (16 KiB), and a connection has a flow-control window of 128 KiB.
+- **Expansion and decoding.** Before decompression and decoding a message
+  takes 8 times its decompressed size (the stated size for compressed
+  messages) from the second half. Decoded batches are the main memory use, and
+  8 times is an estimate of them.
+
+Two pools, not one, so that a request never waits for more of a pool it holds
+a part of. A request that needs more than a whole pool is charged the whole
+pool: it runs alone instead of never. So the budget is a bound for requests
+that fit it; a single request can use more (up to about 64 MiB uncompressed,
+more while decoding). The engine's own buffers are not part of the budget.
+
 ## The HTTP API
 
-All responses are JSON, except `/healthz` and the protobuf form of a trace.
-Errors are `{"error": "<message>"}`: 400 for bad input (including an unknown
-parameter name), 404 for a missing trace or path, 405 for a method other than
-GET, 503 for an engine that is unavailable or fatal, 500 otherwise. Fields
-that are null are left out.
+The API speaks HTTP/1.1 only. It serves at most 256 connections at once (more
+wait in the accept queue), gives a client 10 s to send the request headers, and
+runs at most 64 requests at once (more wait).
 
-Time values are Unix nanoseconds. `from` is inclusive and `to` exclusive. By
-default `to` is now and `from` is one hour earlier.
+All responses are JSON, except `/healthz` and the protobuf form of a trace.
+Errors are always `{"error": "<message>"}`: 400 for bad input (including an
+unknown parameter name and percent-encoding that is wrong or not UTF-8), 404
+for a missing trace or path, 405 for a method other than GET, 421 for a `Host`
+that is not allowed (see Security), 503 for an engine that is unavailable or
+fatal, 500 otherwise. Fields that are null are left out. In percent-encoding
+`%` must be followed by exactly two hex digits.
+
+Time values are Unix nanoseconds, written as the unsigned numbers the sender
+sent. `from` is inclusive and `to` exclusive (both are signed 64-bit numbers).
+By default `to` is now and `from` is one hour earlier.
 
 **`GET /healthz`** returns `ok`.
 
@@ -136,8 +211,9 @@ doubles as numbers, with NaN and the infinities as the strings `"NaN"`,
 bytes as base64; an unset value as `null`. When a key occurs twice the last
 value wins.
 
-With `Accept: application/x-protobuf` the response is the trace as an OTLP
-`ExportTraceServiceRequest` instead:
+If `Accept` contains the media range `application/x-protobuf` with a quality
+other than 0, the response is the trace as an OTLP `ExportTraceServiceRequest`
+instead:
 
 ```sh
 curl -H 'Accept: application/x-protobuf' -o trace.pb http://127.0.0.1:4320/api/v1/traces/0af7651916cd43dd8448eb211c80319c
@@ -154,8 +230,10 @@ curl 'http://127.0.0.1:4320/api/v1/traces?service=agent&error=true&limit=5'
 #   "output_tokens":120,"models":["gpt-4o"],"session_id":"...","user_id":"..."}]}
 ```
 
-**`GET /api/v1/tokens?from=&to=&operation=`** sums token counts per request
-model over spans that start in the range.
+**`GET /api/v1/tokens?from=&to=&operation=&limit=`** sums token counts per
+request model over spans that start in the range. Rows are ordered by `count`
+descending, then by model name. `limit` is 1 to 10000 (default 1000); when rows
+were cut the reply has `"truncated": true`.
 
 ```sh
 curl 'http://127.0.0.1:4320/api/v1/tokens?operation=chat'
@@ -164,10 +242,16 @@ curl 'http://127.0.0.1:4320/api/v1/tokens?operation=chat'
 
 ## Shutdown
 
-On SIGTERM or SIGINT the server stops accepting connections, lets requests in
-progress finish, flushes the engine and exits with code 0. After a fatal engine
-error it does the same as far as it can and exits with code 1. After a crash or
-`kill -9` the next start replays the log; nothing that was acknowledged is lost.
+On SIGTERM or SIGINT the server stops accepting connections and asks every
+open connection to finish. It waits up to 5 s (`drain_timeout` in
+`ServerOptions`) for requests in progress, then drops whatever is left, so an
+open but stalled export stream or an idle client never delays shutdown. Then
+it flushes the engine and exits with code 0. After a fatal engine error it
+does the same and exits with code 1. A second SIGTERM or SIGINT exits at once
+with code 130; that is safe, because the next start replays the log. After a
+crash or `kill -9` the next start replays the log; nothing that was
+acknowledged is lost. Requests that were cut off by the drain deadline were not
+acknowledged, and their senders retry.
 
 ## What is missing
 

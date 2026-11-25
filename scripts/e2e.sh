@@ -70,18 +70,22 @@ docker build -q -t "$GEN_IMAGE" "$ROOT/bench/tracegen" >/dev/null
 docker network create "$NAME" >/dev/null
 docker volume create "$NAME" >/dev/null
 
-echo "== start and load $TRACES traces"
+echo "== start and load $TRACES traces (half uncompressed, half gzip)"
 start_server
 # The generator needs some text to slice. A small one is made inside its own
-# container.
+# container. The two halves use different seeds, so no trace is sent twice.
+HALF=$((TRACES / 2))
 docker run --rm --name "$NAME-gen" --network "$NAME" --entrypoint sh "$GEN_IMAGE" -c "
   mkdir /tmp/corpus
   base64 /dev/urandom | head -c 400000 > /tmp/corpus/text.txt
-  exec tracegen --corpus /tmp/corpus --traces $TRACES --seed 7 --window 1h \
-    --otlp-endpoint $SERVER:4317
+  for half in 'none 7' 'gzip 8'; do
+    set -- \$half
+    tracegen --corpus /tmp/corpus --traces $HALF --seed \$2 --window 1h \
+      --otlp-endpoint $SERVER:4317 --compression \$1 || exit 1
+  done
 " > "$OUT/gen.json"
-SPANS=$(grep -m 1 '^  "spans":' "$OUT/gen.json" | tr -dc '0-9')
-[ -n "$SPANS" ] && [ "$SPANS" -gt 0 ] || fail "cannot read the span count from the generator"
+SPANS=$(grep '^  "spans":' "$OUT/gen.json" | tr -dc '0-9\n' | awk '{s += $1} END {print s + 0}')
+[ "$(grep -c '^  "spans":' "$OUT/gen.json")" = 2 ] || fail "expected two generator summaries"
 echo "generator sent $SPANS spans"
 check "after load"
 

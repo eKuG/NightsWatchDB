@@ -23,11 +23,19 @@ nwdb-wal = { path = "../wal" }
 arrow-array.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
-tonic = { workspace = true, features = ["server", "router", "codegen", "transport", "gzip", "zstd"] }
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "service"] }
+http.workspace = true
+http-body-util.workspace = true
+flate2.workspace = true
+zstd.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
 axum = { workspace = true, features = ["http1", "tokio"] }
 
 [dev-dependencies]
+hyper = { workspace = true, features = ["client", "http2"] }
+# A real gRPC client for the tests.
+tonic = { workspace = true, features = ["channel", "codegen", "gzip", "zstd"] }
 tempfile.workspace = true
 prost.workspace = true
 opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
