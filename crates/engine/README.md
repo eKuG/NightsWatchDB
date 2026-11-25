@@ -201,13 +201,16 @@ from the log. A panic in the stage hook after the commit is ignored.
 
 ## Stored text
 
-`EngineStats::payload_logical_bytes` and `payload_stored_bytes` are the sums,
-over the live parts, of what the parts' rows refer to in their piece stores
-counting every use, and of what the piece stores take on disk, compressed. They
-come from the part's `PartMeta::payload`, which the manifest records, so they
-survive a restart. Text still in the buffer is in neither: it is stored once it
-is flushed. The distance between the two numbers is what sharing and
-compression save.
+`EngineStats::payload_logical_bytes`, `payload_unique_bytes` and
+`payload_stored_bytes` are the sums, over the live parts, of what the parts'
+rows refer to in their piece stores counting every use, of the distinct pieces
+(what is stored once, before compression), and of what the piece stores take on
+disk, compressed. They come from the part's `PartMeta::payload`, which the
+manifest records, so they survive a restart. Text still in the buffer is in
+none of them: it is stored once it is flushed. The distance between logical and
+unique is what sharing saves, and between unique and stored what compression
+saves; stored alone cannot tell the two apart, so a test of sharing asserts on
+unique.
 
 ## Stage hook
 

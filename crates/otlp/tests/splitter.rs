@@ -228,18 +228,16 @@ fn structured_message_values_are_under_their_content_key() {
 #[test]
 fn json_arrays_are_cut_into_their_elements() {
     let splitter = OtlpSplitter::default();
-    let json = r#" [ {"role":"user","content":"a, [b]"} ,
-        {"role":"assistant","content":"say \"hi\"\\"}, "plain", 42, null ] "#;
+    let json = r#" [ {"role":"user","content":"a, [b]  and more text to be long"} ,
+        {"role":"assistant","content":"say \"hi\" and then some more words\\"}, "a string of the right kind" ] "#;
     let a = attrs_col(&[s("gen_ai.input.messages", json)]);
     let got = cuts(&splitter, RawColumn::Attrs, &a);
     assert_eq!(
         cut_texts(&a, &got),
         [
-            r#"{"role":"user","content":"a, [b]"}"#,
-            r#"{"role":"assistant","content":"say \"hi\"\\"}"#,
-            r#""plain""#,
-            "42",
-            "null"
+            r#"{"role":"user","content":"a, [b]  and more text to be long"}"#,
+            r#"{"role":"assistant","content":"say \"hi\" and then some more words\\"}"#,
+            r#""a string of the right kind""#,
         ]
     );
     assert_rope_round_trip(&a, &got);
@@ -254,9 +252,60 @@ fn json_arrays_are_cut_into_their_elements() {
     let a = attrs_col(&[s("gen_ai.completion", "[]")]);
     assert!(cuts(&splitter, RawColumn::Attrs, &a).is_empty());
     // A long array under a plain key is cut into elements too.
-    let long = format!("[{}]", vec!["\"0123456789\""; 40].join(","));
+    let long = format!(
+        "[{}]",
+        vec![format!("\"{}\"", "0123456789".repeat(4)); 40].join(",")
+    );
     let a = attrs_col(&[s("plain", &long)]);
     assert_eq!(cuts(&splitter, RawColumn::Attrs, &a).len(), 40);
+}
+
+#[test]
+fn an_array_of_short_elements_is_one_piece() {
+    let splitter = OtlpSplitter::default();
+    // Numbers, short strings, nothing under 32 bytes on average: the whole
+    // text of the array, whitespace and brackets included, is the one cut.
+    let one = |text: &str, key: &str| {
+        let a = attrs_col(&[s(key, text)]);
+        let got = cuts(&splitter, RawColumn::Attrs, &a);
+        assert_eq!(cut_texts(&a, &got), [text], "{text}");
+        assert_rope_round_trip(&a, &got);
+    };
+    one(
+        " [ 1 ,\n2\t, true,null , -3.5e+2 ] ",
+        "gen_ai.input.messages",
+    );
+    one(r#"["a","b","c"]"#, "gen_ai.prompt");
+    let numbers = format!(
+        "[{}]",
+        (0..5_000)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    one(&numbers, "input.value");
+    // A long array of short elements under a plain key is cut too, as one.
+    let plain = format!("[{}]", vec!["\"0123456789\""; 40].join(","));
+    one(&plain, "plain");
+    // A single short element is an array of short elements.
+    one("[7]", "gen_ai.completion");
+
+    // The bound is on the average, and exact: 32 bytes an element is cut into
+    // elements, 31 is not.
+    let elements = |len: usize| {
+        let e = format!("\"{}\"", "x".repeat(len - 2));
+        format!("[{}]", vec![e; 6].join(","))
+    };
+    let at = |len: usize| {
+        let a = attrs_col(&[s("gen_ai.input.messages", &elements(len))]);
+        cuts(&splitter, RawColumn::Attrs, &a).len()
+    };
+    assert_eq!(at(31), 1);
+    assert_eq!(at(32), 6);
+    // One large element among small ones raises the average.
+    let mixed = format!("[1,2,3,\"{}\"]", "y".repeat(200));
+    let a = attrs_col(&[s("gen_ai.input.messages", &mixed)]);
+    assert_eq!(cuts(&splitter, RawColumn::Attrs, &a).len(), 4);
 }
 
 #[test]

@@ -69,20 +69,32 @@ fn traces_read_back_identical_before_a_flush_after_it_and_after_a_restart() {
     }
     let stats = e.stats();
     assert_eq!(
-        (stats.payload_logical_bytes, stats.payload_stored_bytes),
-        (0, 0)
+        (
+            stats.payload_logical_bytes,
+            stats.payload_unique_bytes,
+            stats.payload_stored_bytes
+        ),
+        (0, 0, 0)
     );
 
     e.flush().unwrap();
     let stats = e.stats();
     assert_eq!(stats.parts, 2);
     eprintln!(
-        "engine payload: logical {} stored {}",
-        stats.payload_logical_bytes, stats.payload_stored_bytes
+        "engine payload: logical {} unique {} stored {}",
+        stats.payload_logical_bytes, stats.payload_unique_bytes, stats.payload_stored_bytes
     );
     assert!(stats.payload_logical_bytes > 0);
+    // The saving is sharing: the distinct text is a fraction of what the rows
+    // refer to. Stored bytes alone would also fall under compression, which
+    // this text (random bytes) does not offer, so the assertion is on
+    // `unique`, and stored cannot be more than a little over it.
     assert!(
-        stats.payload_stored_bytes * 3 < stats.payload_logical_bytes,
+        stats.payload_unique_bytes * 3 < stats.payload_logical_bytes,
+        "{stats:?}"
+    );
+    assert!(
+        stats.payload_stored_bytes <= stats.payload_unique_bytes + stats.payload_unique_bytes / 8,
         "{stats:?}"
     );
     assert_eq!(read_all(&e, &all), before, "after the flush");
@@ -97,6 +109,7 @@ fn traces_read_back_identical_before_a_flush_after_it_and_after_a_restart() {
     let again = e.stats();
     assert_eq!(again.payload_logical_bytes, stats.payload_logical_bytes);
     assert_eq!(again.payload_stored_bytes, stats.payload_stored_bytes);
+    assert_eq!(again.payload_unique_bytes, stats.payload_unique_bytes);
     e.shutdown().unwrap();
 }
 
@@ -112,8 +125,12 @@ fn a_part_without_a_splitter_stores_nothing_out_of_line() {
     e.flush().unwrap();
     let stats = e.stats();
     assert_eq!(
-        (stats.payload_logical_bytes, stats.payload_stored_bytes),
-        (0, 0)
+        (
+            stats.payload_logical_bytes,
+            stats.payload_unique_bytes,
+            stats.payload_stored_bytes
+        ),
+        (0, 0, 0)
     );
     assert_eq!(read_all(&e, &all), before);
     e.shutdown().unwrap();

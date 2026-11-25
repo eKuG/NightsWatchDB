@@ -249,6 +249,9 @@ fn every_value_reads_back_identical_with_and_without_a_splitter() {
         summary_row_group_rows: 50,
         splitter,
         piece_block_bytes: 8 * 1024,
+        // Cuts of one byte are pieces here: the values must read back whatever
+        // the cuts are, so the floor that would store them inline is lowered.
+        min_piece_bytes: 1,
         ..WriterOptions::default()
     };
     let splitters: Vec<Option<Arc<dyn PayloadSplitter>>> = vec![
@@ -409,6 +412,13 @@ fn low_repetition_text_costs_only_a_few_percent() {
         total(&plain),
         total(&split) as f64 / total(&plain) as f64
     );
+    // Nothing repeats, so sharing finds (almost) nothing: the distinct text is
+    // what the rows refer to, and what is stored is what compression leaves.
+    assert!(
+        split.payload.unique_bytes * 10 >= split.payload.logical_bytes * 9,
+        "{:?}",
+        split.payload
+    );
     assert!(
         (total(&split) as f64) < total(&plain) as f64 * 1.05,
         "{} vs {}",
@@ -524,9 +534,16 @@ fn rebuilt_batches_respect_the_limits_in_rebuilt_bytes() {
         w.write(&batch_of(std::slice::from_ref(r))).unwrap();
     }
     let meta = w.finish().unwrap();
-    // The rows are 74 MiB of values in the file's terms, a few KiB stored.
+    // The rows are 74 MiB of values in the file's terms; the distinct text is
+    // two pieces of 1 MiB (the shared value and the run of `q`), whatever
+    // compression does to them.
     assert!(
-        meta.payload.stored_bytes < 3 * MIB as u64,
+        meta.payload.logical_bytes > 70 * MIB as u64,
+        "{:?}",
+        meta.payload
+    );
+    assert!(
+        meta.payload.unique_bytes <= 2 * MIB as u64 + 16,
         "{:?}",
         meta.payload
     );
@@ -534,22 +551,18 @@ fn rebuilt_batches_respect_the_limits_in_rebuilt_bytes() {
 
     let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
     let limit = BatchLimits::DEFAULT.max_bytes;
+    // The measure of `BatchLimits`: every string and binary value of every
+    // column of every row (the builder counts them as it appends).
     let raw_bytes = |b: &RecordBatch| -> usize {
-        [col::ATTRS, col::EVENTS, col::LINKS]
-            .iter()
-            .map(|c| {
-                let a = b
-                    .column_by_name(c)
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<arrow_array::LargeBinaryArray>()
-                    .unwrap();
-                (0..a.len())
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i).len())
-                    .sum::<usize>()
-            })
-            .sum()
+        let cols = SpanColumns::try_new(b).unwrap();
+        let mut all = SpanBatchBuilder::new(BatchLimits {
+            max_rows: usize::MAX,
+            max_bytes: usize::MAX,
+        });
+        for i in 0..cols.len() {
+            all.append(&cols.record(i));
+        }
+        all.value_bytes()
     };
     let check = |batches: Vec<RecordBatch>, what: &str| {
         let sizes: Vec<(usize, usize)> = batches
@@ -694,26 +707,365 @@ fn flipped_bits_in_piece_files_never_return_wrong_bytes() {
     }
 }
 
+/// A part of one trace with two spans whose `attrs` are 2 KiB of random
+/// bytes, cut into 512-byte pieces. Parts made from different seeds have piece
+/// files of equal lengths (random bytes do not compress) and different bytes.
+fn random_part(parts: &Path, id: u64, seed: u64) -> PathBuf {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let rows: Vec<Row> = (0..2)
+        .map(|i| {
+            let mut attrs = vec![0u8; 2048];
+            rng.fill_bytes(&mut attrs);
+            Row {
+                trace: 1,
+                span: i,
+                attrs,
+                events: None,
+                links: None,
+            }
+        })
+        .collect();
+    write_part(parts, id, &rows, 2, with_splitter(Chunks(512)));
+    part_dir(parts, id)
+}
+
 #[test]
 fn the_recorded_checksums_cover_the_piece_files() {
     let tmp = tempfile::tempdir().unwrap();
-    let (good, _) = small_part(tmp.path());
-    // Replace the blocks by another part's: same name, wrong content.
-    let other = tempfile::tempdir().unwrap();
-    let rows = agent_rows(99, 2, 4);
-    let options = WriterOptions {
-        splitter: Some(Arc::new(Chunks(256))),
-        piece_block_bytes: 4_096,
-        ..WriterOptions::default()
-    };
-    write_part(other.path(), 1, &rows, 3, options);
+    let good = random_part(tmp.path(), 1, 1);
+    let other = random_part(tmp.path(), 2, 2);
+    for f in [PIECES_BLK, PIECES_IDX] {
+        assert_eq!(
+            std::fs::metadata(good.join(f)).unwrap().len(),
+            std::fs::metadata(other.join(f)).unwrap().len(),
+            "{f}: the files must have equal lengths, or only the lengths are being tested"
+        );
+        assert_ne!(
+            std::fs::read(good.join(f)).unwrap(),
+            std::fs::read(other.join(f)).unwrap(),
+            "{f}"
+        );
+    }
     let scratch = tempfile::tempdir().unwrap();
     let dir = scratch.path().join("p");
+
+    // The index of another part, of the same length: refused at open, naming
+    // the file, because `traces.idx` records its checksum.
     copy_part(&good, &dir);
-    std::fs::copy(
-        part_dir(other.path(), 1).join(PIECES_IDX),
-        dir.join(PIECES_IDX),
-    )
-    .unwrap();
+    std::fs::copy(other.join(PIECES_IDX), dir.join(PIECES_IDX)).unwrap();
     corrupt_naming(PartReader::open(&dir).err().unwrap(), PIECES_IDX);
+
+    // Both files of another part: also refused at open, since the index holds
+    // the checksum of every block and so binds the blocks too.
+    std::fs::copy(other.join(PIECES_BLK), dir.join(PIECES_BLK)).unwrap();
+    corrupt_naming(PartReader::open(&dir).err().unwrap(), PIECES_IDX);
+
+    // The blocks of another part under this part's index: open cannot know
+    // without reading them, but no read returns their bytes, and `verify`
+    // names the file.
+    copy_part(&good, &dir);
+    std::fs::copy(other.join(PIECES_BLK), dir.join(PIECES_BLK)).unwrap();
+    let reader = PartReader::open(&dir).unwrap();
+    corrupt_naming(
+        reader.read_trace(TraceId([1; 16]), None).unwrap_err(),
+        PIECES_BLK,
+    );
+    corrupt_naming(reader.verify().unwrap_err(), PIECES_BLK);
+}
+
+// ------------------------------------------- floor, ceiling, by block ---
+
+fn piece_lengths(dir: &Path) -> Vec<u64> {
+    let reader = PartReader::open(dir).unwrap();
+    let store = reader.piece_store();
+    (0..store.totals().pieces as u32)
+        .map(|id| store.piece_len(id).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_cut_shorter_than_the_floor_stays_inline() {
+    let rows = mixed_rows(21, 120);
+    let tmp = tempfile::tempdir().unwrap();
+    // The default floor is 8 bytes: cuts of 7 are never pieces.
+    let seven = write_part(tmp.path(), 1, &rows, 20, with_splitter(Chunks(7)));
+    assert_eq!(seven.payload.pieces, 0);
+    assert_eq!(seven.payload.logical_bytes, 0);
+    // Cuts of 8 are, and a short last chunk of a value stays inline.
+    let eight = write_part(tmp.path(), 2, &rows, 20, with_splitter(Chunks(8)));
+    assert!(eight.payload.pieces > 0);
+    assert!(
+        piece_lengths(&part_dir(tmp.path(), 2))
+            .iter()
+            .all(|&l| l >= 8)
+    );
+    // The floor is an option: with it lowered, cuts of 7 are pieces.
+    let low = WriterOptions {
+        min_piece_bytes: 1,
+        ..with_splitter(Chunks(7))
+    };
+    let seven_low = write_part(tmp.path(), 3, &rows, 20, low);
+    assert!(seven_low.payload.pieces > 0);
+    for id in 1..=3 {
+        assert_reads_back(&part_dir(tmp.path(), id), &rows);
+    }
+}
+
+#[test]
+fn the_piece_ceiling_stops_new_pieces_but_pieces_that_exist_are_still_shared() {
+    let mut rng = StdRng::seed_from_u64(33);
+    // 75 rows of four distinct 64-byte chunks, then the first 25 of them
+    // again: the first 100 chunks fill the part, the next 200 do not fit, and
+    // the repeats of the first 100 must still be references.
+    let chunks: Vec<Vec<u8>> = (0..300)
+        .map(|_| {
+            let mut c = vec![0u8; 64];
+            rng.fill_bytes(&mut c);
+            c
+        })
+        .collect();
+    let row = |i: usize, from: usize| Row {
+        trace: (i / 10) as u8,
+        span: i as u32,
+        attrs: chunks[from * 4..from * 4 + 4].concat(),
+        events: None,
+        links: None,
+    };
+    let rows: Vec<Row> = (0..75)
+        .map(|i| row(i, i))
+        .chain((0..25).map(|i| row(75 + i, i)))
+        .collect();
+    let tmp = tempfile::tempdir().unwrap();
+    let options = WriterOptions {
+        max_pieces: 100,
+        ..with_splitter(Chunks(64))
+    };
+    let meta = write_part(tmp.path(), 1, &rows, 10, options);
+    assert_eq!(meta.payload.pieces, 100);
+    assert_eq!(meta.payload.unique_bytes, 100 * 64);
+    // 100 references that made the pieces and 100 that found them again; the
+    // 200 chunks that did not fit are inline and are no reference.
+    assert_eq!(meta.payload.logical_bytes, 200 * 64);
+    // Everything reads back, and the ropes agree with the store (`verify`).
+    assert_reads_back(&part_dir(tmp.path(), 1), &rows);
+
+    // With a ceiling of nothing, no piece is ever made.
+    let none = WriterOptions {
+        max_pieces: 0,
+        ..with_splitter(Chunks(64))
+    };
+    let meta = write_part(tmp.path(), 2, &rows, 10, none);
+    assert_eq!(meta.payload.pieces, 0);
+    assert_reads_back(&part_dir(tmp.path(), 2), &rows);
+}
+
+struct Announced(Mutex<Vec<(u32, Vec<u8>)>>);
+
+impl nwdb_segment::PieceObserver for Announced {
+    fn piece_stored(&self, id: u32, bytes: &[u8]) {
+        self.0.lock().unwrap().push((id, bytes.to_vec()));
+    }
+}
+
+#[test]
+fn the_observer_hears_of_each_piece_once_when_it_is_first_stored() {
+    let rows = agent_rows(5, 2, 6);
+    let tmp = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Announced(Mutex::new(Vec::new())));
+    let options = WriterOptions {
+        piece_observer: Some(seen.clone()),
+        ..with_splitter(Chunks(256))
+    };
+    let meta = write_part(tmp.path(), 1, &rows, 5, options);
+    let seen = seen.0.lock().unwrap();
+    // Every distinct piece, once, in the order of the ids, though the same
+    // text was referenced many times.
+    assert_eq!(seen.len() as u64, meta.payload.pieces);
+    assert!(meta.payload.logical_bytes > 4 * meta.payload.unique_bytes);
+    assert!(
+        seen.iter()
+            .enumerate()
+            .all(|(n, (id, _))| *id as usize == n)
+    );
+    let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
+    let store = reader.piece_store();
+    let mut session = store.session();
+    for (id, bytes) in seen.iter() {
+        let mut out = Vec::new();
+        store.read_piece(&mut session, *id, &mut out).unwrap();
+        assert_eq!(&out, bytes);
+    }
+}
+
+#[test]
+fn stored_rows_list_their_pieces_and_pieces_are_fetched_by_id() {
+    let rows = agent_rows(8, 2, 5);
+    let tmp = tempfile::tempdir().unwrap();
+    write_part(tmp.path(), 1, &rows, 4, with_splitter(Chunks(256)));
+    let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
+    let n = rows.len() as u64;
+    let before = reader.payload_blocks_loaded();
+    let stored = reader.read_rows_stored(0, n, None).unwrap();
+    assert_eq!(reader.payload_blocks_loaded(), before, "no piece is read");
+    let rebuilt = rows_of(&reader.read_rows(0, n, None).unwrap());
+
+    let store = reader.piece_store();
+    let mut refs = 0u64;
+    let mut at = 0;
+    for batch in &stored {
+        for column in [col::ATTRS, col::EVENTS, col::LINKS] {
+            let a = batch
+                .column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::LargeBinaryArray>()
+                .unwrap();
+            for i in 0..a.len() {
+                if a.is_null(i) {
+                    continue;
+                }
+                for id in nwdb_payload::rope::piece_ids(a.value(i)) {
+                    refs += store.piece_len(id.unwrap()).unwrap();
+                }
+                // The rope, rebuilt by hand from the store, is the value.
+                let mut value = Vec::new();
+                let mut session = store.session();
+                nwdb_payload::rope::decode(
+                    a.value(i),
+                    |id, out| store.read_piece(&mut session, id, out),
+                    &mut value,
+                )
+                .unwrap();
+                let want = &rebuilt[at + i];
+                let expected = match column {
+                    col::ATTRS => Some(&want.attrs),
+                    col::EVENTS => want.events.as_ref(),
+                    _ => want.links.as_ref(),
+                };
+                assert_eq!(Some(&value), expected, "row {} {column}", at + i);
+            }
+        }
+        at += batch.num_rows();
+    }
+    // Every reference of the part was seen.
+    assert_eq!(refs, store.totals().logical_bytes);
+}
+
+#[test]
+fn many_threads_reading_one_part_get_what_one_thread_gets() {
+    let rows = agent_rows(13, 6, 10);
+    let tmp = tempfile::tempdir().unwrap();
+    let options = WriterOptions {
+        row_group_rows: 15,
+        piece_block_bytes: 4_096,
+        ..with_splitter(Chunks(256))
+    };
+    write_part(tmp.path(), 1, &rows, 7, options);
+    let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
+    let single: Vec<Vec<Row>> = (0..6u8)
+        .map(|t| rows_of(&reader.read_trace(TraceId([t; 16]), None).unwrap().unwrap()))
+        .collect();
+    for (t, got) in single.iter().enumerate() {
+        let want: Vec<Row> = rows
+            .iter()
+            .filter(|r| r.trace == t as u8)
+            .cloned()
+            .collect();
+        assert_eq!(*got, want, "trace {t}");
+    }
+    std::thread::scope(|scope| {
+        for seed in 0..8u64 {
+            let (reader, single, rows) = (&reader, &single, &rows);
+            scope.spawn(move || {
+                let mut rng = StdRng::seed_from_u64(seed);
+                for _ in 0..40 {
+                    let t = rng.random_range(0..6u8);
+                    let got = reader.read_trace(TraceId([t; 16]), None).unwrap().unwrap();
+                    assert_eq!(rows_of(&got), single[t as usize], "trace {t}");
+                    // And ranges that cut across traces and row groups.
+                    let first = rng.random_range(0..rows.len() as u64 - 1);
+                    let count = rng.random_range(1..=(rows.len() as u64 - first).min(20));
+                    let got = reader.read_rows(first, count, None).unwrap();
+                    assert_eq!(
+                        rows_of(&got),
+                        rows[first as usize..(first + count) as usize],
+                        "rows {first}+{count}"
+                    );
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn references_spread_over_many_blocks_decompress_each_block_once_per_batch() {
+    const PIECE: usize = 8 * 1024;
+    const PIECES: usize = 100;
+    const ROWS: usize = 20;
+    const REFS: usize = 300;
+    let mut rng = StdRng::seed_from_u64(44);
+    let pieces: Vec<Vec<u8>> = (0..PIECES)
+        .map(|_| {
+            let mut p = vec![0u8; PIECE];
+            rng.fill_bytes(&mut p);
+            p
+        })
+        .collect();
+    // Trace 1 makes the pieces, one to a block. Trace 2 has 20 rows of 300
+    // references each, going round and round all 100 blocks in a different
+    // order on each row: 6,000 references, 2.4 MiB a row, two batches.
+    let mut rows: Vec<Row> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, p)| Row {
+            trace: 1,
+            span: i as u32,
+            attrs: p.clone(),
+            events: None,
+            links: None,
+        })
+        .collect();
+    for r in 0..ROWS {
+        let attrs: Vec<u8> = (0..REFS)
+            .flat_map(|k| pieces[(r * 7 + k * 13) % PIECES].clone())
+            .collect();
+        rows.push(Row {
+            trace: 2,
+            span: (PIECES + r) as u32,
+            attrs,
+            events: None,
+            links: None,
+        });
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let options = WriterOptions {
+        piece_block_bytes: PIECE,
+        ..with_splitter(Chunks(PIECE))
+    };
+    let meta = write_part(tmp.path(), 1, &rows, 5, options);
+    assert_eq!(meta.payload.pieces, PIECES as u64);
+
+    let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
+    let blocks = reader.piece_store().block_count() as u64;
+    assert_eq!(blocks, PIECES as u64);
+    let before = reader.payload_blocks_loaded();
+    let got = reader.read_trace(TraceId([2; 16]), None).unwrap().unwrap();
+    let loads = reader.payload_blocks_loaded() - before;
+    eprintln!(
+        "{} references over {blocks} blocks, {} batches: {loads} block decompressions",
+        ROWS * REFS,
+        got.len()
+    );
+    assert!(got.len() >= 2, "the rows do not fit one batch");
+    assert!(
+        loads <= blocks * got.len() as u64,
+        "{loads} decompressions for {} batches of {blocks} blocks",
+        got.len()
+    );
+    // And the values are what was written.
+    let want: Vec<Row> = rows.iter().filter(|r| r.trace == 2).cloned().collect();
+    assert_eq!(rows_of(&got), want);
+    // The same through the other read path.
+    let all = reader.read_rows(PIECES as u64, ROWS as u64, None).unwrap();
+    assert_eq!(rows_of(&all), want);
 }

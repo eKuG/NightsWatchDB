@@ -82,7 +82,9 @@ mod wire;
 
 pub use decode::{DEFAULT_MAX_ORIGIN_BYTES, DecodeStats, RECORD_TAG_OTLP_TRACES, TraceDecoder};
 pub use encode::encode_spans;
-pub use splitter::{CONTENT_KEYS, CONTENT_PREFIXES, DEFAULT_MIN_BYTES, OtlpSplitter};
+pub use splitter::{
+    CONTENT_KEYS, CONTENT_PREFIXES, DEFAULT_MIN_BYTES, MIN_AVERAGE_ELEMENT_BYTES, OtlpSplitter,
+};
 pub use stream::{
     MAX_DEPTH, resource_dropped_attributes, scope_dropped_attributes, write_attrs, write_events,
     write_links, write_resource, write_scope_attrs,

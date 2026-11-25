@@ -84,13 +84,24 @@ or `llm.output_messages.`), the same keys inside event and link attributes. A
 value nested inside the value of a content key (the messages of an array or a
 key-value list) is under that key; nested keys are not themselves matched.
 
-For a candidate whose bytes are one complete JSON array, each top-level
-element is a cut and the brackets, commas and whitespace between them stay
-inline (the scanner is `nwdb_payload::json_array_elements`); this is what lets
-a conversation that grows by one message per call share every message it has
-already sent. Otherwise the whole content of the string is one cut. The tag and
-length prefix of the string always stay inline. An empty array has no elements
-and so no cuts.
+For a candidate whose bytes are one complete JSON array whose elements
+average at least `MIN_AVERAGE_ELEMENT_BYTES` (32) bytes, each top-level element
+is a cut and the brackets, commas and whitespace between them stay inline (the
+scanner is `nwdb_payload::json_array_elements`); this is what lets a
+conversation that grows by one message per call share every message it has
+already sent. An array whose elements average less (numbers, short strings) is
+cut as one piece, its whole text: a piece, a reference and a table entry for
+each would cost more than the element, and the sender decides how many there
+are. The array is still shared with an identical one and indexed as a unit.
+(The bound is on the average, so one large message among small ones keeps the
+array cut into its elements.) Otherwise the whole content of the string is one
+cut. The tag and length prefix of the string always stay inline. An empty array
+has no elements and so no cuts.
+
+The splitter proposes; the part writer decides what is worth a piece: a cut
+shorter than 8 bytes is stored inline (`WriterOptions::min_piece_bytes`) and a
+part stops making new pieces at 16,777,216 (`WriterOptions::max_pieces`), see
+`nwdb-segment`.
 
 ## Wire rules
 

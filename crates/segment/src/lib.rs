@@ -23,10 +23,11 @@ mod reader;
 mod writer;
 
 pub use index::{FileChecksum, INDEX_FILE, TraceEntry};
+pub use nwdb_payload::{PieceObserver, PieceReader};
 pub use reader::{PartReader, Scan, ScanOptions, SummaryScanRev};
 pub use writer::{
-    DEFAULT_DEDUP_WINDOW_BYTES, DEFAULT_PIECE_BLOCK_BYTES, FORMAT_VERSION, PartWriter,
-    WriterOptions, check_format_version,
+    DEFAULT_DEDUP_WINDOW_BYTES, DEFAULT_MAX_PIECES, DEFAULT_MIN_PIECE_BYTES,
+    DEFAULT_PIECE_BLOCK_BYTES, FORMAT_VERSION, PartWriter, WriterOptions, check_format_version,
 };
 
 /// File name of the span rows inside a part directory.

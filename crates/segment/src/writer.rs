@@ -10,7 +10,7 @@ use nwdb_core::{
     Error, PartMeta, PayloadSplitter, RawColumn, Result, SpanColumns, SummaryBatchBuilder,
     SummaryBuilder, TraceId, TraceSummary, col, part_dir_name, span_schema, summary_schema,
 };
-use nwdb_payload::{MAX_PIECE_BYTES, PieceWriter, PieceWriterOptions, rope};
+use nwdb_payload::{MAX_PIECE_BYTES, PieceObserver, PieceWriter, PieceWriterOptions, rope};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -31,14 +31,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// files to `traces.idx`; version 3 made the origin columns dictionary
 /// columns; version 4 stores `attrs`, `events` and `links` as ropes and adds
 /// the piece store, `pieces.blk` and `pieces.idx`, whose length and CRC-32C
-/// are in `traces.idx` too.
-pub const FORMAT_VERSION: u32 = 4;
+/// are in `traces.idx` too; version 5 adds the CRC-32C of the rebuilt value to
+/// every rope that has a reference.
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The default for [`WriterOptions::dedup_window_bytes`]: 64 MiB.
 pub const DEFAULT_DEDUP_WINDOW_BYTES: usize = 64 << 20;
 
 /// The default for [`WriterOptions::piece_block_bytes`]: 1 MiB.
 pub const DEFAULT_PIECE_BLOCK_BYTES: usize = 1 << 20;
+
+/// The default for [`WriterOptions::min_piece_bytes`]: 8.
+pub const DEFAULT_MIN_PIECE_BYTES: usize = 8;
+
+/// The default for [`WriterOptions::max_pieces`]: 16,777,216.
+pub const DEFAULT_MAX_PIECES: usize = 1 << 24;
 
 /// Refuses a part written with another format version, saying so plainly.
 /// There is no migration: the project has had no release, so parts written by
@@ -96,6 +103,18 @@ pub struct WriterOptions {
     pub dedup_window_bytes: usize,
     /// Uncompressed size at which a piece block is closed. Default 1 MiB.
     pub piece_block_bytes: usize,
+    /// A cut shorter than this is stored inline, whatever the splitter says: a
+    /// reference and a table entry cost more than such a piece. Default 8.
+    pub min_piece_bytes: usize,
+    /// Once the part holds this many pieces, further new text is stored
+    /// inline; pieces that exist can still be referenced. The writer and every
+    /// open reader keep a few bytes per piece, and a sender decides how many
+    /// there are, so this bounds them; sharing is lost beyond it, nothing
+    /// else. Default 16,777,216.
+    pub max_pieces: usize,
+    /// Told about each piece the first time it is stored, before the batch
+    /// that holds it is written. `None` by default.
+    pub piece_observer: Option<Arc<dyn PieceObserver>>,
 }
 
 impl std::fmt::Debug for WriterOptions {
@@ -107,6 +126,12 @@ impl std::fmt::Debug for WriterOptions {
             .field("splitter", &self.splitter.as_ref().map(|_| "<splitter>"))
             .field("dedup_window_bytes", &self.dedup_window_bytes)
             .field("piece_block_bytes", &self.piece_block_bytes)
+            .field("min_piece_bytes", &self.min_piece_bytes)
+            .field("max_pieces", &self.max_pieces)
+            .field(
+                "piece_observer",
+                &self.piece_observer.as_ref().map(|_| "<observer>"),
+            )
             .finish()
     }
 }
@@ -120,6 +145,9 @@ impl Default for WriterOptions {
             splitter: None,
             dedup_window_bytes: DEFAULT_DEDUP_WINDOW_BYTES,
             piece_block_bytes: DEFAULT_PIECE_BLOCK_BYTES,
+            min_piece_bytes: DEFAULT_MIN_PIECE_BYTES,
+            max_pieces: DEFAULT_MAX_PIECES,
+            piece_observer: None,
         }
     }
 }
@@ -262,10 +290,11 @@ struct Current {
 /// Memory use while writing is the Parquet writer's row group (at most
 /// [`WriterOptions::row_group_bytes`] of stored value bytes, plus one row), the
 /// de-duplication window ([`WriterOptions::dedup_window_bytes`]) with the open
-/// piece block and the hash map over its pieces, the piece table (12 bytes per
-/// distinct piece), and one [`TraceEntry`] and one [`TraceSummary`] per trace
-/// so far. It does not grow with the number of spans or with the amount of
-/// unique text.
+/// piece block and the hash map over its pieces, the length of every piece in
+/// its compact on-disk form (one to three bytes each, at most
+/// [`WriterOptions::max_pieces`] of them), and one [`TraceEntry`] and one
+/// [`TraceSummary`] per trace so far. It does not grow with the number of
+/// spans or with the amount of unique text.
 ///
 /// Dropping a writer that was not finished removes the temporary directory.
 pub struct PartWriter {
@@ -690,6 +719,9 @@ const RAW_COLUMNS: [(&str, RawColumn); 3] = [
 /// Turns the raw columns of a batch into ropes, storing the cut-out pieces.
 struct PayloadSink {
     splitter: Option<Arc<dyn PayloadSplitter>>,
+    observer: Option<Arc<dyn PieceObserver>>,
+    min_piece_bytes: usize,
+    max_pieces: u64,
     pieces: PieceWriter,
     cuts: Vec<Range<usize>>,
     ids: Vec<u32>,
@@ -700,6 +732,9 @@ impl PayloadSink {
     fn create(dir: &Path, options: &WriterOptions) -> Result<Self> {
         Ok(Self {
             splitter: options.splitter.clone(),
+            observer: options.piece_observer.clone(),
+            min_piece_bytes: options.min_piece_bytes,
+            max_pieces: options.max_pieces as u64,
             pieces: PieceWriter::create(
                 dir,
                 PieceWriterOptions {
@@ -736,7 +771,9 @@ impl PayloadSink {
     }
 
     /// Appends the rope of one value to `self.rope`. A splitter whose ranges
-    /// break the contract gets its value stored whole.
+    /// break the contract gets its value stored whole; a cut that is too short
+    /// to be worth a piece, or that would make a new piece in a part that
+    /// already holds the most it may, stays inline.
     fn encode(&mut self, raw: RawColumn, value: &[u8]) -> Result<()> {
         self.cuts.clear();
         if let Some(splitter) = &self.splitter
@@ -750,9 +787,32 @@ impl PayloadSink {
             }
         }
         self.ids.clear();
-        for cut in &self.cuts {
-            self.ids.push(self.pieces.add(&value[cut.clone()])?);
+        let mut kept = 0;
+        for i in 0..self.cuts.len() {
+            let cut = self.cuts[i].clone();
+            if cut.len() < self.min_piece_bytes {
+                continue;
+            }
+            let bytes = &value[cut.clone()];
+            let id = if self.pieces.piece_count() >= self.max_pieces {
+                match self.pieces.find(bytes) {
+                    Some(id) => id,
+                    None => continue,
+                }
+            } else {
+                let added = self.pieces.add_piece(bytes)?;
+                if added.new
+                    && let Some(observer) = &self.observer
+                {
+                    observer.piece_stored(added.id, bytes);
+                }
+                added.id
+            };
+            self.cuts[kept] = cut;
+            self.ids.push(id);
+            kept += 1;
         }
+        self.cuts.truncate(kept);
         rope::encode_cut(value, &self.cuts, &self.ids, &mut self.rope);
         Ok(())
     }

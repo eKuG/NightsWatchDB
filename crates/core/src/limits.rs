@@ -5,6 +5,13 @@
 /// rows alone has caused out-of-memory kills, which is why a byte bound is
 /// always part of the limits and why the default byte bound is what usually
 /// triggers a flush on real agent traces.
+///
+/// The bound counts the values of the rows. A batch read back from a part can
+/// hold more than that: the dictionaries of the seven origin columns
+/// (`resource`, `scope` and their parts) come with the batch, at most about
+/// 1 MiB for each, the size of a Parquet dictionary page, and the batches
+/// sliced off one Parquet batch share the same dictionary buffers (a read of
+/// rows by trace or range keeps only the values its rows use).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchLimits {
     /// Maximum number of rows.

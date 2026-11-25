@@ -1,6 +1,6 @@
 //! Writing a piece store.
 
-use crate::format::{self, BLOCKS_FILE, BlockLoc, INDEX_FILE, Index, MAX_PIECE_BYTES, PieceLoc};
+use crate::format::{self, BLOCKS_FILE, BlockLoc, INDEX_FILE, MAX_PIECE_BYTES};
 use ahash::RandomState;
 use nwdb_core::{Error, PayloadTotals, Result};
 use std::collections::HashMap;
@@ -11,8 +11,10 @@ use std::path::Path;
 const ZSTD_LEVEL: i32 = 3;
 
 /// What the de-duplication window charges for each piece on top of its bytes:
-/// the map entry and the table row it keeps in memory. Without it a window
-/// full of tiny pieces would cost far more than the window is meant to.
+/// the offset and chain entries (4 bytes each) and the map entry (a 12-byte
+/// slot with its control byte, at a load factor that can leave half the table
+/// empty). More than is held, never less, so that a window full of tiny pieces
+/// is bounded too.
 const PIECE_OVERHEAD: usize = 64;
 
 /// Settings of a [`PieceWriter`].
@@ -41,7 +43,12 @@ impl Default for PieceWriterOptions {
 pub struct FileSum {
     /// Length in bytes.
     pub len: u64,
-    /// CRC-32C of every byte.
+    /// CRC-32C of every byte, except for `pieces.idx`, where it is the CRC-32C
+    /// of every byte but the last four. That file ends with its own checksum,
+    /// and the CRC-32C of a message with its CRC-32C appended is the same
+    /// constant for every message: over the whole file it would tell one
+    /// `pieces.idx` from another not at all. Over the rest it is that checksum
+    /// itself, which depends on every block's checksum and so on the blocks.
     pub crc32c: u32,
 }
 
@@ -56,22 +63,74 @@ pub struct StoreSummary {
     pub index: FileSum,
 }
 
+/// What [`PieceWriter::add_piece`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Added {
+    /// The id of the piece that holds the bytes.
+    pub id: u32,
+    /// True if the bytes were stored now, false if an equal piece was already
+    /// there.
+    pub new: bool,
+}
+
+/// Told about every piece the first time it is stored, in the order of their
+/// ids, for example to index its text. The part writer calls it as it stores
+/// the pieces of a batch, before the batch is written. A repeat of a piece
+/// that is still known is not announced; a repeat of one the writer has
+/// forgotten (see [`PieceWriterOptions::dedup_window_bytes`]) is stored again
+/// under a new id and announced again.
+pub trait PieceObserver: Send + Sync {
+    /// Piece `id` was stored and holds `bytes`.
+    fn piece_stored(&self, id: u32, bytes: &[u8]);
+}
+
 /// Marks the end of a chain of pieces that share a hash value.
 const NONE: u32 = u32::MAX;
 
-/// A closed block kept in memory for comparison.
-struct Kept {
+/// A block that is being filled or is kept in memory for comparison, with
+/// what the writer needs to find and compare its pieces.
+struct Block {
     data: Vec<u8>,
-    /// Pieces `first..first + count` are in this block.
+    /// The id of the first piece in this block.
     first: u32,
-    count: u32,
+    /// Where each piece starts in `data`; a piece ends where the next one
+    /// starts, the last one at the end of `data`.
+    offsets: Vec<u32>,
+    /// For each piece, the next older piece with the same hash value that is
+    /// still known, or `NONE`.
+    chain: Vec<u32>,
     /// When a piece of this block last matched, or when it was closed.
     used: u64,
 }
 
-impl Kept {
+impl Block {
+    fn new(first: u32) -> Self {
+        Self {
+            data: Vec::new(),
+            first,
+            offsets: Vec::new(),
+            chain: Vec::new(),
+            used: 0,
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.offsets.len()
+    }
+
+    fn piece(&self, id: u32) -> &[u8] {
+        let i = (id - self.first) as usize;
+        let from = self.offsets[i] as usize;
+        let to = self
+            .offsets
+            .get(i + 1)
+            .map_or(self.data.len(), |&o| o as usize);
+        &self.data[from..to]
+    }
+
+    /// What the block holds in memory, as the window is charged for it.
     fn cost(&self) -> usize {
-        self.data.len() + self.count as usize * PIECE_OVERHEAD
+        self.data.capacity() + self.count() * PIECE_OVERHEAD
     }
 }
 
@@ -92,25 +151,29 @@ impl Kept {
 /// match is oldest and forgets its pieces, so a later repeat of one of them is
 /// stored again (a missed saving, never an error).
 ///
-/// Memory: the open block, the window, one table row (12 bytes) and one map
-/// entry per piece still in the window, and one table row per piece stored.
+/// Memory: the open block, the window (each block of it trimmed to its size
+/// and charged 64 bytes per piece for its offset, chain and map entries), and
+/// the length of every piece stored, in the compact form it has on disk
+/// (one byte up to 127 bytes, two up to 16 KiB, three up to 2 MiB). That last
+/// part is the only one that grows with the number of pieces of the part.
 pub struct PieceWriter {
     blk: File,
     idx: File,
     opts: PieceWriterOptions,
     hasher: RandomState,
 
-    /// The block being filled, and the first piece in it.
-    open: Vec<u8>,
-    open_first: u32,
-    pieces: Vec<PieceLoc>,
+    /// The block being filled.
+    open: Block,
+    /// The id of the first piece of each closed block.
+    block_first: Vec<u32>,
     blocks: Vec<BlockLoc>,
+    /// The lengths of all pieces, as they are written to `pieces.idx`.
+    lens: Vec<u8>,
+    count: u64,
 
-    /// Hash value to the newest piece with it that is still in the window;
-    /// `chain[id]` is the next older one, or `NONE`.
+    /// Hash value to the newest piece with it that is still known.
     map: HashMap<u64, u32>,
-    chain: Vec<u32>,
-    kept: HashMap<u32, Kept>,
+    kept: HashMap<u32, Block>,
     kept_cost: usize,
     tick: u64,
 
@@ -142,12 +205,12 @@ impl PieceWriter {
             idx: File::create_new(dir.join(INDEX_FILE))?,
             opts,
             hasher: RandomState::new(),
-            open: Vec::new(),
-            open_first: 0,
-            pieces: Vec::new(),
+            open: Block::new(0),
+            block_first: Vec::new(),
             blocks: Vec::new(),
+            lens: Vec::new(),
+            count: 0,
             map: HashMap::new(),
-            chain: Vec::new(),
             kept: HashMap::new(),
             kept_cost: 0,
             tick: 0,
@@ -168,22 +231,73 @@ impl PieceWriter {
         self.hasher.hash_one(bytes)
     }
 
-    /// The bytes of piece `id`, if the open block or the window still holds
-    /// them.
-    fn bytes_of(&self, id: u32) -> Option<&[u8]> {
-        let p = self.pieces[id as usize];
-        let (from, to) = (p.offset as usize, p.offset as usize + p.len as usize);
-        if p.block as usize == self.blocks.len() {
-            self.open.get(from..to)
-        } else {
-            self.kept.get(&p.block)?.data.get(from..to)
+    /// The closed block that holds piece `id`, or `None` for the open one.
+    fn block_no(&self, id: u32) -> Option<u32> {
+        (id < self.open.first).then(|| self.block_first.partition_point(|&f| f <= id) as u32 - 1)
+    }
+
+    /// The block holding piece `id`, if the open block or the window still
+    /// holds it.
+    fn block(&self, id: u32) -> Option<&Block> {
+        match self.block_no(id) {
+            None => Some(&self.open),
+            Some(b) => self.kept.get(&b),
         }
+    }
+
+    fn block_mut(&mut self, id: u32) -> Option<&mut Block> {
+        match self.block_no(id) {
+            None => Some(&mut self.open),
+            Some(b) => self.kept.get_mut(&b),
+        }
+    }
+
+    fn chain_of(&self, id: u32) -> u32 {
+        self.block(id)
+            .map_or(NONE, |b| b.chain[(id - b.first) as usize])
+    }
+
+    /// The piece with hash `h` and these bytes, if it is still known.
+    fn lookup(&mut self, h: u64, bytes: &[u8]) -> Option<u32> {
+        let mut at = self.map.get(&h).copied().unwrap_or(NONE);
+        while at != NONE {
+            let b = self.block(at)?;
+            if b.piece(at) == bytes {
+                self.tick += 1;
+                let tick = self.tick;
+                if let Some(b) = self.block_mut(at) {
+                    b.used = tick;
+                }
+                return Some(at);
+            }
+            at = b.chain[(at - b.first) as usize];
+        }
+        None
+    }
+
+    /// The id of the piece that holds `bytes`, if the writer still knows one
+    /// (the open block and the window are searched; a piece it has forgotten is
+    /// not found). Counts as a reference to it, like [`add`](Self::add). Never
+    /// stores anything, so it works when no new piece may be created.
+    pub fn find(&mut self, bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() || bytes.len() > MAX_PIECE_BYTES {
+            return None;
+        }
+        let h = self.hash(bytes);
+        let id = self.lookup(h, bytes)?;
+        self.logical += bytes.len() as u64;
+        Some(id)
     }
 
     /// Stores `bytes` unless an equal piece is already there, and returns the
     /// id of the piece that holds them. `bytes` must not be empty and must
     /// not be longer than [`MAX_PIECE_BYTES`].
     pub fn add(&mut self, bytes: &[u8]) -> Result<u32> {
+        self.add_piece(bytes).map(|a| a.id)
+    }
+
+    /// Like [`add`](Self::add), and says whether the piece is new.
+    pub fn add_piece(&mut self, bytes: &[u8]) -> Result<Added> {
         if bytes.is_empty() || bytes.len() > MAX_PIECE_BYTES {
             return Err(Error::invalid_argument(format!(
                 "a piece must have 1 to {MAX_PIECE_BYTES} bytes, got {}",
@@ -192,70 +306,68 @@ impl PieceWriter {
         }
         self.logical += bytes.len() as u64;
         let h = self.hash(bytes);
-        let mut at = self.map.get(&h).copied().unwrap_or(NONE);
-        while at != NONE {
-            if self.bytes_of(at) == Some(bytes) {
-                let block = self.pieces[at as usize].block;
-                self.tick += 1;
-                if let Some(k) = self.kept.get_mut(&block) {
-                    k.used = self.tick;
-                }
-                return Ok(at);
-            }
-            at = self.chain[at as usize];
+        if let Some(id) = self.lookup(h, bytes) {
+            return Ok(Added { id, new: false });
         }
 
-        if !self.open.is_empty() && self.open.len() + bytes.len() > self.opts.block_bytes {
+        if !self.open.data.is_empty() && self.open.data.len() + bytes.len() > self.opts.block_bytes
+        {
             self.close_block()?;
         }
-        let id = u32::try_from(self.pieces.len())
+        let id = u32::try_from(self.count)
             .ok()
             .filter(|&id| id != NONE)
             .ok_or_else(|| Error::invalid_argument("a part can hold fewer than 2^32 pieces"))?;
-        self.pieces.push(PieceLoc {
-            block: self.blocks.len() as u32,
-            offset: self.open.len() as u32,
-            len: bytes.len() as u32,
-        });
-        self.open.extend_from_slice(bytes);
+        if self.lens.len() >= u32::MAX as usize - 8 {
+            return Err(Error::invalid_argument("the piece table is too long"));
+        }
+        self.open.offsets.push(self.open.data.len() as u32);
+        self.open.data.extend_from_slice(bytes);
+        let older = self.map.insert(h, id).unwrap_or(NONE);
+        self.open.chain.push(older);
+        format::put_len(&mut self.lens, bytes.len() as u32);
+        self.count += 1;
         self.unique += bytes.len() as u64;
-        self.chain.push(self.map.insert(h, id).unwrap_or(NONE));
-        if self.open.len() >= self.opts.block_bytes {
+        if self.open.data.len() >= self.opts.block_bytes {
             self.close_block()?;
         }
-        Ok(id)
+        Ok(Added { id, new: true })
+    }
+
+    /// The number of pieces stored so far.
+    pub fn piece_count(&self) -> u64 {
+        self.count
     }
 
     /// Compresses the open block, appends it to the file and moves its bytes
-    /// into the window.
+    /// into the window, trimmed to the size they have.
     fn close_block(&mut self) -> Result<()> {
-        if self.open.is_empty() {
+        if self.open.data.is_empty() {
             return Ok(());
         }
-        let packed = zstd::bulk::compress(&self.open, ZSTD_LEVEL).map_err(io_other)?;
+        let packed = zstd::bulk::compress(&self.open.data, ZSTD_LEVEL).map_err(io_other)?;
         self.blk.write_all(&packed)?;
         self.blk_crc = crc32c::crc32c_append(self.blk_crc, &packed);
         let block = self.blocks.len() as u32;
         self.blocks.push(BlockLoc {
             offset: self.written,
             clen: u32::try_from(packed.len()).map_err(|_| Error::other("block too large"))?,
-            ulen: self.open.len() as u32,
+            ulen: self.open.data.len() as u32,
             crc: crc32c::crc32c(&packed),
         });
+        self.block_first.push(self.open.first);
         self.written += packed.len() as u64;
 
         self.tick += 1;
-        let first = self.open_first;
-        let end = self.pieces.len() as u32;
-        let kept = Kept {
-            data: std::mem::take(&mut self.open),
-            first,
-            count: end - first,
-            used: self.tick,
-        };
-        self.kept_cost += kept.cost();
-        self.kept.insert(block, kept);
-        self.open_first = end;
+        let mut closed = std::mem::replace(&mut self.open, Block::new(self.count as u32));
+        closed.used = self.tick;
+        // The buffers grew by doubling; the window must be charged for what is
+        // held, so give back the unused part.
+        closed.data.shrink_to_fit();
+        closed.offsets.shrink_to_fit();
+        closed.chain.shrink_to_fit();
+        self.kept_cost += closed.cost();
+        self.kept.insert(block, closed);
         self.shrink_window();
         Ok(())
     }
@@ -272,14 +384,19 @@ impl PieceWriter {
             else {
                 return;
             };
-            let kept = self.kept.remove(&oldest).expect("just found");
-            self.kept_cost -= kept.cost();
-            for id in kept.first..kept.first + kept.count {
-                let p = self.pieces[id as usize];
-                let bytes = &kept.data[p.offset as usize..(p.offset + p.len) as usize];
-                let h = self.hash(bytes);
+            // Unlink its pieces while the block is still there to be searched,
+            // then drop it.
+            let doomed: Vec<(u64, u32)> = {
+                let b = &self.kept[&oldest];
+                (0..b.count() as u32)
+                    .map(|i| (self.hash(b.piece(b.first + i)), b.first + i))
+                    .collect()
+            };
+            for (h, id) in doomed {
                 self.forget(h, id);
             }
+            let kept = self.kept.remove(&oldest).expect("just found");
+            self.kept_cost -= kept.cost();
         }
     }
 
@@ -288,8 +405,9 @@ impl PieceWriter {
         let Some(&head) = self.map.get(&h) else {
             return;
         };
+        let next = self.chain_of(id);
         if head == id {
-            match self.chain[id as usize] {
+            match next {
                 NONE => self.map.remove(&h),
                 next => self.map.insert(h, next),
             };
@@ -297,12 +415,15 @@ impl PieceWriter {
         }
         let mut at = head;
         while at != NONE {
-            let next = self.chain[at as usize];
-            if next == id {
-                self.chain[at as usize] = self.chain[id as usize];
+            let after = self.chain_of(at);
+            if after == id {
+                if let Some(b) = self.block_mut(at) {
+                    let i = (at - b.first) as usize;
+                    b.chain[i] = next;
+                }
                 return;
             }
-            at = next;
+            at = after;
         }
     }
 
@@ -311,17 +432,12 @@ impl PieceWriter {
     pub fn finish(mut self) -> Result<StoreSummary> {
         self.close_block()?;
         self.blk.sync_all()?;
-        let index = Index {
-            blocks: std::mem::take(&mut self.blocks),
-            pieces: std::mem::take(&mut self.pieces),
-            logical_bytes: self.logical,
-        };
-        let bytes = format::encode(&index);
+        let bytes = format::encode(&self.blocks, &self.lens, self.count, self.logical);
         self.idx.write_all(&bytes)?;
         self.idx.sync_all()?;
         Ok(StoreSummary {
             totals: PayloadTotals {
-                pieces: index.pieces.len() as u64,
+                pieces: self.count,
                 logical_bytes: self.logical,
                 unique_bytes: self.unique,
                 stored_bytes: self.written,
@@ -332,14 +448,21 @@ impl PieceWriter {
             },
             index: FileSum {
                 len: bytes.len() as u64,
-                crc32c: crc32c::crc32c(&bytes),
+                crc32c: crc32c::crc32c(&bytes[..bytes.len() - 4]),
             },
         })
     }
 
-    /// Bytes held in memory for comparison: the open block and the window.
+    /// Bytes this writer holds in memory, as it charges them: the open block,
+    /// the window, and the tables that grow with the part. A measure of the
+    /// writer's own accounting; the tests check it against the process's
+    /// resident memory.
     pub fn memory_bytes(&self) -> usize {
-        self.open.len() + self.kept_cost
+        self.open.cost()
+            + self.kept_cost
+            + self.lens.capacity()
+            + self.block_first.capacity() * size_of::<u32>()
+            + self.blocks.capacity() * size_of::<BlockLoc>()
     }
 
     /// Makes every hash equal, so that all pieces share one bucket: the
@@ -397,6 +520,24 @@ mod tests {
     }
 
     #[test]
+    fn add_piece_says_whether_the_piece_is_new_and_find_never_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = PieceWriter::create(tmp.path(), PieceWriterOptions::default()).unwrap();
+        assert_eq!(w.find(b"x"), None);
+        assert_eq!(w.piece_count(), 0);
+        assert_eq!(w.add_piece(b"x").unwrap(), Added { id: 0, new: true });
+        assert_eq!(w.add_piece(b"x").unwrap(), Added { id: 0, new: false });
+        assert_eq!(w.find(b"x"), Some(0));
+        assert_eq!(w.find(b"y"), None);
+        assert_eq!(w.find(b""), None);
+        assert_eq!(w.piece_count(), 1);
+        let sum = w.finish().unwrap();
+        // Every add and every successful find is one reference.
+        assert_eq!(sum.totals.logical_bytes, 3);
+        assert_eq!(sum.totals.pieces, 1);
+    }
+
+    #[test]
     fn a_forced_hash_collision_keeps_different_pieces_apart() {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = PieceWriter::create(tmp.path(), small(64, 1 << 20)).unwrap();
@@ -439,26 +580,33 @@ mod tests {
     }
 
     #[test]
-    fn the_window_bounds_memory_and_the_data_survives() {
+    fn the_window_keeps_its_chains_whole_while_blocks_are_dropped() {
+        // Equal hashes across many blocks, with a window that drops blocks all
+        // the time: every id the map or a chain can reach must be a piece that
+        // is still held, so that lookups never meet a dropped block.
         let tmp = tempfile::tempdir().unwrap();
-        let mut w = PieceWriter::create(tmp.path(), small(4096, 16 * 1024)).unwrap();
-        let mut rng = StdRng::seed_from_u64(5);
+        let mut w = PieceWriter::create(tmp.path(), small(200, 700)).unwrap();
+        w.force_constant_hash();
+        let mut rng = StdRng::seed_from_u64(77);
         let mut texts = Vec::new();
-        let mut peak = 0;
-        for _ in 0..400 {
-            let mut t = vec![0u8; rng.random_range(1..3000usize)];
-            rng.fill_bytes(&mut t);
-            texts.push(t);
+        for _ in 0..600 {
+            // Few distinct texts, so most adds are repeats of something that
+            // may or may not have been dropped.
+            let n = rng.random_range(0..25u8);
+            texts.push(vec![n; 30 + n as usize]);
             w.add(texts.last().unwrap()).unwrap();
-            peak = peak.max(w.memory_bytes());
+            let mut at = w.map.get(&0).copied().unwrap_or(NONE);
+            while at != NONE {
+                let b = w.block(at).expect("a chain reaches a dropped block");
+                at = b.chain[(at - b.first) as usize];
+            }
         }
-        // The open block plus the window, and a little slack for the piece
-        // that closed a block.
-        assert!(peak <= 16 * 1024 + 4096 + 3000, "{peak}");
-        let ids: Vec<u32> = (0..400).collect();
-        let sum = w.finish().unwrap();
-        assert_eq!(sum.totals.pieces, 400);
-        assert_eq!(read_all(tmp.path(), &ids), texts);
+        let n = w.piece_count() as u32;
+        w.finish().unwrap();
+        // Every id up to the count reads back as some text that was added.
+        for got in read_all(tmp.path(), &(0..n).collect::<Vec<_>>()) {
+            assert!(texts.contains(&got));
+        }
     }
 
     #[test]
@@ -526,6 +674,89 @@ mod tests {
     }
 
     #[test]
+    fn many_short_pieces_are_found_by_id_and_cost_a_few_bytes_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = PieceWriter::create(tmp.path(), small(4_096, 1 << 20)).unwrap();
+        let mut rng = StdRng::seed_from_u64(31);
+        let texts: Vec<Vec<u8>> = (0..20_000u32)
+            .map(|i| {
+                // Mostly short, some of a few hundred bytes, all distinct.
+                let mut t = vec![
+                    0u8;
+                    if i % 9 == 0 {
+                        300
+                    } else {
+                        rng.random_range(8..40)
+                    }
+                ];
+                rng.fill_bytes(&mut t);
+                t.extend_from_slice(&i.to_le_bytes());
+                t
+            })
+            .collect();
+        for t in &texts {
+            w.add(t).unwrap();
+        }
+        // The writer's table is the lengths as they are on disk.
+        assert!(w.lens.len() < 2 * texts.len(), "{}", w.lens.len());
+        let sum = w.finish().unwrap();
+        assert_eq!(sum.totals.pieces, texts.len() as u64);
+
+        let r = PieceReader::open(tmp.path()).unwrap();
+        let mut session = r.session();
+        for id in (0..texts.len()).rev().step_by(7) {
+            let mut out = Vec::new();
+            r.read_piece(&mut session, id as u32, &mut out).unwrap();
+            assert_eq!(out, texts[id], "piece {id}");
+        }
+        // All in id order, by block.
+        let mut seen = 0;
+        r.read_sorted(0..texts.len() as u32, |n, bytes| {
+            assert_eq!(bytes, texts[n], "piece {n}");
+            seen += 1;
+        })
+        .unwrap();
+        assert_eq!(seen, texts.len());
+        assert!(
+            r.memory_bytes() < 3 * texts.len(),
+            "{} bytes for {} pieces",
+            r.memory_bytes(),
+            texts.len()
+        );
+    }
+
+    #[test]
+    fn read_sorted_reads_each_block_once_and_refuses_decreasing_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = PieceWriter::create(tmp.path(), small(100, 1 << 20)).unwrap();
+        let texts: Vec<Vec<u8>> = (0..50u8).map(|i| vec![i; 30]).collect();
+        for t in &texts {
+            w.add(t).unwrap();
+        }
+        w.finish().unwrap();
+        let r = PieceReader::open(tmp.path()).unwrap();
+        // Every piece named three times, and in no particular grouping other
+        // than sorted: each block is decompressed once.
+        let ids: Vec<u32> = (0..50u32).flat_map(|i| [i, i, i]).collect();
+        let mut n_seen = 0;
+        r.read_sorted(ids.iter().copied(), |n, bytes| {
+            assert_eq!(bytes, texts[ids[n] as usize]);
+            n_seen += 1;
+        })
+        .unwrap();
+        assert_eq!(n_seen, 150);
+        assert_eq!(r.blocks_loaded() as usize, r.block_count());
+        assert!(matches!(
+            r.read_sorted([5u32, 4], |_, _| {}),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            r.read_sorted([50u32], |_, _| {}),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn zero_pieces_make_a_valid_store() {
         let tmp = tempfile::tempdir().unwrap();
         let w = PieceWriter::create(tmp.path(), PieceWriterOptions::default()).unwrap();
@@ -542,5 +773,64 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut w = PieceWriter::create(tmp.path(), PieceWriterOptions::default()).unwrap();
         assert!(matches!(w.add(b""), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn the_recorded_sums_bind_the_files_to_the_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = PieceWriter::create(tmp.path(), small(64, 1 << 20)).unwrap();
+        for i in 0..20u8 {
+            w.add(&[i; 30]).unwrap();
+        }
+        let sum = w.finish().unwrap();
+        PieceReader::open_recorded(tmp.path(), sum.blocks, sum.index)
+            .unwrap()
+            .verify()
+            .unwrap();
+        let wrong_crc = FileSum {
+            crc32c: sum.index.crc32c ^ 1,
+            ..sum.index
+        };
+        let wrong_len = FileSum {
+            len: sum.index.len + 1,
+            ..sum.index
+        };
+        for (blocks, index) in [
+            (sum.blocks, wrong_crc),
+            (sum.blocks, wrong_len),
+            (
+                FileSum {
+                    len: sum.blocks.len + 1,
+                    ..sum.blocks
+                },
+                sum.index,
+            ),
+        ] {
+            let err = PieceReader::open_recorded(tmp.path(), blocks, index)
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::Corrupt(_)), "{err}");
+        }
+
+        // The checksum of `pieces.idx` tells two stores apart. (Over the whole
+        // file it would not: a file that ends with its own CRC-32C has the same
+        // CRC-32C as every other such file.)
+        let other = tempfile::tempdir().unwrap();
+        let mut w = PieceWriter::create(other.path(), small(64, 1 << 20)).unwrap();
+        for i in 0..20u8 {
+            w.add(&[i ^ 0x55; 30]).unwrap();
+        }
+        let theirs = w.finish().unwrap();
+        assert_eq!(theirs.index.len, sum.index.len, "the lengths must be equal");
+        assert_ne!(theirs.index.crc32c, sum.index.crc32c);
+        let whole = |dir: &Path| crc32c::crc32c(&std::fs::read(dir.join(INDEX_FILE)).unwrap());
+        assert_eq!(whole(tmp.path()), whole(other.path()));
+        let err = PieceReader::open_recorded(other.path(), theirs.blocks, sum.index)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&err, Error::Corrupt(m) if m.contains("checksum") && m.contains(INDEX_FILE)),
+            "{err}"
+        );
     }
 }

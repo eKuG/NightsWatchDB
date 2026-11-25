@@ -17,11 +17,15 @@
 //! messages of an array or key-value list) is under that key; only top-level
 //! keys of the span, an event or a link are matched.
 //!
-//! For a candidate, if its bytes are a JSON array, each top-level element is
-//! cut, and the brackets, commas and whitespace between them stay inline: the
-//! next call that re-sends the conversation then shares every message it
-//! already sent. Otherwise the whole content of the string is one cut. The
-//! tag and length prefix of the string always stay inline.
+//! For a candidate, if its bytes are a JSON array whose elements average at
+//! least [`MIN_AVERAGE_ELEMENT_BYTES`], each top-level element is cut, and the
+//! brackets, commas and whitespace between them stay inline: the next call
+//! that re-sends the conversation then shares every message it already sent.
+//! An array of shorter elements (numbers, short strings) is cut as one piece,
+//! its whole text, so that a sender cannot make the part's piece table grow by
+//! the element; it is still shared and indexed as a unit. Otherwise the whole
+//! content of the string is one cut. The tag and length prefix of the string
+//! always stay inline.
 
 use crate::walk::{Next, Rd, Val};
 use nwdb_core::{PayloadSplitter, RawColumn};
@@ -58,6 +62,10 @@ pub const CONTENT_PREFIXES: &[&str] = &[
 
 /// The default [`OtlpSplitter::min_bytes`].
 pub const DEFAULT_MIN_BYTES: usize = 256;
+
+/// A JSON array whose elements are shorter than this on average is cut as one
+/// piece, not into its elements.
+pub const MIN_AVERAGE_ELEMENT_BYTES: usize = 32;
 
 fn is_content_key(key: &[u8]) -> bool {
     CONTENT_KEYS.iter().any(|k| k.as_bytes() == key)
@@ -202,8 +210,19 @@ impl Walk<'_> {
         };
         let first = self.cuts.len();
         if json_array_elements(b, self.cuts) {
-            for c in &mut self.cuts[first..] {
-                *c = c.start + at..c.end + at;
+            let elements = &mut self.cuts[first..];
+            let total: usize = elements.iter().map(|c| c.len()).sum();
+            if total < MIN_AVERAGE_ELEMENT_BYTES * elements.len() {
+                // Numbers and short strings: a piece, a reference and a table
+                // entry for each would cost more than the element, and the
+                // sender decides how many there are. The array is shared and
+                // indexed as one piece.
+                self.cuts.truncate(first);
+                self.cuts.push(at..at + b.len());
+            } else {
+                for c in elements {
+                    *c = c.start + at..c.end + at;
+                }
             }
         } else {
             self.cuts.push(at..at + b.len());

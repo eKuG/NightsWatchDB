@@ -12,6 +12,7 @@ rust-version.workspace = true
 nwdb-core = { path = "../core" }
 nwdb-payload = { path = "../payload" }
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 parquet = { workspace = true, features = ["arrow", "zstd"] }

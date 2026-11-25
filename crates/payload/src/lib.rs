@@ -21,4 +21,4 @@ mod writer;
 pub use format::{BLOCKS_FILE, INDEX_FILE, MAX_PIECE_BYTES};
 pub use json::{MAX_JSON_DEPTH, json_array_elements};
 pub use reader::{PieceReader, PieceSession};
-pub use writer::{FileSum, PieceWriter, PieceWriterOptions, StoreSummary};
+pub use writer::{Added, FileSum, PieceObserver, PieceWriter, PieceWriterOptions, StoreSummary};

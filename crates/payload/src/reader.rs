@@ -1,29 +1,32 @@
 //! Reading a piece store.
 
-use crate::format::{self, BLOCKS_FILE, INDEX_FILE, Index};
+use crate::format::{self, BLOCKS_FILE, INDEX_FILE, Index, PieceLoc};
 use crate::writer::FileSum;
 use nwdb_core::{Error, PayloadTotals, Result};
-use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A [`PieceSession`] keeps decompressed blocks up to this many bytes; past
-/// it, it drops what it has before keeping another.
-const SESSION_CACHE_BYTES: usize = 32 << 20;
-
 fn blk_corrupt(msg: impl std::fmt::Display) -> Error {
     Error::corrupt(format!("{BLOCKS_FILE}: {msg}"))
 }
 
-/// The blocks one read call has decompressed so far, kept for the duration of
-/// the call so that many pieces of one block cost one decompression. Create
-/// one per call with [`PieceReader::session`].
+fn missing(name: &str, e: std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            Error::corrupt(format!("{name}: file is missing from the part"))
+        }
+        _ => Error::Io(e),
+    }
+}
+
+/// The block one read call decompressed last, kept so that consecutive
+/// pieces of one block cost one decompression. Create one per call with
+/// [`PieceReader::session`]; it holds at most one block.
 #[derive(Default)]
 pub struct PieceSession {
-    blocks: HashMap<u32, Vec<u8>>,
-    bytes: usize,
+    block: Option<(u32, Vec<u8>)>,
 }
 
 /// Read access to a piece store. Holds both files open and the tables in
@@ -43,31 +46,66 @@ impl PieceReader {
     ///
     /// Any damage is [`Error::Corrupt`] naming the file.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        let dir = dir.as_ref();
-        let missing = |name: &str, e: std::io::Error| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                Error::corrupt(format!("{name}: file is missing from the part"))
-            }
-            _ => Error::Io(e),
-        };
+        Self::open_with(dir.as_ref(), None)
+    }
+
+    /// Like [`open`](Self::open), for a store whose two files were recorded
+    /// when it was written (by the part that holds it): the length of each file
+    /// is compared with the record before anything is read, so a file that grew
+    /// is not read at all, and the CRC-32C of `pieces.idx` (see
+    /// [`FileSum::crc32c`]) is compared with the record after it is read. That checksum binds the store to its part,
+    /// since `pieces.idx` holds the checksum of every block; a store taken from
+    /// another part is refused here even when its files have the same lengths.
+    pub fn open_recorded(dir: impl AsRef<Path>, blocks: FileSum, index: FileSum) -> Result<Self> {
+        Self::open_with(dir.as_ref(), Some((blocks, index)))
+    }
+
+    fn open_with(dir: &Path, recorded: Option<(FileSum, FileSum)>) -> Result<Self> {
         let idx = File::open(dir.join(INDEX_FILE)).map_err(|e| missing(INDEX_FILE, e))?;
-        let idx_len = idx.metadata()?.len();
-        let mut idx_bytes = vec![0u8; usize::try_from(idx_len).map_err(Error::other)?];
-        idx.read_exact_at(&mut idx_bytes, 0)?;
-        let index = format::decode(&idx_bytes)?;
         let blk = File::open(dir.join(BLOCKS_FILE)).map_err(|e| missing(BLOCKS_FILE, e))?;
-        let len = blk.metadata()?.len();
-        if len != index.blk_len() {
+        let idx_len = idx.metadata()?.len();
+        let blk_len = blk.metadata()?.len();
+        if let Some((blocks, index)) = recorded {
+            for (name, found, want) in [
+                (INDEX_FILE, idx_len, index.len),
+                (BLOCKS_FILE, blk_len, blocks.len),
+            ] {
+                if found != want {
+                    return Err(Error::corrupt(format!(
+                        "{name}: file has {found} bytes but the part's index recorded {want}"
+                    )));
+                }
+            }
+        }
+        let mut idx_bytes = Vec::new();
+        idx_bytes
+            .try_reserve_exact(usize::try_from(idx_len).map_err(Error::other)?)
+            .map_err(|_| format::corrupt(format!("{idx_len} bytes is too long")))?;
+        idx_bytes.resize(idx_len as usize, 0);
+        idx.read_exact_at(&mut idx_bytes, 0)?;
+        if let Some((_, index)) = recorded {
+            let crc = crc32c::crc32c(&idx_bytes[..idx_bytes.len().saturating_sub(4)]);
+            if crc != index.crc32c {
+                return Err(format::corrupt(format!(
+                    "checksum mismatch: CRC-32C is {crc:#010x} but the part's index recorded \
+                     {:#010x}; the file belongs to another part or is damaged",
+                    index.crc32c
+                )));
+            }
+        }
+        let index = format::decode(&idx_bytes)?;
+        drop(idx_bytes);
+        if blk_len != index.blk_len() {
             return Err(blk_corrupt(format!(
-                "file has {len} bytes but {INDEX_FILE} describes {}",
+                "file has {blk_len} bytes but {INDEX_FILE} describes {}",
                 index.blk_len()
             )));
         }
         let totals = PayloadTotals {
-            pieces: index.pieces.len() as u64,
+            pieces: index.piece_count,
             logical_bytes: index.logical_bytes,
-            unique_bytes: index.unique_bytes(),
-            stored_bytes: len,
+            unique_bytes: index.unique_bytes,
+            stored_bytes: blk_len,
         };
         Ok(Self {
             blk,
@@ -99,6 +137,13 @@ impl PieceReader {
         self.index.blocks.len()
     }
 
+    /// Heap bytes this reader holds for the block and piece tables, which is
+    /// what an open store costs in memory besides its file handles: about
+    /// one to three bytes per piece.
+    pub fn memory_bytes(&self) -> usize {
+        self.index.memory_bytes()
+    }
+
     /// How many times a block has been read and decompressed since the store
     /// was opened (a test and monitoring aid).
     pub fn blocks_loaded(&self) -> u64 {
@@ -110,20 +155,18 @@ impl PieceReader {
         PieceSession::default()
     }
 
-    /// The length of piece `id`, without reading it.
-    pub fn piece_len(&self, id: u32) -> Result<u64> {
-        self.index
-            .pieces
-            .get(id as usize)
-            .map(|p| u64::from(p.len))
-            .ok_or_else(|| self.bad_id(id))
+    fn locate(&self, id: u32) -> Result<PieceLoc> {
+        self.index.locate(id).ok_or_else(|| {
+            blk_corrupt(format!(
+                "a stored value refers to piece {id} but the store has {}",
+                self.index.piece_count
+            ))
+        })
     }
 
-    fn bad_id(&self, id: u32) -> Error {
-        blk_corrupt(format!(
-            "a stored value refers to piece {id} but the store has {}",
-            self.index.pieces.len()
-        ))
+    /// The length of piece `id`, without reading it.
+    pub fn piece_len(&self, id: u32) -> Result<u64> {
+        self.locate(id).map(|p| u64::from(p.len))
     }
 
     /// Reads, checks and decompresses one block.
@@ -162,27 +205,56 @@ impl PieceReader {
     ///
     /// The block is checked against its checksum every time it is
     /// decompressed, so what is appended is what was written or the result is
-    /// [`Error::Corrupt`].
+    /// [`Error::Corrupt`]. The session keeps the block, so reading the pieces
+    /// of one block one after the other costs one decompression.
     pub fn read_piece(&self, session: &mut PieceSession, id: u32, out: &mut Vec<u8>) -> Result<()> {
-        let p = *self
-            .index
-            .pieces
-            .get(id as usize)
-            .ok_or_else(|| self.bad_id(id))?;
+        let p = self.locate(id)?;
         let (from, to) = (p.offset as usize, p.offset as usize + p.len as usize);
-        if let Some(data) = session.blocks.get(&p.block) {
+        if let Some((block, data)) = &session.block
+            && *block == p.block
+        {
             out.extend_from_slice(&data[from..to]);
             return Ok(());
         }
+        session.block = None;
         let data = self.load(p.block)?;
         out.extend_from_slice(&data[from..to]);
-        if data.len() <= SESSION_CACHE_BYTES {
-            if session.bytes + data.len() > SESSION_CACHE_BYTES {
-                session.blocks.clear();
-                session.bytes = 0;
+        session.block = Some((p.block, data));
+        Ok(())
+    }
+
+    /// Calls `f(n, bytes)` with the bytes of the piece named by the `n`th id of
+    /// `ids`, which must not decrease. Each block is read and decompressed
+    /// once however many of its pieces are named, and only one decompressed
+    /// block is held at a time: this is how many pieces are rebuilt together
+    /// at the cost of the blocks they lie in, not of the references to them.
+    ///
+    /// Fails with [`Error::Corrupt`] for a piece that does not exist or a
+    /// block that is damaged, and with [`Error::InvalidArgument`] if the ids
+    /// decrease.
+    pub fn read_sorted(
+        &self,
+        ids: impl IntoIterator<Item = u32>,
+        mut f: impl FnMut(usize, &[u8]),
+    ) -> Result<()> {
+        let mut current: Option<(u32, Vec<u8>)> = None;
+        let mut last = 0u32;
+        for (n, id) in ids.into_iter().enumerate() {
+            if id < last {
+                return Err(Error::invalid_argument(
+                    "read_sorted needs ids that do not decrease",
+                ));
             }
-            session.bytes += data.len();
-            session.blocks.insert(p.block, data);
+            last = id;
+            let p = self.locate(id)?;
+            if current.as_ref().is_none_or(|(block, _)| *block != p.block) {
+                // Free the old block before the next one is read.
+                drop(current.take());
+                current = Some((p.block, self.load(p.block)?));
+            }
+            if let Some((_, data)) = &current {
+                f(n, &data[p.offset as usize..(p.offset + p.len) as usize]);
+            }
         }
         Ok(())
     }
@@ -193,8 +265,8 @@ impl PieceReader {
     /// is not the one it had when the store was opened.
     pub fn file_sums(&self) -> Result<(FileSum, FileSum)> {
         Ok((
-            sum_of(&self.blk, BLOCKS_FILE, self.totals.stored_bytes)?,
-            sum_of(&self.idx, INDEX_FILE, self.idx_len)?,
+            sum_of(&self.blk, BLOCKS_FILE, self.totals.stored_bytes, 0)?,
+            sum_of(&self.idx, INDEX_FILE, self.idx_len, IDX_TRAILER)?,
         ))
     }
 
@@ -208,8 +280,12 @@ impl PieceReader {
     }
 }
 
-/// Length and CRC-32C of a whole file, which must still be `opened_len` bytes.
-fn sum_of(file: &File, name: &str, opened_len: u64) -> Result<FileSum> {
+/// Length of the checksum `pieces.idx` ends with, which [`FileSum`] leaves out.
+const IDX_TRAILER: u64 = 4;
+
+/// Length and CRC-32C of a file, which must still be `opened_len` bytes, of
+/// every byte but the last `tail`.
+fn sum_of(file: &File, name: &str, opened_len: u64, tail: u64) -> Result<FileSum> {
     let now = file.metadata()?.len();
     if now != opened_len {
         return Err(Error::corrupt(format!(
@@ -219,8 +295,9 @@ fn sum_of(file: &File, name: &str, opened_len: u64) -> Result<FileSum> {
     let mut crc = 0u32;
     let mut buf = vec![0u8; 1 << 20];
     let mut at = 0u64;
-    while at < opened_len {
-        let n = (opened_len - at).min(buf.len() as u64) as usize;
+    let end = opened_len.saturating_sub(tail);
+    while at < end {
+        let n = (end - at).min(buf.len() as u64) as usize;
         file.read_exact_at(&mut buf[..n], at)
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::UnexpectedEof => {

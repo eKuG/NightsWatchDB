@@ -551,14 +551,21 @@ fn index_file_known_answer() {
 
     let mut want: Vec<u8> = Vec::new();
     want.extend_from_slice(b"NWTI");
-    want.extend_from_slice(&[4, 0, 0, 0]);
+    want.extend_from_slice(&[5, 0, 0, 0]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
     // Length (u64) and CRC-32C (u32) of spans.parquet, summary.parquet,
     // pieces.blk and pieces.idx.
     for file in [SPANS_FILE, SUMMARY_FILE, PIECES_BLK, PIECES_IDX] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
         want.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        want.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+        // pieces.idx ends with its own CRC-32C, which the recorded one leaves
+        // out: over the whole file it would be the same for every part.
+        let counted = if file == PIECES_IDX {
+            &bytes[..bytes.len() - 4]
+        } else {
+            &bytes[..]
+        };
+        want.extend_from_slice(&crc32c::crc32c(counted).to_le_bytes());
     }
     assert_eq!(want.len(), 64);
     // Trace 0x05: first row 2, one row, start -50, end 40.
@@ -1095,7 +1102,7 @@ fn part_meta_describes_the_part() {
 
     assert_eq!(meta.part_id, 42);
     assert_eq!(meta.level, 0);
-    assert_eq!(meta.format_version, 4);
+    assert_eq!(meta.format_version, 5);
     assert_eq!(meta.window_start_ns, window_start);
     assert_eq!(meta.window_ns, WINDOW_NS);
     assert_eq!(meta.rows, spans.len() as u64);

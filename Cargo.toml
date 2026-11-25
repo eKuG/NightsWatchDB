@@ -17,6 +17,7 @@ rust-version = "1.100"
 # future parquet crate must be pinned to the same version, and bumped in one
 # commit.
 arrow-array = "=60.2.0"
+arrow-buffer = "=60.2.0"
 arrow-schema = "=60.2.0"
 arrow-select = "=60.2.0"
 parquet = { version = "=60.2.0", default-features = false }

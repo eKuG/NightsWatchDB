@@ -200,6 +200,9 @@ pub struct EngineStats {
     /// Bytes of large text the live parts' rows refer to, counting each use:
     /// what storing it inside every row would take.
     pub payload_logical_bytes: u64,
+    /// The sum of the lengths of the distinct pieces in the live parts' piece
+    /// stores: what is stored once, before compression.
+    pub payload_unique_bytes: u64,
     /// Bytes the live parts' piece stores take on disk, compressed. The
     /// distance from `payload_logical_bytes` is what sharing saves.
     pub payload_stored_bytes: u64,
@@ -793,6 +796,12 @@ impl Engine {
                 .parts
                 .iter()
                 .map(|p| p.meta.payload.logical_bytes)
+                .sum(),
+            payload_unique_bytes: c
+                .vis
+                .parts
+                .iter()
+                .map(|p| p.meta.payload.unique_bytes)
                 .sum(),
             payload_stored_bytes: c
                 .vis

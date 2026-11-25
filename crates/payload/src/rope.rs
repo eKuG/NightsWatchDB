@@ -9,28 +9,38 @@
 //! ```text
 //! empty value        ->  (no bytes)
 //! value with no cuts ->  0x00, the value
-//! value with cuts    ->  0x01, then segments until the end:
+//! value with cuts    ->  0x03, CRC-32C of the value (u32, little endian),
+//!                        then segments until the end:
 //!                          varint(len << 1),     len bytes of inline data
 //!                          varint(id << 1 | 1)   a reference to piece `id`
 //! ```
 //!
 //! A value without cuts therefore costs one byte more than the value, and an
-//! empty value costs nothing. A reference costs one to five bytes. Varints
-//! are the usual little-endian base-128 form. Inline segments are never
-//! empty, and two segments of one kind may follow each other (two adjacent
-//! cuts are two references).
+//! empty value costs nothing. A value with cuts carries the checksum of the
+//! bytes it rebuilds to, so that a damaged reference, which Parquet would not
+//! notice, cannot splice in another value's text unseen: the reader checks it
+//! after rebuilding. A reference costs one to five bytes. Varints are the
+//! usual little-endian base-128 form. Inline segments are never empty, and
+//! two segments of one kind may follow each other (two adjacent cuts are two
+//! references).
 
 use nwdb_core::Error;
 use std::ops::Range;
 
 const TAG_INLINE: u8 = 0;
-const TAG_SEGMENTS: u8 = 1;
+/// Differs from `TAG_INLINE` in two bits, so that one flipped bit in the tag can
+/// never turn a rope with references into a value that is taken as its own
+/// bytes or the other way round.
+const TAG_SEGMENTS: u8 = 3;
+const CRC_LEN: usize = 4;
 
 /// Why a rope could not be read.
 #[derive(Debug)]
 pub enum RopeError {
     /// The rope's own bytes are wrong.
     Malformed(&'static str),
+    /// The rebuilt value does not have the checksum the rope carries.
+    Checksum,
     /// Fetching a piece failed.
     Piece(Error),
 }
@@ -103,6 +113,7 @@ pub fn encode_cut(value: &[u8], cuts: &[Range<usize>], ids: &[u32], out: &mut Ve
         return encode_inline(value, out);
     }
     out.push(TAG_SEGMENTS);
+    out.extend_from_slice(&crc32c::crc32c(value).to_le_bytes());
     let mut at = 0;
     for (cut, &id) in cuts.iter().zip(ids) {
         if cut.start > at {
@@ -130,7 +141,10 @@ pub fn segments(rope: &[u8]) -> Segments<'_> {
                 failed: None,
             };
         }
-        Some((&TAG_SEGMENTS, rest)) => (rest, None),
+        Some((&TAG_SEGMENTS, rest)) => match rest.split_at_checked(CRC_LEN) {
+            Some((_, segments)) => (segments, None),
+            None => (&rope[..0], Some(RopeError::Malformed("truncated checksum"))),
+        },
         Some(_) => (&rope[..0], Some(RopeError::Malformed("unknown rope tag"))),
     };
     Segments {
@@ -138,6 +152,29 @@ pub fn segments(rope: &[u8]) -> Segments<'_> {
         whole: None,
         failed,
     }
+}
+
+/// The checksum a rope with cuts carries: the CRC-32C of the value it
+/// rebuilds to. `None` for a rope without cuts, an empty one, or one too
+/// short to hold it.
+pub fn checksum(rope: &[u8]) -> Option<u32> {
+    match rope.split_first() {
+        Some((&TAG_SEGMENTS, rest)) => rest
+            .first_chunk::<CRC_LEN>()
+            .map(|c| u32::from_le_bytes(*c)),
+        _ => None,
+    }
+}
+
+/// The ids of the pieces a rope refers to, in order of appearance (an id that
+/// appears twice is yielded twice). Yields an error (once) at the first
+/// malformed byte and then ends.
+pub fn piece_ids(rope: &[u8]) -> impl Iterator<Item = Result<u32, RopeError>> + '_ {
+    segments(rope).filter_map(|s| match s {
+        Ok(Segment::Piece(id)) => Some(Ok(id)),
+        Ok(Segment::Inline(_)) => None,
+        Err(e) => Some(Err(e)),
+    })
 }
 
 /// Iterator returned by [`segments`].
@@ -186,19 +223,26 @@ impl<'a> Iterator for Segments<'a> {
 }
 
 /// Appends the value a rope stands for to `out`. `piece` appends the bytes of
-/// the piece with the given id to the vector it is given.
+/// the piece with the given id to the vector it is given. If the rope carries
+/// a checksum and the rebuilt value does not match it, the result is
+/// [`RopeError::Checksum`] and `out` holds the bytes that failed: the caller
+/// must not use them.
 pub fn decode(
     rope: &[u8],
     mut piece: impl FnMut(u32, &mut Vec<u8>) -> Result<(), Error>,
     out: &mut Vec<u8>,
 ) -> Result<(), RopeError> {
+    let start = out.len();
     for seg in segments(rope) {
         match seg? {
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::Piece(id) => piece(id, out).map_err(RopeError::Piece)?,
         }
     }
-    Ok(())
+    match checksum(rope) {
+        Some(want) if crc32c::crc32c(&out[start..]) != want => Err(RopeError::Checksum),
+        _ => Ok(()),
+    }
 }
 
 /// The length of the value a rope stands for, without reading any piece:
@@ -276,7 +320,99 @@ mod tests {
         assert_eq!(out.len(), 1001);
         out.clear();
         encode_cut(&[7u8; 1000], &[0..1000], &[5], &mut out);
-        assert_eq!(out, [TAG_SEGMENTS, 11]);
+        // The tag, the checksum of the value, one reference.
+        assert_eq!(out.len(), 1 + 4 + 1);
+        assert_eq!(out[0], TAG_SEGMENTS);
+        assert_eq!(checksum(&out), Some(crc32c::crc32c(&[7u8; 1000])));
+        assert_eq!(out[5], 11);
+        assert_eq!(checksum(b""), None);
+        assert_eq!(checksum(&[TAG_INLINE, 1, 2, 3, 4, 5]), None);
+        assert_eq!(piece_ids(&out).collect::<Vec<_>>().len(), 1);
+    }
+
+    /// Six pieces: four of 8 bytes, two of 5.
+    fn store() -> Vec<Vec<u8>> {
+        let mut s: Vec<Vec<u8>> = (0..4u8).map(|i| vec![b'a' + i; 8]).collect();
+        s.extend((4..6u8).map(|i| vec![b'a' + i; 5]));
+        s
+    }
+
+    fn rebuild(rope: &[u8], store: &[Vec<u8>]) -> Result<Vec<u8>, RopeError> {
+        let mut out = Vec::new();
+        decode(
+            rope,
+            |id, out| match store.get(id as usize) {
+                Some(p) => {
+                    out.extend_from_slice(p);
+                    Ok(())
+                }
+                None => Err(Error::corrupt("no such piece")),
+            },
+            &mut out,
+        )
+        .map(|()| out)
+    }
+
+    #[test]
+    fn no_damaged_rope_rebuilds_to_other_bytes() {
+        let store = store();
+        let mut value = b"xy".to_vec();
+        value.extend_from_slice(&store[0]);
+        value.extend_from_slice(&store[1]);
+        value.push(b'z');
+        value.extend_from_slice(&store[2]);
+        let cuts = [2..10, 10..18, 19..27];
+        let mut good = Vec::new();
+        encode_cut(&value, &cuts, &[0, 1, 2], &mut good);
+        assert_eq!(rebuild(&good, &store).unwrap(), value);
+
+        // Every bit of the rope, flipped: an error, or the same value.
+        for i in 0..good.len() {
+            for bit in 0..8 {
+                let mut bad = good.clone();
+                bad[i] ^= 1 << bit;
+                if let Ok(got) = rebuild(&bad, &store) {
+                    assert_eq!(got, value, "byte {i} bit {bit}");
+                }
+            }
+        }
+
+        // A reference to another piece of the same length, to one of another
+        // length, the segments in another order, a repeated piece, one
+        // missing, a piece that does not exist: each keeps the original
+        // checksum and so each must fail.
+        let forged = |ids: &[u32], cuts: &[Range<usize>], v: &[u8]| {
+            let mut r = Vec::new();
+            encode_cut(v, cuts, ids, &mut r);
+            r[1..5].copy_from_slice(&good[1..5]);
+            r
+        };
+        let mut v = value.clone();
+        for (ids, what) in [
+            (&[3u32, 1, 2][..], "same length"),
+            (&[4, 1, 2], "another length"),
+            (&[1, 0, 2], "reordered"),
+            (&[0, 0, 2], "repeated"),
+            (&[0, 1, 99], "missing piece"),
+        ] {
+            let r = forged(ids, &cuts, &v);
+            assert!(
+                matches!(
+                    rebuild(&r, &store),
+                    Err(RopeError::Checksum | RopeError::Piece(_))
+                ),
+                "{what}"
+            );
+        }
+        // Fewer references than the value had, the rest dropped.
+        v.truncate(18);
+        let r = forged(&[0, 1], &cuts[..2], &v);
+        assert!(matches!(rebuild(&r, &store), Err(RopeError::Checksum)));
+        // A rope with no checksum bytes at all is malformed, not trusted.
+        assert!(matches!(
+            rebuild(&[TAG_SEGMENTS, 1, 2], &store),
+            Err(RopeError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -316,10 +452,12 @@ mod tests {
         }
         for bad in [
             &[2u8][..],
-            &[1, 0x80],
-            &[1, 20, 1],
-            &[1, 0],
-            &[1, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f],
+            &[3],
+            &[3, 0, 0, 0],
+            &[3, 0, 0, 0, 0, 0x80],
+            &[3, 0, 0, 0, 0, 20, 1],
+            &[3, 0, 0, 0, 0, 0],
+            &[3, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f],
         ] {
             assert!(matches!(
                 decode(bad, none, &mut Vec::new()),
