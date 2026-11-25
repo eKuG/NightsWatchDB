@@ -72,12 +72,26 @@ Both `--flag value` and `--flag=value` work.
 | `--otlp-grpc-addr` | `NWDB_OTLP_GRPC_ADDR` | `127.0.0.1:4317` |
 | `--api-addr` | `NWDB_API_ADDR` | `127.0.0.1:4320` |
 | `--api-allowed-hosts` | `NWDB_API_ALLOWED_HOSTS` | none; comma-separated host names |
+| `--accept-lost-log` | `NWDB_ACCEPT_LOST_LOG` | off; a switch (the variable is `1`, `true`, `0` or `false`) |
 | `--help` | | print the options |
 | `--version` | | print the version |
 
 Addresses are `IP:PORT`; host names are not resolved. The data directory is
 locked: a second process on the same directory fails to start. An argument or
 a `NWDB_*` variable that is not valid UTF-8 is a usage error (exit code 2).
+
+### A lost log
+
+The database records how far the write-ahead log has been flushed into parts.
+If the log's files are gone or end below that position (a deleted `wal`
+directory, a restored partial backup), the records acknowledged after the last
+flush are lost, and the engine refuses to start rather than carry on as if
+nothing happened. The process prints the engine's message, a line naming
+`--accept-lost-log`, and exits with code 1. First look for the files: restoring
+them lets the database open with nothing lost. Pass `--accept-lost-log` (or
+set `NWDB_ACCEPT_LOST_LOG=1`) only when they cannot be found and losing those
+records is acceptable: the server then starts a new log above the position and
+carries on with the parts that exist. A new database is never refused.
 
 Logs are plain lines on standard error: the addresses, a recovery summary,
 shutdown and errors. Nothing is logged per request.
@@ -116,12 +130,16 @@ For each call:
    A size above the limit is refused. Decompression stops at the stated size;
    more output, a different size, bytes after the compressed data, or corrupt
    data is an error.
-6. The request is decoded on a blocking thread. A request with no spans gets a
-   success reply and nothing is stored.
+6. The request is decoded on a blocking thread. Spans that cannot be stored (a
+   trace or span id of the wrong length or all zero, a resource or scope over
+   the decoder's limit) are skipped and counted; the rest is stored. A request
+   with no spans left gets a success reply and nothing is logged.
 7. Otherwise it is handed to the engine. **The reply is sent only after the
    record is durable in the write-ahead log.** The reply is HTTP 200 with
-   `content-type: application/grpc`, one message (an empty
-   `ExportTraceServiceResponse`) and the trailer `grpc-status: 0`.
+   `content-type: application/grpc`, one message and the trailer
+   `grpc-status: 0`. The message is an empty `ExportTraceServiceResponse`, or,
+   if spans were skipped, one with `partial_success` carrying their number and
+   the reason; senders do not retry those.
 
 Errors are replies with HTTP 200 and `grpc-status` and `grpc-message` in the
 headers and no body:
@@ -146,9 +164,11 @@ The budget (256 MiB by default) is split in two halves of one pool each:
   budget. Before a message has its bytes, a stream holds at most one HTTP/2
   frame (16 KiB), and a connection has a flow-control window of 128 KiB.
 - **Expansion and decoding.** Before decompression and decoding a message
-  takes 8 times its decompressed size (the stated size for compressed
-  messages) from the second half. Decoded batches are the main memory use, and
-  8 times is an estimate of them.
+  takes 11 times its decompressed size (the stated size for compressed
+  messages) from the second half. Decoded batches are the main memory use. The
+  number comes from the decoder's measured worst case: 10.1 times the request
+  for requests made only of spans that carry nothing but their ids (see the
+  README of the otlp crate), rounded up; each batch also adds a fixed 64 KiB.
 
 Two pools, not one, so that a request never waits for more of a pool it holds
 a part of. A request that needs more than a whole pool is charged the whole
@@ -174,7 +194,8 @@ Time values are Unix nanoseconds, written as the unsigned numbers the sender
 sent. `from` is inclusive and `to` exclusive (both are signed 64-bit numbers).
 By default `to` is now and `from` is one hour earlier.
 
-**`GET /healthz`** returns `ok`.
+**`GET /healthz`** returns `ok`, or 503 with a JSON error when the engine is in
+its fatal state (it accepts and flushes nothing; restart it).
 
 ```sh
 curl http://127.0.0.1:4320/healthz
@@ -182,7 +203,7 @@ curl http://127.0.0.1:4320/healthz
 
 **`GET /api/v1/stats`** returns the engine counters: `records_ingested`,
 `bytes_ingested`, `acked_lsn`, `flushed_lsn`, `buffered_bytes`, `parts`,
-`flushes`, `flushing`, `last_error`.
+`flushes`, `flushing`, `fatal`, `last_error`.
 
 ```sh
 curl http://127.0.0.1:4320/api/v1/stats
@@ -203,13 +224,20 @@ columns (`operation`, `provider`,
 `request_model`, `response_model`, `input_tokens`, `output_tokens`,
 `conversation_id`, `session_id`, `user_id`, `agent_name`, `tool_name`,
 `error_type`), `flags` and the three `dropped_*_count` fields when not zero,
-and `resource` and `attributes` (objects), `scope_attributes` (object, only
-when the scope has attributes), `events` and `links` (arrays).
+and `resource` and `attributes` (objects), `resource_dropped_attributes_count`
+and `scope_dropped_attributes_count` (when not zero), `scope_attributes`
+(object, only when the scope has attributes), `events` and `links` (arrays).
+The JSON of a trace is streamed in chunks of about 64 KiB as it is written
+(`Transfer-Encoding: chunked`), so a trace is never held as JSON; the rows of
+the trace are still held in memory. Whatever is stored, the output is valid
+JSON: bytes that cannot be read are shown as `{"$unparsed": "<base64>"}` (see
+the otlp README). If the server fails in the middle of a response, the
+connection is cut instead of the body being ended. Keys of an object appear in
+stored order and a key the sender repeated appears twice.
 Attribute values map as follows: strings, bools and ints as themselves;
 doubles as numbers, with NaN and the infinities as the strings `"NaN"`,
 `"Infinity"`, `"-Infinity"`; arrays as arrays; key-value lists as objects;
-bytes as base64; an unset value as `null`. When a key occurs twice the last
-value wins.
+bytes as base64; an unset value as `null`. 
 
 If `Accept` contains the media range `application/x-protobuf` with a quality
 other than 0, the response is the trace as an OTLP `ExportTraceServiceRequest`
@@ -246,7 +274,8 @@ On SIGTERM or SIGINT the server stops accepting connections and asks every
 open connection to finish. It waits up to 5 s (`drain_timeout` in
 `ServerOptions`) for requests in progress, then drops whatever is left, so an
 open but stalled export stream or an idle client never delays shutdown. Then
-it flushes the engine and exits with code 0. After a fatal engine error it
+it flushes the engine and exits with code 0. After a fatal engine error (met by
+a request, or by the background flush, which is checked once a second) it
 does the same and exits with code 1. A second SIGTERM or SIGINT exits at once
 with code 130; that is safe, because the next start replays the log. After a
 crash or `kill -9` the next start replays the log; nothing that was
@@ -257,6 +286,7 @@ acknowledged, and their senders retry.
 
 - OTLP over HTTP, and logs and metrics (only trace export over gRPC).
 - Authentication and TLS.
-- Streaming of large traces: a whole trace is held in memory to render it.
+- Streaming from storage: the rows of a trace are held in memory while it is
+  rendered, though its JSON is not.
 - Counts and token sums may include a span twice if a sender retried it across
   a flush (see the engine README, "Known limits").

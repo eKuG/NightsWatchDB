@@ -3,7 +3,7 @@
 # Extra arguments are passed to `cargo test`. See scripts/README.md.
 set -eu
 
-IMAGE=rust:1.100.0-bookworm
+IMAGE=rust:1.100.0-bookworm@sha256:75d26c23c24cc6ea1cdabf0714a6bff8fd7bf3248716043fd7ae86dac7f41b94
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 # The source is mounted read-only, so the target directory lives in a volume.

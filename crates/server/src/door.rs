@@ -20,8 +20,11 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 const EXPORT_PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 const ACCEPT_ENCODING: &str = "identity,gzip,zstd";
 
-/// How much larger than its bytes a decoded request is assumed to be.
-const DECODE_FACTOR: usize = 8;
+/// How much larger than its bytes a decoded request is assumed to be. The
+/// worst case measured for the decoder is 10.1 times the request (requests
+/// of spans that carry only their ids, see the README of the otlp crate), so
+/// 11 leaves room for what each batch adds on top.
+const DECODE_FACTOR: usize = 11;
 /// Zstd frames that ask for a window above 2^23 bytes (8 MiB) are refused:
 /// the decoder would allocate the window before we see any output.
 const ZSTD_WINDOW_LOG_MAX: u32 = 23;
@@ -370,12 +373,10 @@ pub(crate) async fn handle(
     shared: Arc<Shared>,
     req: Request<Incoming>,
 ) -> Result<Response<Reply>, Infallible> {
-    Ok(reply(
-        export(&shared, req).await.map(|()| export_response(0, "")),
-    ))
+    Ok(reply(export(&shared, req).await))
 }
 
-async fn export(shared: &Shared, req: Request<Incoming>) -> Result<(), Fail> {
+async fn export(shared: &Shared, req: Request<Incoming>) -> Result<Vec<u8>, Fail> {
     let grpc = req
         .headers()
         .get(CONTENT_TYPE)
@@ -415,16 +416,22 @@ async fn export(shared: &Shared, req: Request<Incoming>) -> Result<(), Fail> {
         } else {
             data
         };
-        let decoded = decoder.decode(&data);
+        let decoded = decoder.decode_with_stats(&data);
         Ok::<_, Fail>((data, decoded))
     })
     .await
     .map_err(|_| Fail::new(INTERNAL, "decoding failed"))??;
     // A request that cannot be decoded will never decode: the sender must not
     // retry it.
-    let batches = decoded.map_err(|e| Fail::new(INVALID_ARGUMENT, e.to_string()))?;
+    let (batches, stats) = decoded.map_err(|e| Fail::new(INVALID_ARGUMENT, e.to_string()))?;
+    // Spans the decoder skipped are reported to the sender, who must not
+    // retry them: the rest of the request is stored.
+    let response = export_response(
+        stats.rejected_spans,
+        stats.rejected_reason.as_deref().unwrap_or(""),
+    );
     if batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok(());
+        return Ok(response);
     }
 
     let (tx, rx) = oneshot::channel();
@@ -437,7 +444,7 @@ async fn export(shared: &Shared, req: Request<Incoming>) -> Result<(), Fail> {
         .map_err(|e| shared.fail(&e))?;
     // The reply goes out only after the record is durable.
     match rx.await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => Ok(response),
         Ok(Err(e)) => Err(shared.fail(&e)),
         Err(_) => Err(Fail::new(INTERNAL, "the engine dropped the request")),
     }

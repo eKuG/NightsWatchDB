@@ -26,6 +26,9 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
 
+/// How often [`Server::fatal`] looks at the engine's fatal flag.
+const FATAL_CHECK: Duration = Duration::from_secs(1);
+
 /// Settings of [`Server::start`].
 pub struct ServerOptions {
     /// The storage engine's settings, including the data directory.
@@ -184,7 +187,16 @@ impl Server {
     /// then [`shutdown`](Self::shutdown) and exit with a failure so that a
     /// supervisor restarts the process and recovery runs.
     pub async fn fatal(&self) {
-        self.fatal.notified().await;
+        // A request that meets the error says so at once. An error in the
+        // background (a flush) has no request to tell, so the flag is looked
+        // at once a second as well.
+        let mut tick = tokio::time::interval(FATAL_CHECK);
+        loop {
+            tokio::select! {
+                () = self.fatal.notified() => return,
+                _ = tick.tick() => if self.engine.stats().fatal { return },
+            }
+        }
     }
 
     /// Stops accepting and asks open connections to finish. After

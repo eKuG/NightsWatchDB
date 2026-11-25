@@ -50,6 +50,7 @@ async fn run(config: Config) -> ExitCode {
     options.otlp_grpc_addr = config.otlp_grpc_addr;
     options.api_addr = config.api_addr;
     options.api_allowed_hosts = config.api_allowed_hosts;
+    options.engine.accept_lost_log = config.accept_lost_log;
     eprintln!(
         "nightswatchdb {}: opening {}",
         env!("CARGO_PKG_VERSION"),
@@ -59,6 +60,13 @@ async fn run(config: Config) -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!("nightswatchdb: cannot start: {e}");
+            if e.to_string().contains("accept_lost_log") {
+                eprintln!(
+                    "nightswatchdb: log files were lost. To start anyway and give up the \
+                     records acknowledged since the last flush, pass --accept-lost-log \
+                     (or set NWDB_ACCEPT_LOST_LOG=1)."
+                );
+            }
             return ExitCode::FAILURE;
         }
     };

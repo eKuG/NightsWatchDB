@@ -567,3 +567,64 @@ async fn shutdown_returns_while_a_stalled_stream_is_open() {
         began.elapsed()
     );
 }
+
+/// A database whose log directory was deleted after data was flushed: the
+/// binary refuses to start, says why and names the flag; with the flag it
+/// starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_log_is_refused_unless_accepted() {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let r = export(&mut c, None, vec![message(false, &one_span(0x81))]).await;
+    assert_eq!(r.code, OK, "{}", r.message);
+    // A clean shutdown flushes the data into a part.
+    server.shutdown().await.unwrap();
+    let wal = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().contains("wal"))
+        .expect("a log directory");
+    std::fs::remove_dir_all(&wal).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_nightswatchdb");
+    let args = [
+        "--otlp-grpc-addr",
+        "127.0.0.1:0",
+        "--api-addr",
+        "127.0.0.1:0",
+        "--data-dir",
+    ];
+    let refused = Command::new(bin)
+        .args(args)
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(err.contains("--accept-lost-log"), "{err}");
+    assert!(err.contains("cannot start"), "{err}");
+
+    let mut child = Command::new(bin)
+        .args(args)
+        .arg(dir.path())
+        .arg("--accept-lost-log")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stderr.take().unwrap()).lines();
+    loop {
+        let line = lines.next().expect("exited before listening").unwrap();
+        if line.starts_with("listening:") {
+            break;
+        }
+    }
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    std::thread::spawn(move || lines.for_each(drop));
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+}

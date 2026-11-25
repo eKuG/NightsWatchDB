@@ -3,7 +3,9 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use nwdb_server::{Server, ServerOptions};
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value::Value as V,
 };
@@ -97,6 +99,21 @@ async fn export(
 
 // ---- HTTP client ----
 
+/// The body of a chunked response without the chunk framing.
+fn dechunk(mut raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let eol = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&raw[..eol]).unwrap().trim(), 16).unwrap();
+        if size == 0 {
+            return out;
+        }
+        out.extend_from_slice(&raw[eol + 2..eol + 2 + size]);
+        raw = &raw[eol + 2 + size + 2..];
+    }
+}
+
 struct Resp {
     status: u16,
     headers: String,
@@ -127,7 +144,11 @@ fn http_blocking(addr: SocketAddr, method: &str, target: &str, accept: Option<&s
     Resp {
         status,
         headers: head.to_lowercase(),
-        body: raw[split + 4..].to_vec(),
+        body: if head.to_lowercase().contains("transfer-encoding: chunked") {
+            dechunk(&raw[split + 4..])
+        } else {
+            raw[split + 4..].to_vec()
+        },
     }
 }
 
@@ -899,7 +920,11 @@ fn http_host_blocking(addr: SocketAddr, host: &str, target: &str) -> Resp {
     Resp {
         status: head.split(' ').nth(1).unwrap().parse().unwrap(),
         headers: head.to_lowercase(),
-        body: raw[split + 4..].to_vec(),
+        body: if head.to_lowercase().contains("transfer-encoding: chunked") {
+            dechunk(&raw[split + 4..])
+        } else {
+            raw[split + 4..].to_vec()
+        },
     }
 }
 
@@ -1074,4 +1099,119 @@ async fn a_data_directory_that_is_created_is_private() {
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
     server.shutdown().await.unwrap();
+}
+
+// ---- partial success, fatal state ----
+
+fn response_of(reply: &Bytes) -> ExportTraceServiceResponse {
+    ExportTraceServiceResponse::decode(reply.as_ref()).unwrap()
+}
+
+/// A span the decoder skips: the trace id has the wrong length.
+fn invalid_span(id: u8) -> Span {
+    Span {
+        trace_id: vec![9; 15],
+        span_id: vec![id; 8],
+        name: "bad".into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalid_spans_are_rejected_and_counted_while_the_valid_ones_are_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = started(dir.path()).await;
+    let ch = channel(server.otlp_grpc_addr()).await;
+    let start = now_ns() - 1_000_000_000;
+
+    // Valid, invalid, valid, invalid (all-zero span id).
+    let mut zero_id = invalid_span(0);
+    zero_id.trace_id = tid(0x71);
+    zero_id.span_id = vec![0; 8];
+    let spans = vec![
+        llm_span(0x71, 1, None, start, "m", "chat", (1, 2), false),
+        invalid_span(2),
+        llm_span(0x71, 3, Some(1), start + 5, "m", "chat", (1, 2), false),
+        zero_id,
+    ];
+    let reply = export(&ch, request("s", spans), None).await.unwrap();
+    let resp = response_of(&reply);
+    let partial = resp.partial_success.expect("a partial success");
+    assert_eq!(partial.rejected_spans, 2);
+    assert!(!partial.error_message.is_empty());
+
+    let r = http(
+        server.api_addr(),
+        &format!("/api/v1/traces/{}", hex(&tid(0x71))),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.json()["spans"].as_array().unwrap().len(), 2);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_of_only_invalid_spans_is_not_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = started(dir.path()).await;
+    let ch = channel(server.otlp_grpc_addr()).await;
+    let reply = export(
+        &ch,
+        request("s", vec![invalid_span(1), invalid_span(2), invalid_span(3)]),
+        None,
+    )
+    .await
+    .unwrap();
+    let partial = response_of(&reply).partial_success.unwrap();
+    assert_eq!(partial.rejected_spans, 3);
+    assert!(!partial.error_message.is_empty());
+    assert_eq!(server.engine().stats().records_ingested, 0);
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_with_no_rejections_gets_an_empty_reply_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = started(dir.path()).await;
+    let ch = channel(server.otlp_grpc_addr()).await;
+    let span = llm_span(0x72, 1, None, now_ns(), "m", "chat", (1, 1), false);
+    let reply = export(&ch, request("s", vec![span]), None).await.unwrap();
+    assert!(reply.is_empty());
+    server.shutdown().await.unwrap();
+}
+
+/// A flush in the background fails fatally with no request in flight: the
+/// health check turns 503 and `Server::fatal` resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fatal_error_in_a_background_flush_is_noticed() {
+    use nwdb_engine::Stage;
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.engine.flush_interval = Duration::from_millis(200);
+    let armed = Arc::new(AtomicBool::new(false));
+    let flag = armed.clone();
+    o.engine.stage_hook = Some(Arc::new(move |stage| {
+        if stage == Stage::FlushFrozen && flag.load(Ordering::SeqCst) {
+            return Err(nwdb_core::Error::fatal("injected"));
+        }
+        Ok(())
+    }));
+    let server = Server::start(o).await.unwrap();
+    let api = server.api_addr();
+    assert_eq!(http(api, "/healthz").await.status, 200);
+    assert_eq!(http(api, "/api/v1/stats").await.json()["fatal"], false);
+
+    let ch = channel(server.otlp_grpc_addr()).await;
+    let span = llm_span(0x73, 1, None, now_ns(), "m", "chat", (1, 1), false);
+    export(&ch, request("s", vec![span]), None).await.unwrap();
+    armed.store(true, Ordering::SeqCst);
+
+    tokio::time::timeout(Duration::from_secs(15), server.fatal())
+        .await
+        .expect("the fatal flag was not noticed");
+    let r = http(api, "/healthz").await;
+    assert_eq!(r.status, 503);
+    assert!(r.json()["error"].is_string());
+    assert_eq!(http(api, "/api/v1/stats").await.json()["fatal"], true);
+    let _ = server.shutdown().await;
 }

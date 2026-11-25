@@ -5,15 +5,17 @@ mod common;
 
 use common::*;
 use nwdb_otlp::{
-    MAX_DEPTH, attrs_to_json, resource_dropped_attributes, scope_dropped_attributes, write_attrs,
-    write_events, write_links, write_resource, write_scope_attrs,
+    MAX_DEPTH, resource_dropped_attributes, scope_dropped_attributes, write_attrs, write_events,
+    write_links, write_resource, write_scope_attrs,
 };
-use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+use opentelemetry_proto::tonic::common::v1::{
+    AnyValue, InstrumentationScope, KeyValue, any_value::Value as V,
+};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
 use prost::Message;
 use rand::Rng;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::io::{self, Write};
 
 type W = fn(&mut dyn Write, &[u8]) -> io::Result<()>;
@@ -100,12 +102,69 @@ fn unparsed_of(v: &Value) -> Vec<u8> {
     unb64(v["$unparsed"].as_str().expect("an $unparsed object"))
 }
 
+/// The expected rendering, written from the reference messages.
+fn reference(v: &Option<AnyValue>) -> Value {
+    match v.as_ref().and_then(|a| a.value.as_ref()) {
+        None => json!(null),
+        Some(V::StringValue(s)) => json!(s),
+        Some(V::BoolValue(b)) => json!(b),
+        Some(V::IntValue(i)) => json!(i),
+        Some(V::DoubleValue(d)) if d.is_nan() => json!("NaN"),
+        Some(V::DoubleValue(d)) if d.is_infinite() => {
+            json!(if *d > 0.0 { "Infinity" } else { "-Infinity" })
+        }
+        Some(V::DoubleValue(d)) => json!(d),
+        Some(V::ArrayValue(a)) => Value::Array(
+            a.values
+                .iter()
+                .map(|x| reference(&Some(x.clone())))
+                .collect(),
+        ),
+        Some(V::KvlistValue(l)) => reference_object(&l.values),
+        Some(V::BytesValue(b)) => json!(reference_base64(b)),
+        Some(V::StringValueStrindex(_)) => unreachable!("never generated"),
+    }
+}
+
+fn reference_object(kvs: &[KeyValue]) -> Value {
+    let mut m = Map::new();
+    for x in kvs {
+        m.insert(x.key.clone(), reference(&x.value));
+    }
+    Value::Object(m)
+}
+
+/// An independent base64, bit by bit, to check the table-driven one.
+fn reference_base64(b: &[u8]) -> String {
+    let alphabet: Vec<char> = ('A'..='Z')
+        .chain('a'..='z')
+        .chain('0'..='9')
+        .chain(['+', '/'])
+        .collect();
+    let bits: String = b.iter().map(|x| format!("{x:08b}")).collect();
+    let mut s: String = bits
+        .as_bytes()
+        .chunks(6)
+        .map(|c| {
+            let mut v = String::from_utf8(c.to_vec()).unwrap();
+            while v.len() < 6 {
+                v.push('0');
+            }
+            alphabet[usize::from_str_radix(&v, 2).unwrap()]
+        })
+        .collect();
+    while !s.len().is_multiple_of(4) {
+        s.push('=');
+    }
+    s
+}
+
 #[test]
 fn valid_input_matches_the_reference() {
     let mut r = rng(21);
     for _ in 0..300 {
         let kvs = rand_attrs(&mut r);
-        let want = attrs_to_json(&prefixed(&kvs)).unwrap();
+        let want = reference_object(&kvs);
         assert_same(render(write_attrs, &prefixed(&kvs)), want.clone());
 
         let res = Resource {
@@ -138,7 +197,7 @@ fn valid_input_matches_the_reference() {
                 let mut o = json!({
                     "time_ns": e.time_unix_nano,
                     "name": e.name,
-                    "attributes": attrs_to_json(&prefixed(&e.attributes)).unwrap(),
+                    "attributes": reference_object(&e.attributes),
                 });
                 if e.dropped_attributes_count != 0 {
                     o["dropped_attributes_count"] = e.dropped_attributes_count.into();
@@ -169,7 +228,7 @@ fn valid_input_matches_the_reference() {
                 if l.flags != 0 {
                     o["flags"] = l.flags.into();
                 }
-                o["attributes"] = attrs_to_json(&prefixed(&l.attributes)).unwrap();
+                o["attributes"] = reference_object(&l.attributes);
                 if l.dropped_attributes_count != 0 {
                     o["dropped_attributes_count"] = l.dropped_attributes_count.into();
                 }

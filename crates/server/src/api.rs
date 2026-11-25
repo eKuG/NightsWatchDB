@@ -9,16 +9,22 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use bytes::Bytes;
+use hyper::body::{Body as HttpBody, Frame};
 use nwdb_core::{Error, SpanColumns, SpanRecord, TraceId, TraceSummary};
 use nwdb_engine::{AggQuery, Engine, ListQuery};
 use nwdb_otlp::{
-    attrs_to_json, encode_spans, events_to_json, links_to_json, resource_to_json, scope_to_json,
+    encode_spans, resource_dropped_attributes, scope_dropped_attributes, write_attrs, write_events,
+    write_links, write_resource, write_scope_attrs,
 };
 use serde_json::{Map, Value, json};
+use std::io::{self, Write};
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 
 const HOUR_NS: i64 = 3_600_000_000_000;
 const DEFAULT_LIMIT: usize = 20;
@@ -27,6 +33,10 @@ const TOKENS_DEFAULT_LIMIT: usize = 1000;
 const TOKENS_MAX_LIMIT: usize = 10_000;
 /// API requests that run at once; the others wait.
 const MAX_CONCURRENT: usize = 64;
+/// A streamed response is cut into chunks of about this size.
+const CHUNK: usize = 64 * 1024;
+/// Chunks that may wait for a slow client before the writer blocks.
+const CHUNKS_IN_FLIGHT: usize = 4;
 const PROTOBUF: &str = "application/x-protobuf";
 const TRACE_PREFIX: &str = "/api/v1/traces/";
 
@@ -98,7 +108,31 @@ fn host_name(h: &str) -> &str {
 
 struct Guard {
     hosts: HostCheck,
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
+}
+
+/// A response body that keeps its request's slot until the body is finished
+/// or dropped, so a slow reader of a streamed response counts as running.
+struct Held {
+    inner: axum::body::Body,
+    _slot: OwnedSemaphorePermit,
+}
+
+impl HttpBody for Held {
+    type Data = Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 async fn guard(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Response {
@@ -110,18 +144,27 @@ async fn guard(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Respons
         .into_response();
     }
     // The semaphore is never closed.
-    let _slot = g.slots.acquire().await;
-    next.run(req).await
+    let Ok(slot) = g.slots.clone().acquire_owned().await else {
+        return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
+    };
+    let (parts, body) = next.run(req).await.into_parts();
+    Response::from_parts(
+        parts,
+        axum::body::Body::new(Held {
+            inner: body,
+            _slot: slot,
+        }),
+    )
 }
 
 /// The routes of the API.
 pub(crate) fn router(engine: Engine, fatal: Arc<Notify>, hosts: HostCheck) -> Router {
     let guard_state = Arc::new(Guard {
         hosts,
-        slots: Semaphore::new(MAX_CONCURRENT),
+        slots: Arc::new(Semaphore::new(MAX_CONCURRENT)),
     });
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/traces", get(list_traces))
         .route("/api/v1/traces/{trace_id}", get(get_trace))
@@ -320,6 +363,19 @@ fn wants_protobuf(headers: &HeaderMap) -> bool {
 
 // ---- handlers ----
 
+/// Healthy means the engine is not in its fatal state, where it accepts and
+/// flushes nothing and only a restart recovers it.
+async fn healthz(State(api): State<Api>) -> Response {
+    if api.engine.stats().fatal {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the engine is in a fatal state",
+        )
+        .into_response();
+    }
+    "ok".into_response()
+}
+
 async fn stats(State(api): State<Api>) -> Response {
     let s = api.engine.stats();
     json_response(
@@ -333,6 +389,7 @@ async fn stats(State(api): State<Api>) -> Response {
             "parts": s.parts,
             "flushes": s.flushes,
             "flushing": s.flushing,
+            "fatal": s.fatal,
             "last_error": s.last_error,
         }),
     )
@@ -352,59 +409,155 @@ async fn get_trace(
         .ok_or_else(|| ApiError::bad("the trace id is not valid percent-encoding"))?;
     let trace_id: TraceId = id.parse().map_err(|e| api.error(&e))?;
     let protobuf = wants_protobuf(&headers);
-    let body = api
-        .run(move |engine| {
-            let batches = engine
-                .get_trace(trace_id)?
-                .filter(|b| b.iter().any(|b| b.num_rows() > 0))
-                .ok_or_else(|| Error::not_found(format!("trace {trace_id}")))?;
-            if protobuf {
-                encode_spans(&batches)
-            } else {
-                render_trace(trace_id, &batches)
+    let found = move |engine: Engine| {
+        engine
+            .get_trace(trace_id)?
+            .filter(|b| b.iter().any(|b| b.num_rows() > 0))
+            .ok_or_else(|| Error::not_found(format!("trace {trace_id}")))
+    };
+    if protobuf {
+        let body = api.run(move |engine| encode_spans(&found(engine)?)).await?;
+        return Ok((StatusCode::OK, [(CONTENT_TYPE, PROTOBUF)], body).into_response());
+    }
+    let batches = api.run(found).await?;
+    // The JSON is written by a blocking task and sent in chunks through a
+    // small channel, so a trace is never held as JSON, and a client that is
+    // slow or gone holds the task back or ends it.
+    let (tx, rx) = mpsc::channel(CHUNKS_IN_FLIGHT);
+    tokio::task::spawn_blocking(move || {
+        let mut out = ChunkWriter {
+            tx,
+            buf: Vec::with_capacity(CHUNK),
+        };
+        let result = render_trace(trace_id, &batches, &mut out).and_then(|()| out.flush());
+        if let Err(e) = result {
+            // A failure other than the client leaving ends the body with an
+            // error, so that the client sees a cut-off response and not a
+            // short one that looks complete.
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                let _ = out.tx.blocking_send(Err(e));
             }
-        })
-        .await?;
-    Ok(if protobuf {
-        (StatusCode::OK, [(CONTENT_TYPE, PROTOBUF)], body).into_response()
-    } else {
-        json_bytes(StatusCode::OK, body)
-    })
+        }
+    });
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        axum::body::Body::new(Chunks(rx)),
+    )
+        .into_response())
 }
 
-/// Writes the trace one span at a time, so the JSON of the whole trace is
-/// never held as a tree of values.
-fn render_trace(id: TraceId, batches: &[arrow_array::RecordBatch]) -> nwdb_core::Result<Vec<u8>> {
-    let mut out = format!("{{\"trace_id\":\"{id}\",\"spans\":[").into_bytes();
+/// The body of a streamed response.
+struct Chunks(mpsc::Receiver<io::Result<Bytes>>);
+
+impl HttpBody for Chunks {
+    type Data = Bytes;
+    type Error = io::Error;
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(|c| c.map(Frame::data)))
+    }
+}
+
+/// Collects output into chunks of about [`CHUNK`] bytes and sends them. It
+/// fails with `BrokenPipe` once the receiving side is gone, which stops the
+/// writer that feeds it.
+struct ChunkWriter {
+    tx: mpsc::Sender<io::Result<Bytes>>,
+    buf: Vec<u8>,
+}
+
+impl ChunkWriter {
+    fn send(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let chunk = Bytes::from(std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK)));
+        self.tx
+            .blocking_send(Ok(chunk))
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+    }
+}
+
+impl Write for ChunkWriter {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        // A big piece (a long string) is cut up, so that the chunk is never
+        // more than CHUNK and a piece is not copied whole.
+        for piece in b.chunks(CHUNK) {
+            let room = CHUNK - self.buf.len();
+            let (now, later) = piece.split_at(room.min(piece.len()));
+            self.buf.extend_from_slice(now);
+            if self.buf.len() >= CHUNK {
+                self.send()?;
+            }
+            self.buf.extend_from_slice(later);
+        }
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.send()
+    }
+}
+
+/// Writes the trace one span at a time.
+fn render_trace(
+    id: TraceId,
+    batches: &[arrow_array::RecordBatch],
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    write!(out, "{{\"trace_id\":\"{id}\",\"spans\":[")?;
     let mut first = true;
     for batch in batches {
-        let cols = SpanColumns::try_new(batch)?;
+        let cols = SpanColumns::try_new(batch).map_err(io::Error::other)?;
         for row in 0..cols.len() {
             if !first {
-                out.push(b',');
+                out.write_all(b",")?;
             }
             first = false;
-            serde_json::to_writer(&mut out, &span_json(&cols.record(row))?)
-                .map_err(Error::other)?;
+            write_span(out, &cols.record(row))?;
         }
     }
-    out.extend_from_slice(b"]}");
-    Ok(out)
+    out.write_all(b"]}")
 }
 
-fn span_json(r: &SpanRecord<'_>) -> nwdb_core::Result<Value> {
-    let mut m = Map::new();
-    let mut put = |k: &str, v: Value| m.insert(k.to_owned(), v);
-    put("span_id", r.span_id.to_string().into());
-    if let Some(p) = r.parent_span_id {
-        put("parent_span_id", p.to_string().into());
+/// A writer that stops as soon as it is given more than an empty object.
+struct EmptyObject(usize);
+
+impl Write for EmptyObject {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.0 += b.len();
+        if self.0 > 2 {
+            return Err(io::Error::other("not empty"));
+        }
+        Ok(b.len())
     }
-    put("name", r.name.into());
-    put("kind", r.kind.into());
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_str(out: &mut dyn Write, v: &str) -> io::Result<()> {
+    serde_json::to_writer(&mut *out, v).map_err(io::Error::from)
+}
+
+fn write_span(out: &mut dyn Write, r: &SpanRecord<'_>) -> io::Result<()> {
+    write!(out, "{{\"span_id\":\"{}\"", r.span_id)?;
+    if let Some(p) = r.parent_span_id {
+        write!(out, ",\"parent_span_id\":\"{p}\"")?;
+    }
+    out.write_all(b",\"name\":")?;
+    json_str(out, r.name)?;
     // Times are unsigned on the wire and stored as the same 64 bits.
-    put("start_ns", (r.start_ns as u64).into());
-    put("end_ns", (r.end_ns as u64).into());
-    put("status_code", r.status_code.into());
+    write!(
+        out,
+        ",\"kind\":{},\"start_ns\":{},\"end_ns\":{},\"status_code\":{}",
+        r.kind, r.start_ns as u64, r.end_ns as u64, r.status_code
+    )?;
     let strings = [
         ("status_message", r.status_message),
         ("trace_state", r.trace_state),
@@ -426,7 +579,8 @@ fn span_json(r: &SpanRecord<'_>) -> nwdb_core::Result<Value> {
     ];
     for (k, v) in strings {
         if let Some(v) = v {
-            put(k, v.into());
+            write!(out, ",\"{k}\":")?;
+            json_str(out, v)?;
         }
     }
     for (k, v) in [
@@ -434,7 +588,7 @@ fn span_json(r: &SpanRecord<'_>) -> nwdb_core::Result<Value> {
         ("output_tokens", r.output_tokens),
     ] {
         if let Some(v) = v {
-            put(k, v.into());
+            write!(out, ",\"{k}\":{v}")?;
         }
     }
     for (k, v) in [
@@ -444,28 +598,40 @@ fn span_json(r: &SpanRecord<'_>) -> nwdb_core::Result<Value> {
         ("dropped_links_count", r.dropped_links_count),
     ] {
         if v != 0 {
-            put(k, v.into());
+            write!(out, ",\"{k}\":{v}")?;
         }
     }
     if let Some(res) = r.resource {
-        put("resource", resource_to_json(res)?);
+        out.write_all(b",\"resource\":")?;
+        write_resource(out, res)?;
+        let dropped = resource_dropped_attributes(res);
+        if dropped != 0 {
+            write!(out, ",\"resource_dropped_attributes_count\":{dropped}")?;
+        }
     }
     if let Some(scope) = r.scope {
         // Most scopes carry a name and a version only; those are already
         // fields of their own.
-        let attributes = scope_to_json(scope)?;
-        if attributes.as_object().is_some_and(|a| !a.is_empty()) {
-            put("scope_attributes", attributes);
+        if write_scope_attrs(&mut EmptyObject(0), scope).is_err() {
+            out.write_all(b",\"scope_attributes\":")?;
+            write_scope_attrs(out, scope)?;
+        }
+        let dropped = scope_dropped_attributes(scope);
+        if dropped != 0 {
+            write!(out, ",\"scope_dropped_attributes_count\":{dropped}")?;
         }
     }
-    put("attributes", attrs_to_json(r.attrs)?);
+    out.write_all(b",\"attributes\":")?;
+    write_attrs(out, r.attrs)?;
     if let Some(e) = r.events {
-        put("events", events_to_json(e)?);
+        out.write_all(b",\"events\":")?;
+        write_events(out, e)?;
     }
     if let Some(l) = r.links {
-        put("links", links_to_json(l)?);
+        out.write_all(b",\"links\":")?;
+        write_links(out, l)?;
     }
-    Ok(Value::Object(m))
+    out.write_all(b"}")
 }
 
 async fn list_traces(

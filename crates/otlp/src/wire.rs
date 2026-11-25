@@ -77,10 +77,6 @@ impl<'a> Cur<'a> {
         Self { rest: buf }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.rest.is_empty()
-    }
-
     pub(crate) fn varint(&mut self) -> R<u64> {
         let mut v = 0u64;
         for i in 0..10u32 {

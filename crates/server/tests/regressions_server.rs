@@ -4,7 +4,9 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use nwdb_server::{MAX_MESSAGE, Server, ServerOptions};
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as V};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
@@ -84,6 +86,21 @@ async fn export(ch: &Channel, body: Vec<u8>) -> Result<Bytes, Status> {
 
 // ---- HTTP client ----
 
+/// The body of a chunked response without the chunk framing.
+fn dechunk(mut raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let eol = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&raw[..eol]).unwrap().trim(), 16).unwrap();
+        if size == 0 {
+            return out;
+        }
+        out.extend_from_slice(&raw[eol + 2..eol + 2 + size]);
+        raw = &raw[eol + 2 + size + 2..];
+    }
+}
+
 struct Resp {
     status: u16,
     headers: String,
@@ -107,7 +124,11 @@ fn http_blocking(addr: SocketAddr, target: &str, accept: Option<&str>) -> Resp {
     Resp {
         status,
         headers: head.to_lowercase(),
-        body: raw[split + 4..].to_vec(),
+        body: if head.to_lowercase().contains("transfer-encoding: chunked") {
+            dechunk(&raw[split + 4..])
+        } else {
+            raw[split + 4..].to_vec()
+        },
     }
 }
 
@@ -117,6 +138,14 @@ async fn http(addr: SocketAddr, target: &str, accept: Option<&str>) -> Resp {
     tokio::task::spawn_blocking(move || http_blocking(addr, &target, accept.as_deref()))
         .await
         .unwrap()
+}
+
+/// How many spans the reply says were rejected.
+fn rejected(reply: &Bytes) -> i64 {
+    ExportTraceServiceResponse::decode(reply.as_ref())
+        .unwrap()
+        .partial_success
+        .map_or(0, |p| p.rejected_spans)
 }
 
 // ---- fixtures ----
@@ -310,7 +339,6 @@ async fn every_message_of_an_acknowledged_export_is_stored() {
 /// in one trace are then one span to the engine, and the other is lost after
 /// the request was acknowledged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waits for the tolerant readers / per-span rejection"]
 async fn spans_with_all_zero_ids_are_refused_or_all_kept() {
     let dir = tempfile::tempdir().unwrap();
     let server = started(dir.path()).await;
@@ -320,7 +348,12 @@ async fn spans_with_all_zero_ids_are_refused_or_all_kept() {
     let mut b = span(0x62, 0, start + 10);
     a.name = "first".into();
     b.name = "second".into();
-    if export(&ch, request(vec![a, b])).await.is_ok() {
+    // Refused as an error, or by name in the reply's count of rejected spans,
+    // or kept: all three are fine; acknowledging both and keeping one is not.
+    if export(&ch, request(vec![a, b]))
+        .await
+        .is_ok_and(|r| rejected(&r) == 0)
+    {
         let r = http(
             server.api_addr(),
             &format!("/api/v1/traces/{}", hex(&[0x62; 16])),
@@ -345,7 +378,6 @@ async fn spans_with_all_zero_ids_are_refused_or_all_kept() {
 /// failing the whole trace loses the normal span too, and lets any sender
 /// hide any trace whose id it knows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waits for the tolerant readers / per-span rejection"]
 async fn an_accepted_span_never_hides_its_trace() {
     let dir = tempfile::tempdir().unwrap();
     let server = started(dir.path()).await;
@@ -396,7 +428,7 @@ async fn an_accepted_span_never_hides_its_trace() {
             .unwrap();
         let odd = raw_request(trace, 2, start + 10, &extra, resource.as_deref());
         let accepted = match export(&ch, odd).await {
-            Ok(_) => true,
+            Ok(reply) => rejected(&reply) == 0,
             Err(e) if e.code() == Code::InvalidArgument => false,
             Err(e) => panic!("{what}: unexpected status {e}"),
         };
@@ -419,7 +451,6 @@ async fn an_accepted_span_never_hides_its_trace() {
 
 /// The protobuf form of an acknowledged trace must be a valid OTLP message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "waits for the tolerant readers / per-span rejection"]
 async fn the_protobuf_view_of_an_accepted_trace_is_valid_otlp() {
     let dir = tempfile::tempdir().unwrap();
     let server = started(dir.path()).await;
@@ -431,7 +462,7 @@ async fn the_protobuf_view_of_an_accepted_trace_is_valid_otlp() {
         &attr("llm.output", &ld(1, &[0xed, 0xa0, 0xbd])),
         None,
     );
-    if export(&ch, odd).await.is_ok() {
+    if export(&ch, odd).await.is_ok_and(|r| rejected(&r) == 0) {
         let r = http(
             server.api_addr(),
             &format!("/api/v1/traces/{}", hex(&[0x50; 16])),

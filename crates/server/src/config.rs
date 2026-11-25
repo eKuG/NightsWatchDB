@@ -27,6 +27,8 @@ pub struct Config {
     pub api_addr: SocketAddr,
     /// Extra host names the API answers to (see the README).
     pub api_allowed_hosts: Vec<String>,
+    /// Start even if log files were lost (see the README).
+    pub accept_lost_log: bool,
 }
 
 /// The text printed by `--help`.
@@ -42,6 +44,9 @@ Options (each also reads an environment variable; a flag wins):
   --api-allowed-hosts LIST NWDB_API_ALLOWED_HOSTS [none]
                            comma-separated host names the API answers to
                            besides localhost and the loopback addresses
+  --accept-lost-log        NWDB_ACCEPT_LOST_LOG  [off]
+                           start although log files were lost, giving up the
+                           records acknowledged since the last flush
   --help                   print this text
   --version                print the version
 
@@ -60,6 +65,7 @@ pub fn parse(
     let mut otlp = None;
     let mut api = None;
     let mut hosts = None;
+    let mut accept_lost_log = false;
     let mut args = args.into_iter().map(|a| {
         a.into_string()
             .map_err(|a| format!("argument {a:?} is not valid UTF-8"))
@@ -70,6 +76,13 @@ pub fn parse(
             Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(v.to_owned())),
             _ => (arg, None),
         };
+        if name == "--accept-lost-log" {
+            if inline.is_some() {
+                return Err("`--accept-lost-log` takes no value".into());
+            }
+            accept_lost_log = true;
+            continue;
+        }
         let slot = match name.as_str() {
             "--help" | "-h" => return Ok(Command::Help),
             "--version" | "-V" => return Ok(Command::Version),
@@ -111,6 +124,16 @@ pub fn parse(
             "OTLP gRPC address",
         )?,
         api_addr: addr(pick(api, "NWDB_API_ADDR", "127.0.0.1:4320")?, "API address")?,
+        accept_lost_log: accept_lost_log
+            || match pick(None, "NWDB_ACCEPT_LOST_LOG", "false")?.as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                other => {
+                    return Err(format!(
+                        "NWDB_ACCEPT_LOST_LOG `{other}` is not one of 1, true, 0, false"
+                    ));
+                }
+            },
         api_allowed_hosts: pick(hosts, "NWDB_API_ALLOWED_HOSTS", "")?
             .split(',')
             .map(str::trim)
@@ -174,6 +197,27 @@ mod tests {
             panic!()
         };
         assert!(c.api_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn accept_lost_log_is_a_switch() {
+        let get = |args: &[&str], env: &[(&str, &str)]| match run(args, env) {
+            Ok(Command::Run(c)) => Ok(c.accept_lost_log),
+            Ok(_) => panic!(),
+            Err(e) => Err(e),
+        };
+        assert_eq!(get(&[], &[]), Ok(false));
+        assert_eq!(get(&["--accept-lost-log"], &[]), Ok(true));
+        assert!(get(&["--accept-lost-log=1"], &[]).is_err());
+        for (v, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(get(&[], &[("NWDB_ACCEPT_LOST_LOG", v)]), Ok(want), "{v}");
+        }
+        assert!(get(&[], &[("NWDB_ACCEPT_LOST_LOG", "yes")]).is_err());
+        // The flag wins over a variable that says no.
+        assert_eq!(
+            get(&["--accept-lost-log"], &[("NWDB_ACCEPT_LOST_LOG", "0")]),
+            Ok(true)
+        );
     }
 
     #[test]

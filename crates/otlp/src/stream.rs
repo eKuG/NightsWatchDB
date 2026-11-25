@@ -10,9 +10,8 @@
 //! with the next sibling when the framing allows it. The only error is the
 //! writer's own.
 //!
-//! The mapping of values is the one documented on the
-//! [`json`](crate::json) module, with these differences from the older
-//! functions there:
+//! The mapping of values is in the README of this crate. Properties worth
+//! knowing:
 //!
 //! - Strings and keys that are not valid UTF-8 are written with each invalid
 //!   sequence replaced by U+FFFD.
@@ -23,9 +22,12 @@
 //! - When a `KeyValue` carries its `value` field twice, the last occurrence is
 //!   shown; protobuf would merge them.
 
-use crate::json::MAX_DEPTH;
 use crate::walk::{Next, Rd, Val};
 use std::io::{self, Write};
+
+/// Deepest nesting of arrays and key-value lists written; deeper values are
+/// kept as `$unparsed`, so that hostile input cannot exhaust the stack.
+pub const MAX_DEPTH: usize = 64;
 
 const BUF: usize = 8 * 1024;
 

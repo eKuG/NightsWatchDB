@@ -159,9 +159,7 @@ values deep), so the memory does not grow with the column, and the only error
 they return is the writer's own: whatever the stored bytes hold, the output is
 valid JSON. `resource_dropped_attributes` and `scope_dropped_attributes` give
 the `dropped_attributes_count` of a resource and a scope (0 when absent or
-unreadable). The older `attrs_to_json` and its siblings build a
-`serde_json::Value`, fail on the first thing they cannot read and need hundreds
-of times the column's size in memory; they are superseded and will be removed.
+unreadable).
 
 Mapping: string, bool, int (number), double (number; `"NaN"`, `"Infinity"` and
 `"-Infinity"` as strings), array, key-value list (object), bytes (standard
