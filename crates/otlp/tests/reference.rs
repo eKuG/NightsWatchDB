@@ -12,7 +12,7 @@ use opentelemetry_proto::tonic::common::v1::{
     AnyValue, InstrumentationScope, KeyValue, any_value::Value,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{Span, span};
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, span};
 use prost::Message;
 
 const CASES: u64 = 120;
@@ -41,18 +41,17 @@ const REFERENCE: [(&[&str], bool); 11] = [
 ];
 
 fn reference_value(attrs: &[KeyValue], names: &[&str], int: bool) -> Option<String> {
-    for name in names {
-        if let Some(last) = attrs.iter().rev().find(|kv| kv.key == *name) {
-            let v = last.value.as_ref().and_then(|v| v.value.as_ref());
-            return match v {
-                Some(Value::StringValue(s)) if !int => Some(s.clone()),
-                Some(Value::StringValue(s)) => s.parse::<i64>().ok().map(|n| n.to_string()),
-                Some(Value::IntValue(n)) if int => Some(n.to_string()),
-                _ => None,
-            };
+    // The first name whose last occurrence has a usable value.
+    names.iter().find_map(|name| {
+        let last = attrs.iter().rev().find(|kv| kv.key == *name)?;
+        let v = last.value.as_ref().and_then(|v| v.value.as_ref());
+        match v {
+            Some(Value::StringValue(s)) if !int => Some(s.clone()),
+            Some(Value::StringValue(s)) => s.parse::<i64>().ok().map(|n| n.to_string()),
+            Some(Value::IntValue(n)) if int => Some(n.to_string()),
+            _ => None,
         }
-    }
-    None
+    })
 }
 
 fn check_raw<M: Message + Default + PartialEq + std::fmt::Debug>(col: Option<&[u8]>, want: &[M]) {
@@ -70,6 +69,7 @@ fn check_row(
     r: &SpanRecord<'_>,
     resource: &Option<Resource>,
     scope: &Option<InstrumentationScope>,
+    schema_urls: (&str, &str),
     s: &Span,
 ) {
     assert_eq!(r.trace_id.0.as_slice(), s.trace_id.as_slice());
@@ -111,6 +111,12 @@ fn check_row(
     let scope = scope.as_ref();
     assert_eq!(r.scope_name, scope.and_then(|sc| non_empty(&sc.name)));
     assert_eq!(r.scope_version, scope.and_then(|sc| non_empty(&sc.version)));
+    assert_eq!(r.resource_schema_url, non_empty(schema_urls.0));
+    assert_eq!(r.scope_schema_url, non_empty(schema_urls.1));
+    match scope {
+        Some(sc) => assert_eq!(r.scope, Some(sc.encode_to_vec().as_slice())),
+        None => assert!(r.scope.is_none()),
+    }
 
     let got = [
         r.operation,
@@ -154,14 +160,20 @@ fn check_row(
     check_raw::<span::Link>(r.links, &s.links);
 }
 
-fn expected_spans(
-    req: &ExportTraceServiceRequest,
-) -> Vec<(&Option<Resource>, &Option<InstrumentationScope>, &Span)> {
+type Expected<'a> = (
+    &'a Option<Resource>,
+    &'a Option<InstrumentationScope>,
+    (&'a str, &'a str),
+    &'a Span,
+);
+
+fn expected_spans(req: &ExportTraceServiceRequest) -> Vec<Expected<'_>> {
     let mut out = Vec::new();
     for rs in &req.resource_spans {
         for ss in &rs.scope_spans {
             for s in &ss.spans {
-                out.push((&rs.resource, &ss.scope, s));
+                let urls = (rs.schema_url.as_str(), ss.schema_url.as_str());
+                out.push((&rs.resource, &ss.scope, urls, s));
             }
         }
     }
@@ -182,8 +194,8 @@ fn every_column_matches_the_reference_decoder() {
         let rows = all_rows(&batches);
         let want = expected_spans(&req);
         assert_eq!(rows.len(), want.len());
-        for (row, (res, scope, s)) in rows.iter().zip(want) {
-            check_row(row, res, scope, s);
+        for (row, (res, scope, urls, s)) in rows.iter().zip(want) {
+            check_row(row, res, scope, urls, s);
         }
         spans += rows.len();
     }
@@ -249,6 +261,133 @@ fn encode_groups_consecutive_rows() {
         .map(|rs| rs.scope_spans.iter().map(|ss| ss.spans.len()).collect())
         .collect();
     assert_eq!(shape, vec![vec![2, 4], vec![2]]);
+}
+
+type Shape = Vec<(
+    Option<Resource>,
+    String,
+    Vec<(Option<InstrumentationScope>, String, usize)>,
+)>;
+
+/// Resources, scopes and schema URLs of a request, with the span counts.
+fn shape(req: &ExportTraceServiceRequest) -> Shape {
+    req.resource_spans
+        .iter()
+        .map(|rs| {
+            let scopes = rs
+                .scope_spans
+                .iter()
+                .map(|ss| (ss.scope.clone(), ss.schema_url.clone(), ss.spans.len()))
+                .collect();
+            (rs.resource.clone(), rs.schema_url.clone(), scopes)
+        })
+        .collect()
+}
+
+#[test]
+fn scope_attributes_and_schema_urls_survive_the_round_trip() {
+    let mut r = rng(5);
+    let lib = |attr: &str| InstrumentationScope {
+        name: "lib".into(),
+        version: "1".into(),
+        attributes: vec![kv("k", str_val(attr))],
+        dropped_attributes_count: 3,
+    };
+    let res = Resource {
+        attributes: vec![kv("service.name", str_val("svc"))],
+        ..Default::default()
+    };
+    let mut scope_spans = |scope: Option<InstrumentationScope>, url: &str| ScopeSpans {
+        scope,
+        spans: vec![rand_span(&mut r)],
+        schema_url: url.into(),
+    };
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![
+            ResourceSpans {
+                resource: Some(res.clone()),
+                schema_url: "https://example.test/r/1".into(),
+                scope_spans: vec![
+                    scope_spans(Some(lib("a")), "https://example.test/s/1"),
+                    // Differs from the one before only in an attribute value.
+                    scope_spans(Some(lib("b")), "https://example.test/s/1"),
+                    // Same scope as the one before, a different schema URL.
+                    scope_spans(Some(lib("b")), "https://example.test/s/2"),
+                    // Only a name.
+                    scope_spans(
+                        Some(InstrumentationScope {
+                            name: "only".into(),
+                            ..Default::default()
+                        }),
+                        "",
+                    ),
+                    // An empty scope, then none at all.
+                    scope_spans(Some(InstrumentationScope::default()), ""),
+                    scope_spans(None, ""),
+                    scope_spans(None, "https://example.test/s/1"),
+                ],
+            },
+            // The same resource bytes, a different schema URL.
+            ResourceSpans {
+                resource: Some(res.clone()),
+                schema_url: "https://example.test/r/2".into(),
+                scope_spans: vec![scope_spans(None, "")],
+            },
+            ResourceSpans {
+                resource: Some(res),
+                schema_url: String::new(),
+                scope_spans: vec![scope_spans(None, "")],
+            },
+        ],
+    };
+    let decoder = TraceDecoder::new(BatchLimits::DEFAULT);
+    let first = decoder.decode(&req.encode_to_vec()).unwrap();
+    let encoded = encode_spans(&first).unwrap();
+    let out = ExportTraceServiceRequest::decode(encoded.as_slice()).unwrap();
+    // Nothing is merged and nothing is lost: every boundary above differs in
+    // the resource, the scope bytes or a schema URL.
+    assert_eq!(shape(&out), shape(&req));
+    let second = decoder.decode(&encoded).unwrap();
+    assert_eq!(all_rows(&first), all_rows(&second));
+
+    let rows = all_rows(&second);
+    assert_eq!(rows.len(), 9);
+    assert_eq!(rows[0].scope_schema_url, Some("https://example.test/s/1"));
+    assert_eq!(
+        rows[0].resource_schema_url,
+        Some("https://example.test/r/1")
+    );
+    let scope = |i: usize| InstrumentationScope::decode(rows[i].scope.unwrap()).unwrap();
+    assert_eq!(scope(0), lib("a"));
+    assert_eq!(scope(1), lib("b"));
+    assert_eq!(scope(3).name, "only");
+    assert_eq!(
+        (rows[3].scope_name, rows[3].scope_version),
+        (Some("only"), None)
+    );
+    assert_eq!(rows[4].scope, Some(&[][..]));
+    assert!(rows[5].scope.is_none() && rows[5].scope_name.is_none());
+    assert!(rows[5].scope_schema_url.is_none());
+    assert_eq!(
+        rows[7].resource_schema_url,
+        Some("https://example.test/r/2")
+    );
+    assert!(rows[8].resource_schema_url.is_none());
+}
+
+#[test]
+fn rows_without_scope_bytes_get_a_scope_from_name_and_version() {
+    use nwdb_core::{SpanBatchBuilder, SpanRecord};
+    let mut b = SpanBatchBuilder::new(BatchLimits::DEFAULT);
+    b.append(&SpanRecord {
+        scope_name: Some("lib"),
+        scope_version: Some("2"),
+        ..SpanRecord::default()
+    });
+    let out =
+        ExportTraceServiceRequest::decode(encode_spans(&[b.finish()]).unwrap().as_slice()).unwrap();
+    let scope = out.resource_spans[0].scope_spans[0].scope.clone().unwrap();
+    assert_eq!((scope.name.as_str(), scope.version.as_str()), ("lib", "2"));
 }
 
 #[test]

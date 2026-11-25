@@ -80,10 +80,11 @@ impl WriterOptions {
     }
 }
 
-/// Writer settings. `spans` selects the span table, whose four raw binary
-/// columns get no statistics (nothing prunes by them) and, except `resource`,
-/// no dictionary: `attrs`, `events` and `links` are close to unique per row,
-/// so a dictionary is wasted work, while `resource` repeats heavily.
+/// Writer settings. `spans` selects the span table, whose five raw binary
+/// columns get no statistics (nothing prunes by them) and, except `resource`
+/// and `scope`, no dictionary: `attrs`, `events` and `links` are close to
+/// unique per row, so a dictionary is wasted work, while `resource` and
+/// `scope` repeat heavily.
 fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
@@ -101,14 +102,16 @@ fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
         .set_data_page_row_count_limit(DATA_PAGE_ROWS)
         .set_write_batch_size(WRITE_BATCH_VALUES);
     if spans {
-        for name in ["resource", "attrs", "events", "links"] {
+        for name in ["resource", "scope", "attrs", "events", "links"] {
             builder = builder
                 .set_column_statistics_enabled(ColumnPath::from(name), EnabledStatistics::None);
         }
         for name in ["attrs", "events", "links"] {
             builder = builder.set_column_dictionary_enabled(ColumnPath::from(name), false);
         }
-        builder = builder.set_column_dictionary_enabled(ColumnPath::from("resource"), true);
+        for name in ["resource", "scope"] {
+            builder = builder.set_column_dictionary_enabled(ColumnPath::from(name), true);
+        }
     }
     builder.build()
 }

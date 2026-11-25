@@ -77,25 +77,47 @@ fn encode_span(out: &mut Vec<u8>, r: &SpanRecord<'_>) -> Result<()> {
     Ok(())
 }
 
-/// The scope of a row: what [`encode_spans`] groups on besides the resource.
-fn scope_of<'a>(r: &SpanRecord<'a>) -> (Option<&'a str>, Option<&'a str>) {
-    (
-        r.scope_name.filter(|s| !s.is_empty()),
-        r.scope_version.filter(|s| !s.is_empty()),
-    )
+fn non_empty(v: Option<&str>) -> Option<&str> {
+    v.filter(|s| !s.is_empty())
+}
+
+/// What [`encode_spans`] groups on for the resource level.
+type ResourceKey<'a> = (Option<&'a [u8]>, Option<&'a str>);
+
+fn resource_of<'a>(r: &SpanRecord<'a>) -> ResourceKey<'a> {
+    (r.resource, non_empty(r.resource_schema_url))
+}
+
+/// What [`encode_spans`] groups on for the scope level: the `scope` bytes, the
+/// name and version, and the schema URL. The name and version only count for a
+/// row that has no `scope` bytes; with the bytes they are copies of them.
+type ScopeKey<'a> = (
+    Option<&'a [u8]>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+fn scope_of<'a>(r: &SpanRecord<'a>) -> ScopeKey<'a> {
+    let (name, version) = match r.scope {
+        Some(_) => (None, None),
+        None => (non_empty(r.scope_name), non_empty(r.scope_version)),
+    };
+    (r.scope, name, version, non_empty(r.scope_schema_url))
 }
 
 /// Serializes span-table batches as an OTLP `ExportTraceServiceRequest`,
 /// which is also a valid `TracesData` since the two share their wire form.
 ///
-/// Consecutive rows with the same `resource` bytes go into one
-/// `ResourceSpans`, and consecutive rows of those with the same scope name and
-/// version into one `ScopeSpans`, so the output keeps the row order. The
-/// `resource`, `attrs`, `events` and `links` bytes are written as stored. The
-/// promoted columns and `service_name` are not written: they are copies of
-/// data that is already in those bytes. Instrumentation scope attributes are
-/// not stored in the table and are not written. Decoding the result gives
-/// back the same rows.
+/// Consecutive rows with the same `resource` bytes and `resource_schema_url`
+/// go into one `ResourceSpans`, and consecutive rows of those with the same
+/// `scope` bytes and `scope_schema_url` into one `ScopeSpans`, so the output
+/// keeps the row order. The `resource`, `scope`, `attrs`, `events` and `links`
+/// bytes are written as stored. A row whose `scope` is null but which has a
+/// scope name or version gets a scope rebuilt from those two. The promoted
+/// columns, `service_name` and, when `scope` is present, the scope name and
+/// version are not written: they are copies of data that is already in those
+/// bytes. Decoding the result gives back the same rows.
 ///
 /// Returns [`Error::InvalidArgument`] for a batch that does not have the span
 /// schema and [`Error::Corrupt`] for a raw column that is not length-prefixed.
@@ -107,14 +129,12 @@ pub fn encode_spans(batches: &[RecordBatch]) -> Result<Vec<u8>> {
         let cols = SpanColumns::try_new(batch)?;
         for row in 0..cols.len() {
             let r = cols.record(row);
-            if !resource
-                .as_ref()
-                .is_some_and(|o| o.bytes.as_deref() == r.resource)
-            {
+            let key = resource_of(&r);
+            if !resource.as_ref().is_some_and(|o| o.matches(key)) {
                 if let Some(done) = resource.take() {
                     done.close(&mut out);
                 }
-                resource = Some(OpenResource::new(r.resource));
+                resource = Some(OpenResource::new(key));
             }
             span_buf.clear();
             encode_span(&mut span_buf, &r)?;
@@ -129,27 +149,53 @@ pub fn encode_spans(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A scope's name and version, as owned strings.
-type ScopeKey = (Option<String>, Option<String>);
+/// A [`ScopeKey`] with owned values.
+struct OwnedScopeKey {
+    scope: Option<Vec<u8>>,
+    name: Option<String>,
+    version: Option<String>,
+    schema_url: Option<String>,
+}
+
+impl OwnedScopeKey {
+    fn new((scope, name, version, schema_url): ScopeKey<'_>) -> Self {
+        Self {
+            scope: scope.map(<[u8]>::to_vec),
+            name: name.map(str::to_owned),
+            version: version.map(str::to_owned),
+            schema_url: schema_url.map(str::to_owned),
+        }
+    }
+
+    fn matches(&self, (scope, name, version, schema_url): ScopeKey<'_>) -> bool {
+        self.scope.as_deref() == scope
+            && self.name.as_deref() == name
+            && self.version.as_deref() == version
+            && self.schema_url.as_deref() == schema_url
+    }
+}
 
 /// A `ScopeSpans` being filled. A message's length goes before its content,
 /// so the children are collected first.
 struct OpenScope {
-    key: ScopeKey,
+    key: OwnedScopeKey,
     spans: Vec<u8>,
 }
 
 impl OpenScope {
     fn close(self, into: &mut Vec<u8>) {
         let mut body = Vec::new();
-        let (name, version) = &self.key;
-        if name.is_some() || version.is_some() {
+        let key = &self.key;
+        if let Some(scope) = &key.scope {
+            put_len_field(&mut body, 1, scope);
+        } else if key.name.is_some() || key.version.is_some() {
             let mut scope = Vec::new();
-            put_str_field(&mut scope, 1, name.as_deref());
-            put_str_field(&mut scope, 2, version.as_deref());
+            put_str_field(&mut scope, 1, key.name.as_deref());
+            put_str_field(&mut scope, 2, key.version.as_deref());
             put_len_field(&mut body, 1, &scope);
         }
         body.extend_from_slice(&self.spans);
+        put_str_field(&mut body, 3, key.schema_url.as_deref());
         put_len_field(into, 2, &body);
     }
 }
@@ -157,30 +203,32 @@ impl OpenScope {
 /// A `ResourceSpans` being filled.
 struct OpenResource {
     bytes: Option<Vec<u8>>,
+    schema_url: Option<String>,
     scopes: Vec<u8>,
     scope: Option<OpenScope>,
 }
 
 impl OpenResource {
-    fn new(bytes: Option<&[u8]>) -> Self {
+    fn new((bytes, schema_url): ResourceKey<'_>) -> Self {
         Self {
             bytes: bytes.map(<[u8]>::to_vec),
+            schema_url: schema_url.map(str::to_owned),
             scopes: Vec::new(),
             scope: None,
         }
     }
 
-    fn push_span(&mut self, (name, version): (Option<&str>, Option<&str>), span: &[u8]) {
-        let same = self
-            .scope
-            .as_ref()
-            .is_some_and(|s| s.key.0.as_deref() == name && s.key.1.as_deref() == version);
-        if !same {
+    fn matches(&self, (bytes, schema_url): ResourceKey<'_>) -> bool {
+        self.bytes.as_deref() == bytes && self.schema_url.as_deref() == schema_url
+    }
+
+    fn push_span(&mut self, key: ScopeKey<'_>, span: &[u8]) {
+        if !self.scope.as_ref().is_some_and(|s| s.key.matches(key)) {
             if let Some(done) = self.scope.take() {
                 done.close(&mut self.scopes);
             }
             self.scope = Some(OpenScope {
-                key: (name.map(str::to_owned), version.map(str::to_owned)),
+                key: OwnedScopeKey::new(key),
                 spans: Vec::new(),
             });
         }
@@ -198,6 +246,7 @@ impl OpenResource {
             put_len_field(&mut body, 1, r);
         }
         body.extend_from_slice(&self.scopes);
+        put_str_field(&mut body, 3, self.schema_url.as_deref());
         put_len_field(out, 1, &body);
     }
 }

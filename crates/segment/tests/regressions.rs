@@ -385,8 +385,8 @@ fn reads_continue_after_the_part_directory_is_deleted() {
     reader.verify().unwrap();
 }
 
-/// Statistics are off for the four raw columns, dictionaries are off for
-/// `attrs`, `events` and `links` but not `resource`, and the offset index is
+/// Statistics are off for the five raw columns, dictionaries are off for
+/// `attrs`, `events` and `links` but not `resource` and `scope`, and the offset index is
 /// written for every column of every row group.
 #[test]
 fn raw_columns_have_no_statistics_or_dictionary_but_keep_the_offset_index() {
@@ -400,11 +400,13 @@ fn raw_columns_have_no_statistics_or_dictionary_but_keep_the_offset_index() {
         })
         .collect();
     let resource = b"resource-bytes".to_vec();
+    let scope = b"scope-bytes".to_vec();
     let rows: Vec<_> = owned
         .iter()
         .enumerate()
         .map(|(i, a)| SpanRecord {
             resource: Some(&resource),
+            scope: Some(&scope),
             events: Some(a),
             links: Some(a),
             ..span(1, i as u32, a)
@@ -424,7 +426,7 @@ fn raw_columns_have_no_statistics_or_dictionary_but_keep_the_offset_index() {
         for (i, field) in schema.fields().iter().enumerate() {
             let name = field.name().as_str();
             let column = meta.row_group(g).column(i);
-            let raw = ["resource", "attrs", "events", "links"].contains(&name);
+            let raw = ["resource", "scope", "attrs", "events", "links"].contains(&name);
             assert_eq!(column.statistics().is_none(), raw, "statistics of {name}");
             let pages = meta
                 .page_index()
@@ -439,6 +441,7 @@ fn raw_columns_have_no_statistics_or_dictionary_but_keep_the_offset_index() {
             column.dictionary_page_offset().is_some()
         };
         assert!(has_dictionary("resource"));
+        assert!(has_dictionary("scope"));
         for n in ["attrs", "events", "links"] {
             assert!(!has_dictionary(n), "{n}");
         }

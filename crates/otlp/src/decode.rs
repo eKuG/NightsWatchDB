@@ -70,8 +70,9 @@ impl RecordDecoder for TraceDecoder {
 
 // The promoted attributes. Each row names a column and the attribute keys it
 // is copied from, the current semantic-convention name first and older names
-// after it; the first name present on a span wins. To promote another
-// attribute, add a variant and a row.
+// after it. The first name whose value has a type the column can use wins, so
+// a newer name with an unusable value does not hide a usable older one. To
+// promote another attribute, add a variant and a row.
 #[derive(Clone, Copy)]
 enum Col {
     Operation,
@@ -144,25 +145,25 @@ impl<'a> Seen<'a> {
         }
     }
 
-    /// The value of the first name that was present, whatever its type.
-    fn get(&self, col: Col) -> Option<Val<'a>> {
+    /// The first name, newest first, for which `usable` gives a value.
+    fn first<T>(&self, col: Col, usable: impl Fn(Val<'a>) -> Option<T>) -> Option<T> {
         let row = self.0.get(col as usize)?;
-        row.iter().flatten().next().copied()
+        row.iter().flatten().find_map(|v| usable(*v))
     }
 
     fn text(&self, col: Col) -> Option<&'a str> {
-        match self.get(col) {
-            Some(Val::Str(s)) => Some(s),
+        self.first(col, |v| match v {
+            Val::Str(s) => Some(s),
             _ => None,
-        }
+        })
     }
 
     fn count(&self, col: Col) -> Option<i64> {
-        match self.get(col) {
-            Some(Val::Int(n)) => Some(n),
-            Some(Val::Str(s)) => s.parse().ok(),
-            _ => None,
-        }
+        self.first(col, |v| match v {
+            Val::Int(n) => Some(n),
+            Val::Str(s) => s.parse().ok(),
+            Val::Other => None,
+        })
     }
 }
 
@@ -213,14 +214,18 @@ impl Sink {
 #[derive(Clone, Copy)]
 struct Origin<'a> {
     resource: Option<&'a [u8]>,
+    schema_url: Option<&'a str>,
     service_name: Option<&'a str>,
 }
 
 /// What a span inherits from its `ScopeSpans`.
 #[derive(Clone, Copy, Default)]
 struct Scope<'a> {
+    /// The `InstrumentationScope` message as received.
+    raw: Option<&'a [u8]>,
     name: Option<&'a str>,
     version: Option<&'a str>,
+    schema_url: Option<&'a str>,
 }
 
 fn export_request(req: &[u8], sink: &mut Sink) -> R<()> {
@@ -240,12 +245,13 @@ fn resource_spans(body: &[u8], sink: &mut Sink) -> R<()> {
     // The resource may come after the scope spans on the wire, and every span
     // needs it, so find it before walking the spans.
     let mut resource = None;
+    let mut schema_url = None;
     let mut c = Cur::new(body);
     while let Some((f, w)) = c.next_field()? {
-        if f == 1 {
-            resource = Some(c.expect_len(w).at("resource")?);
-        } else {
-            c.skip(w)?;
+        match f {
+            1 => resource = Some(c.expect_len(w).at("resource")?),
+            3 => schema_url = optional_str(c.expect_len(w).at("schema_url")?).at("schema_url")?,
+            _ => c.skip(w)?,
         }
     }
     let service_name = match resource {
@@ -254,6 +260,7 @@ fn resource_spans(body: &[u8], sink: &mut Sink) -> R<()> {
     };
     let origin = Origin {
         resource,
+        schema_url,
         service_name,
     };
     sink.stats.resources += 1;
@@ -296,14 +303,20 @@ fn service_name(resource: &[u8]) -> R<Option<&str>> {
 fn scope_spans(body: &[u8], origin: Origin<'_>, sink: &mut Sink) -> R<()> {
     // As with the resource, the scope may follow its spans.
     let mut scope = Scope::default();
+    let mut schema_url = None;
     let mut c = Cur::new(body);
     while let Some((f, w)) = c.next_field()? {
-        if f == 1 {
-            scope = instrumentation_scope(c.expect_len(w).at("scope")?).at("scope")?;
-        } else {
-            c.skip(w)?;
+        match f {
+            1 => {
+                let raw = c.expect_len(w).at("scope")?;
+                // A repeated scope replaces the earlier one, schema URL aside.
+                scope = instrumentation_scope(raw).at("scope")?;
+            }
+            3 => schema_url = optional_str(c.expect_len(w).at("schema_url")?).at("schema_url")?,
+            _ => c.skip(w)?,
         }
     }
+    scope.schema_url = schema_url;
     sink.stats.scopes += 1;
 
     let mut c = Cur::new(body);
@@ -325,7 +338,10 @@ fn optional_str(bytes: &[u8]) -> R<Option<&str>> {
 }
 
 fn instrumentation_scope(body: &[u8]) -> R<Scope<'_>> {
-    let mut scope = Scope::default();
+    let mut scope = Scope {
+        raw: Some(body),
+        ..Scope::default()
+    };
     let mut c = Cur::new(body);
     while let Some((f, w)) = c.next_field()? {
         match f {
@@ -493,6 +509,8 @@ fn span(body: &[u8], origin: Origin<'_>, scope: Scope<'_>, sink: &mut Sink) -> R
         service_name: origin.service_name,
         scope_name: scope.name,
         scope_version: scope.version,
+        resource_schema_url: origin.schema_url,
+        scope_schema_url: scope.schema_url,
         operation: seen.text(Col::Operation),
         provider: seen.text(Col::Provider),
         request_model: seen.text(Col::RequestModel),
@@ -506,6 +524,7 @@ fn span(body: &[u8], origin: Origin<'_>, scope: Scope<'_>, sink: &mut Sink) -> R
         tool_name: seen.text(Col::ToolName),
         error_type: seen.text(Col::ErrorType),
         resource: origin.resource,
+        scope: scope.raw,
         attrs: &scratch.attrs,
         events: non_empty(&scratch.events),
         links: non_empty(&scratch.links),

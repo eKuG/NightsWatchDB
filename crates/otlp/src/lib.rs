@@ -19,6 +19,7 @@
 //! | `dropped_*_count` | `Span.dropped_attributes_count`, `dropped_events_count`, `dropped_links_count` |
 //! | `service_name` | string value of resource attribute `service.name` |
 //! | `scope_name`, `scope_version` | `InstrumentationScope.name`, `.version` (empty is null) |
+//! | `resource_schema_url`, `scope_schema_url` | `ResourceSpans.schema_url`, `ScopeSpans.schema_url` (empty is null) |
 //! | `operation` | `gen_ai.operation.name` |
 //! | `provider` | `gen_ai.provider.name`, else `gen_ai.system` |
 //! | `request_model` | `gen_ai.request.model` |
@@ -31,17 +32,18 @@
 //! | `agent_name` | `gen_ai.agent.name` |
 //! | `tool_name` | `gen_ai.tool.name` |
 //! | `error_type` | `error.type` |
-//! | `resource` | the `Resource` message bytes as received; null when absent |
+//! | `resource`, `scope` | the `Resource` and `InstrumentationScope` message bytes as received; null when absent |
 //! | `attrs` | each span `KeyValue`, bytes as received, each preceded by its length as a varint |
 //! | `events`, `links` | likewise for `Span.Event` and `Span.Link`; null when there are none |
 //!
 //! Promoted columns are copies; `attrs` keeps the originals. A text column
 //! takes a string value. A token column takes an int value or a string that
-//! parses as a base-10 `i64`. Any other value type leaves the column null. The
-//! first name in the row that is present on the span is the one used, even
-//! when its value has the wrong type, so the newer name wins over the older
-//! one whatever their order. When a key occurs more than once the last
-//! occurrence wins. The table lives in the source as `PROMOTED`.
+//! parses as a base-10 `i64`. Any other value type is unusable. The first name
+//! in the row whose value is usable is the one used, so the newer name wins
+//! over the older one whatever their order, and a newer name with an unusable
+//! value does not hide a usable older one. When a key occurs more than once
+//! the last occurrence is its value. The table lives in the source as
+//! `PROMOTED`.
 //!
 //! # Wire rules
 //!

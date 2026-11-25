@@ -3,8 +3,8 @@ use crate::{SpanId, TraceId};
 /// One span, borrowing its variable-length values.
 ///
 /// Field names and meanings match the columns of the span table; see the
-/// `schema` module for the encoding of `resource`, `attrs`, `events` and
-/// `links`. The default is an all-zero, empty span, which is only useful as a
+/// `schema` module for the encoding of `resource`, `scope`, `attrs`,
+/// `events` and `links`. The default is an all-zero, empty span, which is only useful as a
 /// base for struct update syntax.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SpanRecord<'a> {
@@ -36,6 +36,10 @@ pub struct SpanRecord<'a> {
     pub scope_name: Option<&'a str>,
     /// `scope_version` column.
     pub scope_version: Option<&'a str>,
+    /// `resource_schema_url` column.
+    pub resource_schema_url: Option<&'a str>,
+    /// `scope_schema_url` column.
+    pub scope_schema_url: Option<&'a str>,
     /// `operation` column (promoted attribute).
     pub operation: Option<&'a str>,
     /// `provider` column (promoted attribute).
@@ -62,6 +66,8 @@ pub struct SpanRecord<'a> {
     pub error_type: Option<&'a str>,
     /// `resource` column: serialized OTLP `Resource`, as received.
     pub resource: Option<&'a [u8]>,
+    /// `scope` column: serialized OTLP `InstrumentationScope`, as received.
+    pub scope: Option<&'a [u8]>,
     /// `attrs` column: length-prefixed OTLP `KeyValue` messages.
     pub attrs: &'a [u8],
     /// `events` column: length-prefixed OTLP `Span.Event` messages.

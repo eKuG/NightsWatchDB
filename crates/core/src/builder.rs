@@ -55,6 +55,8 @@ pub struct SpanBatchBuilder {
     service_name: StringBuilder,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
+    resource_schema_url: StringBuilder,
+    scope_schema_url: StringBuilder,
     operation: StringBuilder,
     provider: StringBuilder,
     request_model: StringBuilder,
@@ -68,6 +70,7 @@ pub struct SpanBatchBuilder {
     tool_name: StringBuilder,
     error_type: StringBuilder,
     resource: LargeBinaryBuilder,
+    scope: LargeBinaryBuilder,
     attrs: LargeBinaryBuilder,
     events: LargeBinaryBuilder,
     links: LargeBinaryBuilder,
@@ -113,6 +116,8 @@ impl SpanBatchBuilder {
             service_name: short(),
             scope_name: short(),
             scope_version: short(),
+            resource_schema_url: short(),
+            scope_schema_url: short(),
             operation: short(),
             provider: short(),
             request_model: short(),
@@ -126,6 +131,7 @@ impl SpanBatchBuilder {
             tool_name: short(),
             error_type: short(),
             resource: raw(0),
+            scope: raw(0),
             attrs: raw(ATTRS_BYTES_PER_ROW),
             events: raw(0),
             links: raw(0),
@@ -167,6 +173,12 @@ impl SpanBatchBuilder {
         bytes += put_str(&mut self.service_name, r.service_name, &mut fullest);
         bytes += put_str(&mut self.scope_name, r.scope_name, &mut fullest);
         bytes += put_str(&mut self.scope_version, r.scope_version, &mut fullest);
+        bytes += put_str(
+            &mut self.resource_schema_url,
+            r.resource_schema_url,
+            &mut fullest,
+        );
+        bytes += put_str(&mut self.scope_schema_url, r.scope_schema_url, &mut fullest);
         bytes += put_str(&mut self.operation, r.operation, &mut fullest);
         bytes += put_str(&mut self.provider, r.provider, &mut fullest);
         bytes += put_str(&mut self.request_model, r.request_model, &mut fullest);
@@ -178,6 +190,7 @@ impl SpanBatchBuilder {
         bytes += put_str(&mut self.tool_name, r.tool_name, &mut fullest);
         bytes += put_str(&mut self.error_type, r.error_type, &mut fullest);
         bytes += put_bytes(&mut self.resource, r.resource);
+        bytes += put_bytes(&mut self.scope, r.scope);
         bytes += put_bytes(&mut self.events, r.events);
         bytes += put_bytes(&mut self.links, r.links);
 
@@ -234,6 +247,8 @@ impl SpanBatchBuilder {
             Arc::new(self.service_name.finish()),
             Arc::new(self.scope_name.finish()),
             Arc::new(self.scope_version.finish()),
+            Arc::new(self.resource_schema_url.finish()),
+            Arc::new(self.scope_schema_url.finish()),
             Arc::new(self.operation.finish()),
             Arc::new(self.provider.finish()),
             Arc::new(self.request_model.finish()),
@@ -247,6 +262,7 @@ impl SpanBatchBuilder {
             Arc::new(self.tool_name.finish()),
             Arc::new(self.error_type.finish()),
             Arc::new(self.resource.finish()),
+            Arc::new(self.scope.finish()),
             Arc::new(self.attrs.finish()),
             Arc::new(self.events.finish()),
             Arc::new(self.links.finish()),
@@ -289,17 +305,20 @@ mod tests {
             max_bytes: 100,
         });
         let r = SpanRecord {
-            name: "0123456789",        // 10
-            session_id: Some("abcde"), // 5
-            attrs: &[0; 35],           // 35
-            resource: Some(&[0; 10]),  // 10
+            name: "0123456789",              // 10
+            session_id: Some("abcde"),       // 5
+            attrs: &[0; 35],                 // 35
+            resource: Some(&[0; 10]),        // 10
+            scope: Some(&[0; 3]),            // 3
+            scope_schema_url: Some("u"),     // 1
+            resource_schema_url: Some("vv"), // 2
             ..SpanRecord::default()
         };
         b.append(&r);
-        assert_eq!(b.value_bytes(), 60);
+        assert_eq!(b.value_bytes(), 66);
         assert!(!b.is_full());
         b.append(&r);
-        assert_eq!(b.value_bytes(), 120);
+        assert_eq!(b.value_bytes(), 132);
         assert!(b.is_full());
         assert_eq!(b.rows(), 2);
     }

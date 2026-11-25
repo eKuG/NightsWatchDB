@@ -230,12 +230,56 @@ fn a_duplicated_key_takes_its_last_value() {
         kv("gen_ai.system", str_val("old2")),
     ]);
     assert_eq!(got[1].as_deref(), Some("new"));
-    // A newer name that is present but of the wrong type hides the older one.
-    let got = promoted(vec![
-        kv("gen_ai.provider.name", Value::IntValue(1)),
-        kv("gen_ai.system", str_val("old")),
-    ]);
-    assert_eq!(got[1], None);
+}
+
+/// A newer name whose value cannot be used does not hide an older name.
+#[test]
+fn the_first_name_with_a_usable_value_wins() {
+    for (col, token, new, old) in TABLE {
+        let Some(old) = old.first() else { continue };
+        let good = |s: &str| {
+            if token {
+                Value::IntValue(s.parse().unwrap())
+            } else {
+                str_val(s)
+            }
+        };
+        let bad = || {
+            if token {
+                str_val("not a number")
+            } else {
+                Value::IntValue(7)
+            }
+        };
+        // Newer name unusable, older usable: the older one is taken, in
+        // either order on the wire.
+        assert_eq!(
+            promoted(vec![kv(new, bad()), kv(old, good("1"))]),
+            only(col, "1"),
+            "{new}"
+        );
+        assert_eq!(
+            promoted(vec![kv(old, good("1")), kv(new, bad())]),
+            only(col, "1"),
+            "{new}"
+        );
+        // Both usable: the newer name wins.
+        assert_eq!(
+            promoted(vec![kv(old, good("1")), kv(new, good("2"))]),
+            only(col, "2")
+        );
+        // Only the older name.
+        assert_eq!(promoted(vec![kv(old, good("1"))]), only(col, "1"));
+        // Neither is usable.
+        assert_eq!(promoted(vec![kv(new, bad()), kv(old, bad())])[col], None);
+        // A newer name with no value at all is skipped too.
+        let empty = KeyValue {
+            key: new.to_string(),
+            value: None,
+            ..Default::default()
+        };
+        assert_eq!(promoted(vec![empty, kv(old, good("1"))]), only(col, "1"));
+    }
 }
 
 #[test]
@@ -313,6 +357,9 @@ fn fields_in_any_order_with_unknown_fields_at_every_level() {
         assert_eq!(r.service_name, Some("svc"));
         assert_eq!(r.scope_name, Some("lib"));
         assert_eq!(r.scope_version, Some("1.2"));
+        assert_eq!(r.scope, Some(scope.as_slice()));
+        assert_eq!(r.resource_schema_url, Some("url"));
+        assert_eq!(r.scope_schema_url, Some("url"));
         assert_eq!(r.resource, Some(resource.as_slice()));
         assert_eq!(r.trace_id.0, [7; 16]);
         assert_eq!(r.span_id.0, [9; 8]);
@@ -501,6 +548,10 @@ fn invalid_utf8_is_corrupt() {
         &ld(1, &concat(&[&ld(1, b"service.name"), &ld(2, &ld(1, &bad))])),
     );
     corrupt(&ld(1, &concat(&[&res, &ld(2, &ld(2, &ids))])));
+    // Both schema URLs.
+    let scope_spans = ld(2, &concat(&[&ld(3, &bad), &ld(2, &ids)]));
+    assert!(corrupt(&ld(1, &scope_spans)).contains("scope_spans.schema_url"));
+    assert!(corrupt(&ld(1, &ld(3, &bad))).contains("resource_spans.schema_url"));
     // Bytes that are not UTF-8 in a value that is only copied are not read.
     let blob = concat(&[&ld(1, b"blob"), &ld(2, &ld(1, &bad))]);
     decoder()
@@ -525,13 +576,14 @@ fn small_request() -> Vec<u8> {
                 opentelemetry_proto::tonic::common::v1::InstrumentationScope {
                     name: "scope".into(),
                     version: "1".into(),
-                    ..Default::default()
+                    attributes: vec![kv("k", str_val("v"))],
+                    dropped_attributes_count: 2,
                 },
             ),
             spans: vec![span, rand_span(&mut r)],
-            ..Default::default()
+            schema_url: "https://example.test/s".into(),
         }],
-        ..Default::default()
+        schema_url: "https://example.test/r".into(),
     }];
     req.encode_to_vec()
 }

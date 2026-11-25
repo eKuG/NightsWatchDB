@@ -13,9 +13,9 @@ nwdb-core = { path = "../core" }
 arrow-array.workspace = true
 
 [dev-dependencies]
-prost = "=0.14.6"
-opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
-rand = "=0.9.5"
+prost.workspace = true
+opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
+rand.workspace = true
 
 [lints]
 workspace = true

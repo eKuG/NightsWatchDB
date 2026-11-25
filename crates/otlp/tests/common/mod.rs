@@ -38,6 +38,8 @@ pub fn value_bytes(r: &SpanRecord<'_>) -> usize {
         r.service_name,
         r.scope_name,
         r.scope_version,
+        r.resource_schema_url,
+        r.scope_schema_url,
         r.operation,
         r.provider,
         r.request_model,
@@ -49,7 +51,7 @@ pub fn value_bytes(r: &SpanRecord<'_>) -> usize {
         r.tool_name,
         r.error_type,
     ];
-    let raws = [r.resource, Some(r.attrs), r.events, r.links];
+    let raws = [r.resource, r.scope, Some(r.attrs), r.events, r.links];
     strings.iter().flatten().map(|s| s.len()).sum::<usize>()
         + raws.iter().flatten().map(|b| b.len()).sum::<usize>()
 }

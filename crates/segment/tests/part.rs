@@ -32,10 +32,11 @@ struct Span {
     start_ns: i64,
     end_ns: i64,
     status_code: i32,
-    strings: [Option<String>; 14],
+    strings: [Option<String>; 16],
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     resource: Option<Vec<u8>>,
+    scope: Option<Vec<u8>>,
     attrs: Vec<u8>,
     events: Option<Vec<u8>>,
     links: Option<Vec<u8>>,
@@ -47,7 +48,7 @@ impl Span {
     /// Order of `strings`: status_message, trace_state, service_name,
     /// scope_name, scope_version, operation, provider, request_model,
     /// response_model, conversation_id, session_id, user_id, agent_name,
-    /// tool_name. `error_type` is derived from `status_code`.
+    /// tool_name, resource_schema_url, scope_schema_url. `error_type` is derived from `status_code`.
     fn record(&self) -> SpanRecord<'_> {
         let s = |i: usize| self.strings[i].as_deref();
         SpanRecord {
@@ -78,6 +79,9 @@ impl Span {
             tool_name: s(13),
             error_type: (self.status_code == 2).then_some("boom"),
             resource: self.resource.as_deref(),
+            scope: self.scope.as_deref(),
+            resource_schema_url: s(14),
+            scope_schema_url: s(15),
             attrs: &self.attrs,
             events: self.events.as_deref(),
             links: self.links.as_deref(),
@@ -145,7 +149,7 @@ fn generate(g: &Gen) -> Vec<Span> {
                 1 => rng.random_range(1..64),
                 _ => rng.random_range(64..2048),
             };
-            let strings: [Option<String>; 14] = std::array::from_fn(|_| opt(&mut rng, word));
+            let strings: [Option<String>; 16] = std::array::from_fn(|_| opt(&mut rng, word));
             let status_code = rng.random_range(0..3);
             out.push(Span {
                 trace_id,
@@ -161,6 +165,7 @@ fn generate(g: &Gen) -> Vec<Span> {
                 input_tokens: opt(&mut rng, |r| r.random_range(0..100_000)),
                 output_tokens: opt(&mut rng, |r| r.random_range(0..100_000)),
                 resource: opt(&mut rng, |r| bytes(r, 40)),
+                scope: opt(&mut rng, |r| bytes(r, 30)),
                 attrs: bytes(&mut rng, attrs_len),
                 events: opt(&mut rng, |r| bytes(r, 100)),
                 links: opt(&mut rng, |_| Vec::new()),
@@ -525,6 +530,7 @@ fn index_file_known_answer() {
         input_tokens: None,
         output_tokens: None,
         resource: None,
+        scope: None,
         attrs: Vec::new(),
         events: None,
         links: None,

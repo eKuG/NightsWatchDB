@@ -25,6 +25,8 @@ pub struct SpanColumns<'a> {
     service_name: &'a StringArray,
     scope_name: &'a StringArray,
     scope_version: &'a StringArray,
+    resource_schema_url: &'a StringArray,
+    scope_schema_url: &'a StringArray,
     operation: &'a StringArray,
     provider: &'a StringArray,
     request_model: &'a StringArray,
@@ -38,6 +40,7 @@ pub struct SpanColumns<'a> {
     tool_name: &'a StringArray,
     error_type: &'a StringArray,
     resource: &'a LargeBinaryArray,
+    scope: &'a LargeBinaryArray,
     attrs: &'a LargeBinaryArray,
     events: &'a LargeBinaryArray,
     links: &'a LargeBinaryArray,
@@ -127,6 +130,8 @@ impl<'a> SpanColumns<'a> {
             service_name: get(batch, col::SERVICE_NAME)?,
             scope_name: get(batch, col::SCOPE_NAME)?,
             scope_version: get(batch, col::SCOPE_VERSION)?,
+            resource_schema_url: get(batch, col::RESOURCE_SCHEMA_URL)?,
+            scope_schema_url: get(batch, col::SCOPE_SCHEMA_URL)?,
             operation: get(batch, col::OPERATION)?,
             provider: get(batch, col::PROVIDER)?,
             request_model: get(batch, col::REQUEST_MODEL)?,
@@ -140,6 +145,7 @@ impl<'a> SpanColumns<'a> {
             tool_name: get(batch, col::TOOL_NAME)?,
             error_type: get(batch, col::ERROR_TYPE)?,
             resource: get(batch, col::RESOURCE)?,
+            scope: get(batch, col::SCOPE)?,
             attrs: get(batch, col::ATTRS)?,
             events: get(batch, col::EVENTS)?,
             links: get(batch, col::LINKS)?,
@@ -189,6 +195,8 @@ impl<'a> SpanColumns<'a> {
             service_name: string(self.service_name, row),
             scope_name: string(self.scope_name, row),
             scope_version: string(self.scope_version, row),
+            resource_schema_url: string(self.resource_schema_url, row),
+            scope_schema_url: string(self.scope_schema_url, row),
             operation: string(self.operation, row),
             provider: string(self.provider, row),
             request_model: string(self.request_model, row),
@@ -202,6 +210,7 @@ impl<'a> SpanColumns<'a> {
             tool_name: string(self.tool_name, row),
             error_type: string(self.error_type, row),
             resource: bytes(self.resource, row),
+            scope: bytes(self.scope, row),
             attrs: self.attrs.value(row),
             events: bytes(self.events, row),
             links: bytes(self.links, row),
@@ -241,6 +250,8 @@ mod tests {
             service_name: Some("agent"),
             scope_name: Some("scope"),
             scope_version: Some("1.2.3"),
+            resource_schema_url: Some("https://example.test/r/1"),
+            scope_schema_url: Some("https://example.test/s/1"),
             operation: Some("chat"),
             provider: Some("openai"),
             request_model: Some("gpt-5"),
@@ -254,6 +265,7 @@ mod tests {
             tool_name: Some("search"),
             error_type: Some("timeout"),
             resource: Some(&[1, 2, 3]),
+            scope: Some(&[7, 8]),
             attrs,
             events: Some(&[4, 5]),
             links: Some(&[]),
@@ -294,6 +306,8 @@ mod tests {
         assert_eq!(cols.record(0).attrs.len(), 1 << 20);
         assert!(cols.record(1).parent_span_id.is_none());
         assert!(cols.record(1).resource.is_none());
+        assert!(cols.record(1).scope.is_none());
+        assert!(cols.record(1).scope_schema_url.is_none());
         assert_eq!(cols.record(1).attrs, b"");
         assert_eq!(cols.record(1).name, "ünïcode \u{1F600} 名前");
 

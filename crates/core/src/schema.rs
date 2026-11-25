@@ -5,13 +5,14 @@
 //! 1. The span itself: `trace_id`, `span_id`, `parent_span_id`, `name`,
 //!    `kind`, `start_ns`, `end_ns`, `status_code`, `status_message`,
 //!    `trace_state`, `flags`.
-//! 2. Where it came from: `service_name`, `scope_name`, `scope_version`.
+//! 2. Where it came from: `service_name`, `scope_name`, `scope_version`,
+//!    `resource_schema_url`, `scope_schema_url`.
 //! 3. Promoted fields (all nullable): `operation`, `provider`,
 //!    `request_model`, `response_model`, `input_tokens`, `output_tokens`,
 //!    `conversation_id`, `session_id`, `user_id`, `agent_name`, `tool_name`,
 //!    `error_type`.
-//! 4. The raw, lossless parts (`LargeBinary`): `resource`, `attrs`, `events`,
-//!    `links`.
+//! 4. The raw, lossless parts (`LargeBinary`): `resource`, `scope`, `attrs`,
+//!    `events`, `links`.
 //! 5. `dropped_attributes_count`, `dropped_events_count`,
 //!    `dropped_links_count`.
 //!
@@ -40,7 +41,15 @@
 //! also be zero bytes; both mean "empty". `attrs` is never null.
 //!
 //! `resource` is the serialized OTLP `Resource` message exactly as received
-//! (no length prefix), or null if the sender sent none.
+//! (no length prefix), or null if the sender sent none. `scope` is the same
+//! for the `InstrumentationScope` message: its name, version, attributes and
+//! dropped-attributes count. `scope_name` and `scope_version` are copies of
+//! two of its fields for filtering, as `service_name` is for the resource.
+//!
+//! `resource_schema_url` and `scope_schema_url` are the `schema_url` of the
+//! `ResourceSpans` and `ScopeSpans` the span arrived in; they name the
+//! semantic-convention version the sender used. Both are null when the
+//! sender's value was empty or absent.
 //!
 //! Core does not parse these bytes; the ingest crates write them and the
 //! query layer reads them.
@@ -74,6 +83,8 @@ pub mod col {
         SERVICE_NAME = "service_name",
         SCOPE_NAME = "scope_name",
         SCOPE_VERSION = "scope_version",
+        RESOURCE_SCHEMA_URL = "resource_schema_url",
+        SCOPE_SCHEMA_URL = "scope_schema_url",
         OPERATION = "operation",
         PROVIDER = "provider",
         REQUEST_MODEL = "request_model",
@@ -87,6 +98,7 @@ pub mod col {
         TOOL_NAME = "tool_name",
         ERROR_TYPE = "error_type",
         RESOURCE = "resource",
+        SCOPE = "scope",
         ATTRS = "attrs",
         EVENTS = "events",
         LINKS = "links",
@@ -120,6 +132,8 @@ fn build() -> SchemaRef {
         f(col::SERVICE_NAME, Utf8, true),
         f(col::SCOPE_NAME, Utf8, true),
         f(col::SCOPE_VERSION, Utf8, true),
+        f(col::RESOURCE_SCHEMA_URL, Utf8, true),
+        f(col::SCOPE_SCHEMA_URL, Utf8, true),
         f(col::OPERATION, Utf8, true),
         f(col::PROVIDER, Utf8, true),
         f(col::REQUEST_MODEL, Utf8, true),
@@ -133,6 +147,7 @@ fn build() -> SchemaRef {
         f(col::TOOL_NAME, Utf8, true),
         f(col::ERROR_TYPE, Utf8, true),
         f(col::RESOURCE, LargeBinary, true),
+        f(col::SCOPE, LargeBinary, true),
         f(col::ATTRS, LargeBinary, false),
         f(col::EVENTS, LargeBinary, true),
         f(col::LINKS, LargeBinary, true),
@@ -177,6 +192,8 @@ mod tests {
             "service_name:Utf8:null",
             "scope_name:Utf8:null",
             "scope_version:Utf8:null",
+            "resource_schema_url:Utf8:null",
+            "scope_schema_url:Utf8:null",
             "operation:Utf8:null",
             "provider:Utf8:null",
             "request_model:Utf8:null",
@@ -190,6 +207,7 @@ mod tests {
             "tool_name:Utf8:null",
             "error_type:Utf8:null",
             "resource:LargeBinary:null",
+            "scope:LargeBinary:null",
             "attrs:LargeBinary:required",
             "events:LargeBinary:null",
             "links:LargeBinary:null",

@@ -10,10 +10,10 @@ rust-version.workspace = true
 
 [dependencies]
 nwdb-core = { path = "../core" }
-crc32c = "=0.6.9"
+crc32c.workspace = true
 
 [dev-dependencies]
-tempfile = "=3.27.0"
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -28,8 +28,8 @@ Parquet settings:
 | Setting | Value | Why |
 |---|---|---|
 | Compression | zstd level 3, all columns | |
-| Statistics | page level (so also the column index), except off for `resource`, `attrs`, `events` and `links` | row group pruning by `start_ns`; nothing prunes by the raw binary columns, so their statistics are wasted work |
-| Dictionary encoding | on, except off for `attrs`, `events` and `links` | `resource` repeats heavily across spans; the other three are close to unique per row |
+| Statistics | page level (so also the column index), except off for `resource`, `scope`, `attrs`, `events` and `links` | row group pruning by `start_ns`; nothing prunes by the raw binary columns, so their statistics are wasted work |
+| Dictionary encoding | on, except off for `attrs`, `events` and `links` | `resource` and `scope` repeat heavily across spans; the other three are close to unique per row |
 | Offset index | on, for every column (also those without statistics) | lets a row selection skip pages; a test pins that `read_trace` does not fetch other traces' pages |
 | Bloom filters | off | the trace index replaces them |
 | Row group size | 16,384 rows or 64 MiB of value bytes, whichever first | rows range from 1 KB to several MB, so a row bound alone is unsafe; the row that crosses the byte bound stays in the group |

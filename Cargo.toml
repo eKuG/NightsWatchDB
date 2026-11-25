@@ -18,6 +18,14 @@ rust-version = "1.100"
 # commit.
 arrow-array = "=60.2.0"
 arrow-schema = "=60.2.0"
+parquet = { version = "=60.2.0", default-features = false }
+
+bytes = "=1.12.2"
+crc32c = "=0.6.9"
+opentelemetry-proto = { version = "=0.33.1", default-features = false }
+prost = "=0.14.6"
+rand = "=0.9.5"
+tempfile = "=3.27.0"
 
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"

@@ -13,12 +13,12 @@ nwdb-core = { path = "../core" }
 nwdb-wal = { path = "../wal" }
 nwdb-segment = { path = "../segment" }
 nwdb-manifest = { path = "../manifest" }
-arrow-array = "=60.2.0"
-arrow-schema = "=60.2.0"
+arrow-array.workspace = true
+arrow-schema.workspace = true
 
 [dev-dependencies]
-tempfile = "=3.27.0"
-rand = "=0.9.5"
+tempfile.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true
