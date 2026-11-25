@@ -1,0 +1,861 @@
+//! The engine handle: options, start-up, ingest, the applier and flusher
+//! threads, and shutdown.
+
+use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::{JoinHandle, ThreadId};
+use std::time::{Duration, Instant};
+
+use arrow_array::RecordBatch;
+use nwdb_core::{
+    BatchLimits, DEFAULT_WINDOW_NS, Error, RecordDecoder, Result, SpanColumns, TraceId,
+    TraceSummary,
+};
+use nwdb_manifest::{
+    Edit, Manifest, ManifestOptions, OpenMode, highest_part_dir_id, unreferenced_part_dirs,
+};
+use nwdb_segment::PartReader;
+use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
+
+use crate::lock;
+use crate::query::{AggQuery, ListQuery, Snapshot, TokenAgg};
+
+/// How long the background flusher waits after a failed flush before it tries
+/// again. An explicit [`Engine::flush`] is never delayed by it.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Settings for [`Engine::open`].
+#[derive(Clone, Debug)]
+pub struct EngineOptions {
+    /// The data directory. It holds `LOCK`, `manifest/`, `parts/` and `wal/`.
+    pub data_dir: PathBuf,
+    /// Create the data directory and an empty database if there is none.
+    /// When false, a missing database is [`Error::NotFound`]. Default true.
+    pub create_if_missing: bool,
+    /// Width of a part's time window, nanoseconds; must be positive. Default
+    /// 15 minutes.
+    pub window_ns: i64,
+    /// The active buffer is flushed when it reaches this many bytes of memory.
+    /// Default 256 MiB.
+    pub buffer_bytes: usize,
+    /// [`Engine::ingest`] returns `Unavailable` rather than let the active
+    /// buffer, the buffer being flushed and the batches of requests still
+    /// waiting for the log together grow past this many bytes. A single
+    /// request that is larger than the limit is accepted when nothing else is
+    /// buffered, so that it can make progress. Default twice `buffer_bytes`.
+    /// Setting it below `buffer_bytes` means the size trigger never fires and
+    /// only age or an explicit flush empties the buffer.
+    pub max_buffered_bytes: usize,
+    /// The active buffer is flushed when its oldest data is this old.
+    /// Default 30 seconds.
+    pub flush_interval: Duration,
+    /// [`Engine::ingest`] returns `Unavailable` while the log holds more than
+    /// this many bytes of records not yet durable. Default 256 MiB.
+    pub max_wal_pending_bytes: u64,
+    /// Settings of the write-ahead log. The engine overrides `min_next_lsn`.
+    pub wal: WalOptions,
+    /// Byte and row bounds of the batches built for parts and for query
+    /// results.
+    pub batch_limits: BatchLimits,
+}
+
+impl EngineOptions {
+    /// Options for the database in `data_dir`, with every other setting at
+    /// its default.
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        let buffer_bytes = 256 * 1024 * 1024;
+        Self {
+            data_dir: data_dir.into(),
+            create_if_missing: true,
+            window_ns: DEFAULT_WINDOW_NS,
+            buffer_bytes,
+            max_buffered_bytes: 2 * buffer_bytes,
+            flush_interval: Duration::from_secs(30),
+            max_wal_pending_bytes: 256 * 1024 * 1024,
+            wal: WalOptions::default(),
+            batch_limits: BatchLimits::DEFAULT,
+        }
+    }
+}
+
+/// Counters and positions, from [`Engine::stats`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EngineStats {
+    /// Requests accepted by [`Engine::ingest`] since the engine was opened.
+    pub records_ingested: u64,
+    /// Bytes of those requests' log records, not counting the tag byte.
+    pub bytes_ingested: u64,
+    /// Highest log position whose data is in the buffer or in a part, and
+    /// whose sender has been (or is being) acknowledged.
+    pub acked_lsn: u64,
+    /// Highest log position whose data is in live parts, as the manifest says.
+    pub flushed_lsn: u64,
+    /// Memory estimate of the active buffer plus the buffer being flushed.
+    pub buffered_bytes: usize,
+    /// Number of live parts.
+    pub parts: usize,
+    /// Flushes completed since the engine was opened.
+    pub flushes: u64,
+    /// True while a flush is writing parts or committing.
+    pub flushing: bool,
+    /// The most recent error from a flush, the log or trimming, if any.
+    pub last_error: Option<String>,
+}
+
+/// A live part: its metadata and an open reader.
+pub(crate) struct LivePart {
+    pub meta: nwdb_core::PartMeta,
+    pub reader: PartReader,
+}
+
+/// What queries can see, replaced whole under the core lock.
+#[derive(Clone, Default)]
+pub(crate) struct Visible {
+    pub parts: Arc<Vec<Arc<LivePart>>>,
+    /// The buffer being written out, until its parts are live.
+    pub frozen: Option<Arc<Vec<Arc<RecordBatch>>>>,
+    pub active: Arc<Vec<Arc<RecordBatch>>>,
+}
+
+/// Everything the threads share under one lock. Held only to move pointers
+/// and counters, never across I/O.
+pub(crate) struct Core {
+    pub fatal: Option<String>,
+    pub closing: bool,
+    pub stop_flusher: bool,
+    pub vis: Visible,
+    pub active_bytes: usize,
+    pub active_oldest: Option<Instant>,
+    pub frozen_bytes: usize,
+    /// Bytes of batches of requests accepted but not yet in the buffer.
+    pub inflight_bytes: usize,
+    /// Requests accepted whose callback has not finished.
+    pub outstanding: u64,
+    /// Highest log position in the buffer or in parts: always a contiguous
+    /// prefix of the log.
+    pub applied_lsn: u64,
+    pub flushed_lsn: u64,
+    pub flushing: bool,
+    pub retry_after: Option<Instant>,
+    pub records: u64,
+    pub bytes: u64,
+    pub flushes: u64,
+    pub last_error: Option<String>,
+}
+
+struct Pending {
+    result: Result<Lsn>,
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+    done: Box<dyn FnOnce(Result<()>) + Send>,
+}
+
+#[derive(Default)]
+struct QueueState {
+    items: VecDeque<Pending>,
+    closed: bool,
+}
+
+/// The hand-off from the log's thread to the applier: the log's callbacks only
+/// push here.
+#[derive(Default)]
+struct Queue {
+    state: Mutex<QueueState>,
+    cv: Condvar,
+}
+
+pub(crate) struct Inner {
+    pub opts: EngineOptions,
+    decoders: HashMap<u8, Arc<dyn RecordDecoder>>,
+    pub core: Mutex<Core>,
+    /// Wakes the flusher.
+    pub flusher_cv: Condvar,
+    /// Signals that `outstanding` reached zero.
+    idle_cv: Condvar,
+    queue: Arc<Queue>,
+    pub wal: RwLock<Option<Wal>>,
+    pub manifest: Manifest,
+    pub parts_dir: PathBuf,
+    /// One flush at a time.
+    pub flush_gate: Mutex<()>,
+    lock_file: Mutex<Option<File>>,
+    threads: Mutex<Threads>,
+    shut_down: AtomicBool,
+}
+
+/// The two engine threads, until shutdown takes them.
+#[derive(Default)]
+struct Threads {
+    applier: Option<(ThreadId, JoinHandle<()>)>,
+    flusher: Option<(ThreadId, JoinHandle<()>)>,
+}
+
+struct Handle {
+    inner: Arc<Inner>,
+}
+
+/// An open database. Cheap to clone; every clone is the same engine.
+///
+/// Dropping the last clone without [`shutdown`](Self::shutdown) stops the
+/// threads after the pending acknowledgements, and does not flush: what was
+/// acknowledged is in the log and is recovered by the next `open`.
+#[derive(Clone)]
+pub struct Engine {
+    handle: Arc<Handle>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if self.inner.on_engine_thread() {
+            // The last handle was dropped by a callback running on one of the
+            // engine's own threads, which cannot join itself.
+            let inner = self.inner.clone();
+            let _ = std::thread::Builder::new()
+                .name("nwdb-cleanup".into())
+                .spawn(move || {
+                    let _ = inner.shutdown_inner(false);
+                });
+        } else {
+            let _ = self.inner.shutdown_inner(false);
+        }
+    }
+}
+
+fn sync_dir(dir: &Path) {
+    // Best effort by design: the callers only use it to make a deletion
+    // durable sooner, and a leftover is deleted again at the next start-up.
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+impl Engine {
+    /// Opens the database in `options.data_dir`, recovering it first.
+    ///
+    /// `decoders` maps the one-byte tag that precedes every log record to the
+    /// decoder that turns such a record back into span batches.
+    ///
+    /// Start-up order, each step before the next: lock the directory
+    /// (`Conflict` if another engine holds it), open the manifest (never
+    /// treating a missing manifest next to part directories as an empty
+    /// database), make part ids unreusable, delete unreferenced parts, open
+    /// every live part, open the log and check it reaches back to the
+    /// manifest's position, replay the log into the buffer, and only then
+    /// start the threads. A log record with an unknown tag or that does not
+    /// decode is [`Error::Corrupt`] and stops start-up.
+    pub fn open(
+        options: EngineOptions,
+        decoders: Vec<(u8, Arc<dyn RecordDecoder>)>,
+    ) -> Result<Engine> {
+        if options.window_ns <= 0 {
+            return Err(Error::invalid_argument("window_ns must be positive"));
+        }
+        if options.buffer_bytes == 0 {
+            return Err(Error::invalid_argument("buffer_bytes must be positive"));
+        }
+        let dir = options.data_dir.clone();
+        if !dir.is_dir() {
+            if !options.create_if_missing {
+                return Err(Error::not_found(format!(
+                    "data directory {} does not exist",
+                    dir.display()
+                )));
+            }
+            std::fs::create_dir_all(&dir)?;
+            if let Some(parent) = dir.parent() {
+                sync_dir(if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                });
+            }
+        }
+
+        // 1. The lock comes before anything else is opened or changed.
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join("LOCK"))?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(Error::conflict(format!(
+                    "{} is in use by another engine",
+                    dir.display()
+                )));
+            }
+            Err(TryLockError::Error(e)) => return Err(e.into()),
+        }
+
+        // 2. The manifest. A first start creates it, and commits an empty
+        // first version at once: from then on, part directories without a
+        // manifest file can only mean a lost manifest, never a crash before
+        // the first commit.
+        let parts_dir = dir.join("parts");
+        let has_parts = highest_part_dir_id(&parts_dir)?.is_some();
+        let mode = if options.create_if_missing && !has_parts {
+            OpenMode::Create
+        } else {
+            OpenMode::MustExist
+        };
+        let manifest = match Manifest::open(dir.join("manifest"), mode, ManifestOptions::default())
+        {
+            Ok(m) => m,
+            Err(Error::NotFound(why)) if has_parts => {
+                return Err(Error::corrupt(format!(
+                    "{} holds part directories but no manifest ({why}); \
+                     refusing to start as if the database were empty",
+                    parts_dir.display()
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        if manifest.current().version == 0 {
+            manifest.commit(Edit::default())?;
+        }
+
+        // 3. Part ids that exist on disk must never be handed out again.
+        let state = manifest.current();
+        if let Some(highest) = highest_part_dir_id(&parts_dir)?
+            && highest >= state.next_part_id
+        {
+            manifest.commit(Edit {
+                next_part_id: Some(highest + 1),
+                ..Edit::default()
+            })?;
+        }
+
+        // 4. Directories the manifest does not reference are leftovers of a
+        // flush that did not commit.
+        let state = manifest.current();
+        let leftovers = unreferenced_part_dirs(&parts_dir, &state)?;
+        for d in &leftovers {
+            std::fs::remove_dir_all(d)?;
+        }
+        if !leftovers.is_empty() {
+            sync_dir(&parts_dir);
+        }
+
+        // 5. Every live part must open.
+        let mut parts = Vec::with_capacity(state.parts.len());
+        for meta in &state.parts {
+            let reader = PartReader::open(parts_dir.join(nwdb_core::part_dir_name(meta.part_id)))?;
+            parts.push(Arc::new(LivePart {
+                meta: meta.clone(),
+                reader,
+            }));
+        }
+
+        // 6. The log, numbered above everything already in parts.
+        let flushed = state.wal_flushed_lsn;
+        let wal_options = WalOptions {
+            min_next_lsn: Some(flushed + 1),
+            ..options.wal.clone()
+        };
+        let (wal, recovery) = Wal::open(dir.join("wal"), wal_options)?;
+        if recovery.first_lsn > flushed + 1 {
+            return Err(Error::corrupt(format!(
+                "the log starts at record {} but the manifest says records up to {flushed} are in \
+                 parts: records {}..{} were acknowledged and are missing",
+                recovery.first_lsn,
+                flushed + 1,
+                recovery.first_lsn
+            )));
+        }
+
+        let mut decoder_map = HashMap::new();
+        for (tag, d) in decoders {
+            if decoder_map.insert(tag, d).is_some() {
+                return Err(Error::invalid_argument(format!(
+                    "two decoders registered for tag {tag}"
+                )));
+            }
+        }
+        let inner = Arc::new(Inner {
+            decoders: decoder_map,
+            core: Mutex::new(Core {
+                fatal: None,
+                closing: false,
+                stop_flusher: false,
+                vis: Visible {
+                    parts: Arc::new(parts),
+                    frozen: None,
+                    active: Arc::default(),
+                },
+                active_bytes: 0,
+                active_oldest: None,
+                frozen_bytes: 0,
+                inflight_bytes: 0,
+                outstanding: 0,
+                applied_lsn: flushed,
+                flushed_lsn: flushed,
+                flushing: false,
+                retry_after: None,
+                records: 0,
+                bytes: 0,
+                flushes: 0,
+                last_error: None,
+            }),
+            flusher_cv: Condvar::new(),
+            idle_cv: Condvar::new(),
+            queue: Arc::default(),
+            wal: RwLock::new(None),
+            manifest,
+            parts_dir,
+            flush_gate: Mutex::new(()),
+            lock_file: Mutex::new(Some(lock_file)),
+            threads: Mutex::new(Threads::default()),
+            shut_down: AtomicBool::new(false),
+            opts: options,
+        });
+
+        // Replay. The buffer is flushed whenever it fills, so a long log does
+        // not need more memory than a running engine.
+        let replayed = wal.replay(flushed + 1, |lsn, payload| {
+            inner.replay_record(lsn, payload)
+        })?;
+        let expected = recovery.last_lsn.saturating_sub(flushed);
+        if replayed != expected {
+            return Err(Error::corrupt(format!(
+                "replayed {replayed} log records, expected {expected}"
+            )));
+        }
+        *inner.wal.write().unwrap_or_else(|e| e.into_inner()) = Some(wal);
+
+        // 7. Accept requests.
+        if let Err(e) = inner.spawn_threads() {
+            let _ = inner.shutdown_inner(false);
+            return Err(e);
+        }
+        Ok(Engine {
+            handle: Arc::new(Handle { inner }),
+        })
+    }
+
+    fn inner(&self) -> &Arc<Inner> {
+        &self.handle.inner
+    }
+
+    /// Logs a request, makes it visible once it is durable, and then calls
+    /// `on_durable`.
+    ///
+    /// `record` is the request in the door's own wire format and `tag` names
+    /// that format; the engine logs `[tag] + record`. `batches` are the same
+    /// request already decoded, and must decode from `record` identically, as
+    /// they are what replay will rebuild after a crash.
+    ///
+    /// Returns an error at once, without calling `on_durable` and without
+    /// changing anything, when: `tag` has no registered decoder or a batch
+    /// does not have the span schema ([`Error::InvalidArgument`]); the buffer
+    /// or the log has too much waiting ([`Error::Unavailable`], retry later);
+    /// the engine is shut down ([`Error::Unavailable`]); or it is in the
+    /// fatal state ([`Error::Fatal`]).
+    ///
+    /// Otherwise `on_durable` is called exactly once, on an engine thread: with
+    /// `Ok` when the record is durable and its batches are visible to
+    /// queries, or with the error that stopped it ([`Error::Fatal`] when the
+    /// log or the engine failed; the record may still be recovered after a
+    /// restart). The callback must not block for long: it delays every
+    /// acknowledgement behind it.
+    pub fn ingest(
+        &self,
+        tag: u8,
+        mut record: Vec<u8>,
+        batches: Vec<RecordBatch>,
+        on_durable: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> Result<()> {
+        let inner = self.inner();
+        if !inner.decoders.contains_key(&tag) {
+            return Err(Error::invalid_argument(format!(
+                "no decoder is registered for tag {tag}"
+            )));
+        }
+        if record.len() >= MAX_RECORD_BYTES {
+            return Err(Error::invalid_argument(format!(
+                "record of {} bytes is too large",
+                record.len()
+            )));
+        }
+        let mut bytes = 0;
+        for b in &batches {
+            SpanColumns::try_new(b)?;
+            bytes += b.get_array_memory_size();
+        }
+
+        let wal_guard = inner.wal.read().unwrap_or_else(|e| e.into_inner());
+        let Some(wal) = wal_guard.as_ref() else {
+            return Err(Error::unavailable("the engine is shut down"));
+        };
+        let wal_pending = wal.stats().pending_bytes;
+        {
+            let mut c = lock(&inner.core);
+            if let Some(f) = &c.fatal {
+                return Err(Error::fatal(f.clone()));
+            }
+            if c.closing {
+                return Err(Error::unavailable("the engine is shutting down"));
+            }
+            let used = c.active_bytes + c.frozen_bytes + c.inflight_bytes;
+            if used > 0 && used + bytes > inner.opts.max_buffered_bytes {
+                return Err(Error::unavailable(format!(
+                    "{used} bytes are buffered, the limit is {}",
+                    inner.opts.max_buffered_bytes
+                )));
+            }
+            if wal_pending > inner.opts.max_wal_pending_bytes {
+                return Err(Error::unavailable(format!(
+                    "{wal_pending} bytes wait in the log, the limit is {}",
+                    inner.opts.max_wal_pending_bytes
+                )));
+            }
+            c.inflight_bytes += bytes;
+            c.outstanding += 1;
+            c.records += 1;
+            c.bytes += record.len() as u64;
+        }
+
+        record.insert(0, tag);
+        let queue = inner.queue.clone();
+        let done: Box<dyn FnOnce(Result<()>) + Send> = Box::new(on_durable);
+        // The log's callback does almost nothing: it hands the result to the
+        // applier. It never calls back into the log and never blocks beyond
+        // this queue's short lock.
+        wal.append_owned(record, move |result| {
+            lock(&queue.state).items.push_back(Pending {
+                result,
+                batches,
+                bytes,
+                done,
+            });
+            queue.cv.notify_one();
+        });
+        Ok(())
+    }
+
+    /// Writes everything acknowledged so far into parts, publishes them in
+    /// one manifest commit and trims the log, then returns.
+    ///
+    /// [`Error::Fatal`] if the engine is in the fatal state or this flush
+    /// leaves it there. Any other error leaves the data in the buffer, where
+    /// it stays visible, and a later flush tries again with new part ids.
+    pub fn flush(&self) -> Result<()> {
+        {
+            let c = lock(&self.inner().core);
+            if let Some(f) = &c.fatal {
+                return Err(Error::fatal(f.clone()));
+            }
+            if c.closing {
+                return Err(Error::unavailable("the engine is shut down"));
+            }
+        }
+        self.inner().do_flush(true)
+    }
+
+    /// A consistent view of the data: the live parts, the buffer being
+    /// flushed if there is one, and the batches in the active buffer at this
+    /// instant. Queries on it see exactly that state however long they run.
+    pub fn snapshot(&self) -> Snapshot {
+        self.inner().snapshot()
+    }
+
+    /// [`Snapshot::get_trace`] on a fresh snapshot.
+    pub fn get_trace(&self, trace_id: TraceId) -> Result<Option<Vec<RecordBatch>>> {
+        self.snapshot().get_trace(trace_id)
+    }
+
+    /// [`Snapshot::list_traces`] on a fresh snapshot.
+    pub fn list_traces(&self, query: &ListQuery) -> Result<Vec<TraceSummary>> {
+        self.snapshot().list_traces(query)
+    }
+
+    /// [`Snapshot::aggregate_tokens`] on a fresh snapshot.
+    pub fn aggregate_tokens(&self, query: &AggQuery) -> Result<Vec<TokenAgg>> {
+        self.snapshot().aggregate_tokens(query)
+    }
+
+    /// Counters and positions.
+    pub fn stats(&self) -> EngineStats {
+        let c = lock(&self.inner().core);
+        EngineStats {
+            records_ingested: c.records,
+            bytes_ingested: c.bytes,
+            acked_lsn: c.applied_lsn,
+            flushed_lsn: c.flushed_lsn,
+            buffered_bytes: c.active_bytes + c.frozen_bytes,
+            parts: c.vis.parts.len(),
+            flushes: c.flushes,
+            flushing: c.flushing,
+            last_error: c.last_error.clone(),
+        }
+    }
+
+    /// Stops accepting requests, waits for every accepted request to be
+    /// acknowledged, flushes, shuts the log down and releases the directory
+    /// lock. Queries on existing snapshots keep working.
+    ///
+    /// Returns the first error met; the log is shut down and the lock
+    /// released regardless. Calling it from a callback of this engine is an
+    /// [`Error::InvalidArgument`], as it would wait for itself.
+    pub fn shutdown(&self) -> Result<()> {
+        if self.inner().on_engine_thread() {
+            return Err(Error::invalid_argument(
+                "shutdown cannot be called from an engine callback",
+            ));
+        }
+        self.inner().shutdown_inner(true)
+    }
+}
+
+impl Inner {
+    fn on_engine_thread(&self) -> bool {
+        let me = std::thread::current().id();
+        let t = lock(&self.threads);
+        [&t.applier, &t.flusher]
+            .into_iter()
+            .flatten()
+            .any(|(id, _)| *id == me)
+    }
+
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        let c = lock(&self.core);
+        Snapshot::new(c.vis.clone(), self.opts.batch_limits)
+    }
+
+    fn set_fatal_locked(&self, c: &mut Core, msg: String) {
+        c.last_error = Some(msg.clone());
+        c.fatal.get_or_insert(msg);
+        self.flusher_cv.notify_all();
+    }
+
+    /// Adds batches to the active buffer. `lsn` is the log position of the
+    /// record they came from.
+    fn push_active(&self, c: &mut Core, batches: Vec<RecordBatch>, bytes: usize, lsn: Lsn) {
+        let batches: Vec<Arc<RecordBatch>> = batches
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .map(Arc::new)
+            .collect();
+        if !batches.is_empty() {
+            if c.vis.active.is_empty() {
+                c.active_oldest = Some(Instant::now());
+                // The flusher sleeps without a deadline while the buffer is
+                // empty; this starts the age clock.
+                self.flusher_cv.notify_all();
+            }
+            // Copies the list only if a snapshot still holds the old one.
+            Arc::make_mut(&mut c.vis.active).extend(batches);
+            c.active_bytes += bytes;
+        }
+        c.applied_lsn = lsn;
+        if c.active_bytes >= self.opts.buffer_bytes {
+            self.flusher_cv.notify_all();
+        }
+    }
+
+    /// Start-up: decodes one log record into the buffer, flushing when the
+    /// buffer is full.
+    fn replay_record(&self, lsn: Lsn, payload: &[u8]) -> Result<()> {
+        let Some((&tag, body)) = payload.split_first() else {
+            return Err(Error::corrupt(format!("log record {lsn} is empty")));
+        };
+        let decoder = self.decoders.get(&tag).ok_or_else(|| {
+            Error::corrupt(format!("log record {lsn} has unknown format tag {tag}"))
+        })?;
+        let batches = decoder.decode(body).map_err(|e| match e {
+            Error::Corrupt(m) => Error::corrupt(format!("log record {lsn}: {m}")),
+            other => Error::corrupt(format!("log record {lsn} does not decode: {other}")),
+        })?;
+        let mut bytes = 0;
+        for b in &batches {
+            SpanColumns::try_new(b).map_err(|e| {
+                Error::corrupt(format!("log record {lsn} decodes to a wrong table: {e}"))
+            })?;
+            bytes += b.get_array_memory_size();
+        }
+        let full = {
+            let mut c = lock(&self.core);
+            if lsn != c.applied_lsn + 1 {
+                return Err(Error::corrupt(format!(
+                    "log record {lsn} follows {}",
+                    c.applied_lsn
+                )));
+            }
+            self.push_active(&mut c, batches, bytes, lsn);
+            c.active_bytes >= self.opts.buffer_bytes
+        };
+        if full {
+            // The log is not trimmed here: it is being read.
+            self.do_flush(false)?;
+        }
+        Ok(())
+    }
+
+    fn spawn_threads(self: &Arc<Self>) -> Result<()> {
+        let spawn = |name: &str, f: fn(Arc<Inner>)| -> Result<(ThreadId, JoinHandle<()>)> {
+            let inner = self.clone();
+            let handle = std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || f(inner))?;
+            Ok((handle.thread().id(), handle))
+        };
+        let applier = spawn("nwdb-applier", Inner::applier_loop)?;
+        lock(&self.threads).applier = Some(applier);
+        let flusher = spawn("nwdb-flusher", Inner::flusher_loop)?;
+        lock(&self.threads).flusher = Some(flusher);
+        Ok(())
+    }
+
+    /// Takes results from the log's thread in log order, puts durable
+    /// requests into the buffer and acknowledges them.
+    fn applier_loop(self: Arc<Self>) {
+        loop {
+            let pending = {
+                let mut q = lock(&self.queue.state);
+                loop {
+                    if let Some(p) = q.items.pop_front() {
+                        break Some(p);
+                    }
+                    if q.closed {
+                        break None;
+                    }
+                    q = self.queue.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let Some(p) = pending else { return };
+            self.apply(p);
+        }
+    }
+
+    fn apply(&self, p: Pending) {
+        let Pending {
+            result,
+            batches,
+            bytes,
+            done,
+        } = p;
+        let outcome = {
+            let mut c = lock(&self.core);
+            c.inflight_bytes = c.inflight_bytes.saturating_sub(bytes);
+            match result {
+                Ok(lsn) => {
+                    if let Some(f) = &c.fatal {
+                        // Durable in the log, so a restart recovers it, but
+                        // not visible on this handle: its outcome is unknown.
+                        Err(Error::fatal(f.clone()))
+                    } else if lsn != c.applied_lsn + 1 {
+                        let msg =
+                            format!("the log numbered a record {lsn} after {}", c.applied_lsn);
+                        self.set_fatal_locked(&mut c, msg.clone());
+                        Err(Error::fatal(msg))
+                    } else {
+                        self.push_active(&mut c, batches, bytes, lsn);
+                        Ok(())
+                    }
+                }
+                Err(e) => {
+                    if matches!(e, Error::Fatal(_)) {
+                        self.set_fatal_locked(&mut c, e.to_string());
+                    }
+                    Err(e)
+                }
+            }
+        };
+        // The callback runs after the data is visible, outside every lock.
+        let _ = catch_unwind(AssertUnwindSafe(|| done(outcome)));
+        let mut c = lock(&self.core);
+        c.outstanding -= 1;
+        if c.outstanding == 0 {
+            self.idle_cv.notify_all();
+        }
+    }
+
+    /// Flushes when the buffer is full or old.
+    fn flusher_loop(self: Arc<Self>) {
+        loop {
+            {
+                let mut c = lock(&self.core);
+                loop {
+                    if c.stop_flusher {
+                        return;
+                    }
+                    let now = Instant::now();
+                    let mut wake: Option<Instant> = None;
+                    if c.fatal.is_none() && !c.vis.active.is_empty() {
+                        let due = c
+                            .active_oldest
+                            .map_or(now, |t| t + self.opts.flush_interval);
+                        let size_due = c.active_bytes >= self.opts.buffer_bytes;
+                        // After a failed flush the next try waits out the
+                        // retry delay, however full or old the buffer is.
+                        let at = if size_due { now } else { due }.max(c.retry_after.unwrap_or(now));
+                        if at <= now {
+                            break;
+                        }
+                        wake = Some(at);
+                    }
+                    c = match wake {
+                        Some(t) => {
+                            self.flusher_cv
+                                .wait_timeout(c, t.saturating_duration_since(now))
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0
+                        }
+                        None => self.flusher_cv.wait(c).unwrap_or_else(|e| e.into_inner()),
+                    };
+                }
+            }
+            let outcome = self.do_flush(true);
+            let mut c = lock(&self.core);
+            c.retry_after = outcome.is_err().then(|| Instant::now() + RETRY_DELAY);
+        }
+    }
+
+    pub(crate) fn shutdown_inner(&self, flush: bool) -> Result<()> {
+        if self.shut_down.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        // No new request is accepted from here on, so `outstanding` can only
+        // fall.
+        {
+            let mut c = lock(&self.core);
+            c.closing = true;
+            while c.outstanding > 0 {
+                c = self.idle_cv.wait(c).unwrap_or_else(|e| e.into_inner());
+            }
+            c.stop_flusher = true;
+            self.flusher_cv.notify_all();
+        }
+        let Threads { applier, flusher } = std::mem::take(&mut *lock(&self.threads));
+        if let Some((_, flusher)) = flusher {
+            let _ = flusher.join();
+        }
+
+        let mut first_error = None;
+        let fatal = lock(&self.core).fatal.clone();
+        if let Some(f) = fatal {
+            first_error = Some(Error::fatal(f));
+        } else if flush && let Err(e) = self.do_flush(true) {
+            first_error = Some(e);
+        }
+
+        let wal = self.wal.write().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(wal) = wal
+            && let Err(e) = wal.shutdown()
+        {
+            first_error.get_or_insert(e);
+        }
+        lock(&self.queue.state).closed = true;
+        self.queue.cv.notify_all();
+        if let Some((_, applier)) = applier {
+            let _ = applier.join();
+        }
+        // Dropping the file releases the directory lock.
+        drop(lock(&self.lock_file).take());
+        first_error.map_or(Ok(()), Err)
+    }
+}

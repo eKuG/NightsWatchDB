@@ -503,6 +503,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nwdb-engine"
+version = "0.0.1"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "nwdb-core",
+ "nwdb-manifest",
+ "nwdb-segment",
+ "nwdb-wal",
+ "rand",
+ "tempfile",
+]
+
+[[package]]
 name = "nwdb-manifest"
 version = "0.0.1"
 dependencies = [
