@@ -508,21 +508,20 @@ fn targeted_malformed_inputs_are_corrupt() {
 }
 
 #[test]
-fn ids_of_the_wrong_length_are_corrupt() {
-    let span = |trace: &[u8], span: &[u8], parent: &[u8]| {
-        wrap_span(&concat(&[&ld(1, trace), &ld(2, span), &ld(4, parent)]))
+fn a_parent_id_of_the_wrong_length_is_corrupt() {
+    let span = |parent: &[u8]| {
+        wrap_span(&concat(&[
+            &ld(1, &[1; 16]),
+            &ld(2, &[2; 8]),
+            &ld(4, parent),
+        ]))
     };
-    let m = corrupt(&span(&[1; 17], &[2; 8], b""));
+    let m = corrupt(&span(&[1; 9]));
     assert!(
-        m.contains("resource_spans.scope_spans.spans.trace_id"),
+        m.contains("resource_spans.scope_spans.spans.parent_span_id"),
         "{m}"
     );
-    assert!(corrupt(&span(&[1; 15], &[2; 8], b"")).contains("trace_id"));
-    assert!(corrupt(&span(&[1; 16], &[2; 7], b"")).contains("span_id"));
-    assert!(corrupt(&span(&[1; 16], &[2; 8], &[1; 9])).contains("parent_span_id"));
-    // Absent ids have length zero.
-    assert!(corrupt(&wrap_span(&ld(2, &[2; 8]))).contains("trace_id"));
-    assert!(corrupt(&wrap_span(&ld(1, &[1; 16]))).contains("span_id"));
+    assert!(corrupt(&span(&[1; 7])).contains("parent_span_id"));
 }
 
 #[test]

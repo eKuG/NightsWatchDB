@@ -4,14 +4,16 @@
 //! `ExportTraceServiceRequest` exactly as an OTLP sender produces them. It
 //! walks the wire format itself and has no protobuf dependency: strings are
 //! checked and copied once from the request into the Arrow builders, and the
-//! raw columns keep the original message bytes. [`encode_spans`] goes the
-//! other way for the query API.
+//! raw columns keep the original message bytes. The resource and scope values
+//! that all spans of a message share are not copied per span: the span table
+//! stores them in dictionary columns, once per batch. [`encode_spans`] goes
+//! the other way for the query API.
 //!
 //! # Column mapping
 //!
 //! | Column | Source |
 //! |---|---|
-//! | `trace_id`, `span_id` | `Span.trace_id`, `Span.span_id`; must be 16 and 8 bytes |
+//! | `trace_id`, `span_id` | `Span.trace_id`, `Span.span_id`; 16 and 8 bytes, not all zero, or the span is rejected |
 //! | `parent_span_id` | `Span.parent_span_id`; null when empty or all zero (a root) |
 //! | `name`, `kind`, `start_ns`, `end_ns`, `flags` | the span fields of the same name |
 //! | `status_code`, `status_message` | `Span.status.code`, `Span.status.message` (empty is null) |
@@ -51,10 +53,23 @@
 //! a field that should occur once, the last occurrence wins; a repeated
 //! message-typed field (`resource`, `scope`, `status`) is replaced, not merged.
 //! Groups, truncated input, lengths past the end of the enclosing message,
-//! varints over 10 bytes, a wrong wire type on a known field, ids of the wrong
-//! length and invalid UTF-8 in a field that is read are all
+//! varints over 10 bytes, a wrong wire type on a known field, a parent span id
+//! of the wrong length and invalid UTF-8 in a field that is read are all
 //! [`nwdb_core::Error::Corrupt`] with the field path in the message. Nothing
 //! on this path panics or allocates from an unchecked length.
+//!
+//! A `KeyValue` whose `value` occurs twice takes the last occurrence, where
+//! protobuf would merge the two; no real sender encodes that.
+//!
+//! # Spans that are not stored
+//!
+//! A span whose trace id is not 16 bytes or is all zero, or whose span id is
+//! not 8 bytes or is all zero, is skipped and counted in
+//! [`DecodeStats::rejected_spans`]; so is every span of a message whose
+//! resource, scope or schema URL is over the limit set with
+//! [`TraceDecoder::with_max_origin_bytes`] (64 KiB by default). The rest of
+//! the request is decoded, and [`TraceDecoder::decode`] skips the same spans,
+//! so replaying the log gives the same rows.
 
 mod decode;
 mod encode;
@@ -64,7 +79,7 @@ mod stream;
 mod walk;
 mod wire;
 
-pub use decode::{DecodeStats, RECORD_TAG_OTLP_TRACES, TraceDecoder};
+pub use decode::{DEFAULT_MAX_ORIGIN_BYTES, DecodeStats, RECORD_TAG_OTLP_TRACES, TraceDecoder};
 pub use encode::encode_spans;
 pub use json::{
     MAX_DEPTH, attrs_to_json, events_to_json, links_to_json, resource_to_json, scope_to_json,

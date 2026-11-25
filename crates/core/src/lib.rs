@@ -10,8 +10,9 @@
 //! - Pure arithmetic and constants shared by writers and readers: time
 //!   windows ([`window_start`]) and buffer limits ([`BatchLimits`]).
 //! - The definition of the span table ([`span_schema`], [`SpanRecord`]), the
-//!   way to build a batch of it ([`SpanBatchBuilder`]) and the way to read one
-//!   back ([`SpanColumns`]).
+//!   way to build a batch of it ([`SpanBatchBuilder`], which stores each
+//!   distinct origin value once per batch: [`Origin`], [`OriginKeys`]) and the
+//!   way to read one back ([`SpanColumns`]).
 //! - The per-trace summary ([`TraceSummary`], [`SummaryBuilder`],
 //!   [`summary_schema`]) and its batch form ([`SummaryBatchBuilder`],
 //!   [`SummaryColumns`]).
@@ -37,6 +38,7 @@ mod error;
 mod hex;
 mod id;
 mod limits;
+mod origin;
 mod part;
 mod record;
 mod schema;
@@ -50,6 +52,7 @@ pub use decoder::RecordDecoder;
 pub use error::{Error, Result};
 pub use id::{SpanId, TraceId};
 pub use limits::BatchLimits;
+pub use origin::{Origin, OriginKeys};
 pub use part::{PartMeta, part_dir_name};
 pub use record::SpanRecord;
 pub use schema::{col, span_schema};

@@ -39,7 +39,40 @@ Parquet settings:
 | Write batch | 256 values | the Parquet writer checks page limits between batches of this many values |
 
 Value bytes are the lengths of all string and binary values of a row, the
-measure `nwdb_core::BatchLimits` uses.
+measure `nwdb_core::BatchLimits` uses. The seven origin columns (`resource`,
+`service_name`, `resource_schema_url`, `scope`, `scope_name`, `scope_version`,
+`scope_schema_url`) are Arrow dictionary columns, `Dictionary(Int32, Utf8)` or
+`Dictionary(Int32, LargeBinary)`. For the row group bound a row counts its
+4-byte key in each of them, and the values of a batch's dictionaries are
+counted once, on the first row of the batch.
+
+### Dictionary columns in Parquet
+
+What the Parquet library (60.2.0) does with them. `tests/dictionaries.rs`
+pins that parts written from batches with different dictionaries read back to
+the same values and exactly the span schema; the rest was read from the
+library and measured:
+
+- Writing: `ArrowWriter` takes the dictionary arrays as they are and embeds
+  the Arrow schema in the file. Two batches of one part may number the same
+  value differently, or hold values the other lacks; each is written by value,
+  so the file does not depend on the numbering. Within one dictionary array
+  each distinct value is hashed once, not once per row (this holds when the
+  array has at most as many values as the rows written together, and for every
+  later write of the same array); a batch of rows sliced off a larger
+  dictionary still hashes per row when the slice is shorter than the
+  dictionary.
+- Reading: because the Arrow schema is embedded, the reader gives back
+  `Dictionary(Int32, Utf8)` and `Dictionary(Int32, LargeBinary)` columns, and
+  every batch has exactly `span_schema()` (or the projection of it), so no
+  conversion is done. Keys are numbered per batch and mean nothing outside it;
+  use `SpanColumns`, which resolves them.
+- The dictionary of a batch read from a file holds the values of the page
+  being decoded (up to 4,096 rows), not only the values of the rows returned.
+  Reading one row therefore returns a batch whose dictionary can be as large as
+  the dictionary of a page: at most about 1 MiB per column, because the
+  writer's dictionary page limit is 1 MiB and a column that outgrows it
+  continues without a dictionary.
 
 The writer hands rows to Parquet in pieces that end exactly where a row group
 ends, and closes the group itself. What the Parquet writer buffers is therefore

@@ -1,13 +1,54 @@
-use crate::{Error, Result, SpanId, SpanRecord, TraceId, span_schema};
+use crate::origin::{ORIGIN_COLUMNS, slot};
+use crate::{Error, Origin, Result, SpanId, SpanRecord, TraceId, span_schema};
+use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray, RecordBatch,
-    StringArray, UInt32Array,
+    Array, DictionaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray,
+    RecordBatch, StringArray, UInt32Array,
 };
+
+/// A dictionary column: the keys of the rows and the array they point into.
+/// [`SpanColumns::try_new`] has checked that every key is inside `values`.
+struct Dict<'a, V> {
+    keys: &'a Int32Array,
+    values: &'a V,
+}
+
+// Derives would require `V: Clone`; the fields are references.
+impl<V> Clone for Dict<'_, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<V> Copy for Dict<'_, V> {}
+
+impl<'a> Dict<'a, StringArray> {
+    fn get(&self, row: usize) -> Option<&'a str> {
+        let k = self.key(row)?;
+        self.values.is_valid(k).then(|| self.values.value(k))
+    }
+}
+
+impl<'a> Dict<'a, LargeBinaryArray> {
+    fn get(&self, row: usize) -> Option<&'a [u8]> {
+        let k = self.key(row)?;
+        self.values.is_valid(k).then(|| self.values.value(k))
+    }
+}
+
+impl<V> Dict<'_, V> {
+    fn key(&self, row: usize) -> Option<usize> {
+        self.keys
+            .is_valid(row)
+            .then(|| self.keys.value(row) as usize)
+    }
+}
 
 /// Typed, checked access to the columns of a batch with the span schema.
 ///
 /// [`try_new`](Self::try_new) verifies the batch once, so reading a row
-/// afterwards cannot fail.
+/// afterwards cannot fail. The origin columns are dictionary columns; a row
+/// read from them is resolved through the batch's own dictionary.
 #[derive(Clone, Copy)]
 pub struct SpanColumns<'a> {
     batch: &'a RecordBatch,
@@ -22,11 +63,11 @@ pub struct SpanColumns<'a> {
     status_message: &'a StringArray,
     trace_state: &'a StringArray,
     flags: &'a UInt32Array,
-    service_name: &'a StringArray,
-    scope_name: &'a StringArray,
-    scope_version: &'a StringArray,
-    resource_schema_url: &'a StringArray,
-    scope_schema_url: &'a StringArray,
+    service_name: Dict<'a, StringArray>,
+    scope_name: Dict<'a, StringArray>,
+    scope_version: Dict<'a, StringArray>,
+    resource_schema_url: Dict<'a, StringArray>,
+    scope_schema_url: Dict<'a, StringArray>,
     operation: &'a StringArray,
     provider: &'a StringArray,
     request_model: &'a StringArray,
@@ -39,8 +80,8 @@ pub struct SpanColumns<'a> {
     agent_name: &'a StringArray,
     tool_name: &'a StringArray,
     error_type: &'a StringArray,
-    resource: &'a LargeBinaryArray,
-    scope: &'a LargeBinaryArray,
+    resource: Dict<'a, LargeBinaryArray>,
+    scope: Dict<'a, LargeBinaryArray>,
     attrs: &'a LargeBinaryArray,
     events: &'a LargeBinaryArray,
     links: &'a LargeBinaryArray,
@@ -113,6 +154,26 @@ impl<'a> SpanColumns<'a> {
                 .and_then(|c| c.as_any().downcast_ref::<T>())
                 .ok_or_else(|| Error::invalid_argument(format!("span batch column `{name}`")))
         }
+        // The array types were verified above. A key outside its dictionary
+        // would panic when a row is read, so it is refused here.
+        fn dict<'b, V: 'static + Array>(batch: &'b RecordBatch, name: &str) -> Result<Dict<'b, V>> {
+            let array: &DictionaryArray<Int32Type> = get(batch, name)?;
+            let values =
+                array.values().as_any().downcast_ref::<V>().ok_or_else(|| {
+                    Error::invalid_argument(format!("span batch column `{name}`"))
+                })?;
+            let keys = array.keys();
+            let inside = keys
+                .iter()
+                .flatten()
+                .all(|k| usize::try_from(k).is_ok_and(|k| k < values.len()));
+            if !inside {
+                return Err(Error::invalid_argument(format!(
+                    "span batch column `{name}` has a dictionary key outside its dictionary"
+                )));
+            }
+            Ok(Dict { keys, values })
+        }
         use crate::col;
         Ok(Self {
             batch,
@@ -127,11 +188,11 @@ impl<'a> SpanColumns<'a> {
             status_message: get(batch, col::STATUS_MESSAGE)?,
             trace_state: get(batch, col::TRACE_STATE)?,
             flags: get(batch, col::FLAGS)?,
-            service_name: get(batch, col::SERVICE_NAME)?,
-            scope_name: get(batch, col::SCOPE_NAME)?,
-            scope_version: get(batch, col::SCOPE_VERSION)?,
-            resource_schema_url: get(batch, col::RESOURCE_SCHEMA_URL)?,
-            scope_schema_url: get(batch, col::SCOPE_SCHEMA_URL)?,
+            service_name: dict(batch, col::SERVICE_NAME)?,
+            scope_name: dict(batch, col::SCOPE_NAME)?,
+            scope_version: dict(batch, col::SCOPE_VERSION)?,
+            resource_schema_url: dict(batch, col::RESOURCE_SCHEMA_URL)?,
+            scope_schema_url: dict(batch, col::SCOPE_SCHEMA_URL)?,
             operation: get(batch, col::OPERATION)?,
             provider: get(batch, col::PROVIDER)?,
             request_model: get(batch, col::REQUEST_MODEL)?,
@@ -144,8 +205,8 @@ impl<'a> SpanColumns<'a> {
             agent_name: get(batch, col::AGENT_NAME)?,
             tool_name: get(batch, col::TOOL_NAME)?,
             error_type: get(batch, col::ERROR_TYPE)?,
-            resource: get(batch, col::RESOURCE)?,
-            scope: get(batch, col::SCOPE)?,
+            resource: dict(batch, col::RESOURCE)?,
+            scope: dict(batch, col::SCOPE)?,
             attrs: get(batch, col::ATTRS)?,
             events: get(batch, col::EVENTS)?,
             links: get(batch, col::LINKS)?,
@@ -170,6 +231,45 @@ impl<'a> SpanColumns<'a> {
         self.len() == 0
     }
 
+    /// The dictionary key of each origin column at `row`, in [`Origin`]
+    /// field order, `None` for a null. Keys of different batches are not
+    /// comparable, and a batch that did not come from
+    /// [`SpanBatchBuilder`](crate::SpanBatchBuilder) may hold one value under
+    /// several keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= self.len()`.
+    pub fn origin_keys(&self, row: usize) -> [Option<u32>; ORIGIN_COLUMNS] {
+        let mut out = [None; ORIGIN_COLUMNS];
+        let mut put = |i: usize, key: Option<usize>| out[i] = key.map(|k| k as u32);
+        put(slot::RESOURCE, self.resource.key(row));
+        put(slot::SERVICE_NAME, self.service_name.key(row));
+        put(slot::RESOURCE_SCHEMA_URL, self.resource_schema_url.key(row));
+        put(slot::SCOPE, self.scope.key(row));
+        put(slot::SCOPE_NAME, self.scope_name.key(row));
+        put(slot::SCOPE_VERSION, self.scope_version.key(row));
+        put(slot::SCOPE_SCHEMA_URL, self.scope_schema_url.key(row));
+        out
+    }
+
+    /// The origin values of one row, borrowed from the batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= self.len()`.
+    pub fn origin(&self, row: usize) -> Origin<'a> {
+        Origin {
+            resource: self.resource.get(row),
+            service_name: self.service_name.get(row),
+            resource_schema_url: self.resource_schema_url.get(row),
+            scope: self.scope.get(row),
+            scope_name: self.scope_name.get(row),
+            scope_version: self.scope_version.get(row),
+            scope_schema_url: self.scope_schema_url.get(row),
+        }
+    }
+
     /// Reads one row, borrowing its values from the batch.
     ///
     /// # Panics
@@ -192,11 +292,11 @@ impl<'a> SpanColumns<'a> {
             status_message: string(self.status_message, row),
             trace_state: string(self.trace_state, row),
             flags: self.flags.value(row),
-            service_name: string(self.service_name, row),
-            scope_name: string(self.scope_name, row),
-            scope_version: string(self.scope_version, row),
-            resource_schema_url: string(self.resource_schema_url, row),
-            scope_schema_url: string(self.scope_schema_url, row),
+            service_name: self.service_name.get(row),
+            scope_name: self.scope_name.get(row),
+            scope_version: self.scope_version.get(row),
+            resource_schema_url: self.resource_schema_url.get(row),
+            scope_schema_url: self.scope_schema_url.get(row),
             operation: string(self.operation, row),
             provider: string(self.provider, row),
             request_model: string(self.request_model, row),
@@ -209,8 +309,8 @@ impl<'a> SpanColumns<'a> {
             agent_name: string(self.agent_name, row),
             tool_name: string(self.tool_name, row),
             error_type: string(self.error_type, row),
-            resource: bytes(self.resource, row),
-            scope: bytes(self.scope, row),
+            resource: self.resource.get(row),
+            scope: self.scope.get(row),
             attrs: self.attrs.value(row),
             events: bytes(self.events, row),
             links: bytes(self.links, row),

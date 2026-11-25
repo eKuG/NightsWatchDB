@@ -4,8 +4,13 @@ use crate::{SpanId, TraceId};
 ///
 /// Field names and meanings match the columns of the span table; see the
 /// `schema` module for the encoding of `resource`, `scope`, `attrs`,
-/// `events` and `links`. The default is an all-zero, empty span, which is only useful as a
-/// base for struct update syntax.
+/// `events` and `links`. The default is an all-zero, empty span, which is only
+/// useful as a base for struct update syntax.
+///
+/// The table stores the seven origin fields (`resource`, `service_name`,
+/// `resource_schema_url`, `scope`, `scope_name`, `scope_version`,
+/// `scope_schema_url`) once per distinct value, not once per row; a record
+/// read from a batch has them resolved to plain slices.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SpanRecord<'a> {
     /// `trace_id` column.

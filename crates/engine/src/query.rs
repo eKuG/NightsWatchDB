@@ -182,7 +182,9 @@ impl Snapshot {
         let mut out = Vec::new();
         let mut builder = SpanBatchBuilder::new(self.limits);
         for r in &rows {
-            builder.append(&cols[r.source as usize].record(r.row as usize));
+            // `source` numbers the batch for the builder, so each distinct
+            // origin of a batch is hashed once per output batch.
+            builder.append_from(&cols[r.source as usize], r.source as usize, r.row as usize);
             if builder.is_full() {
                 out.push(builder.finish());
             }

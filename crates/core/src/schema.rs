@@ -6,15 +6,29 @@
 //!    `kind`, `start_ns`, `end_ns`, `status_code`, `status_message`,
 //!    `trace_state`, `flags`.
 //! 2. Where it came from: `service_name`, `scope_name`, `scope_version`,
-//!    `resource_schema_url`, `scope_schema_url`.
+//!    `resource_schema_url`, `scope_schema_url`, and the raw `resource` and
+//!    `scope` of group 4. These seven are dictionary columns, see below.
 //! 3. Promoted fields (all nullable): `operation`, `provider`,
 //!    `request_model`, `response_model`, `input_tokens`, `output_tokens`,
 //!    `conversation_id`, `session_id`, `user_id`, `agent_name`, `tool_name`,
 //!    `error_type`.
 //! 4. The raw, lossless parts (`LargeBinary`): `resource`, `scope`, `attrs`,
-//!    `events`, `links`.
+//!    `events`, `links`. `resource` and `scope` are dictionary columns.
 //! 5. `dropped_attributes_count`, `dropped_events_count`,
 //!    `dropped_links_count`.
+//!
+//! # Origin columns
+//!
+//! `resource`, `service_name`, `resource_schema_url`, `scope`, `scope_name`,
+//! `scope_version` and `scope_schema_url` describe where a span came from and
+//! are the same for every span of a `ResourceSpans` or `ScopeSpans`. They are
+//! `Dictionary(Int32, <value type>)` columns: each distinct value is stored
+//! once per batch and each row holds a 4-byte key. Without this, one large
+//! resource shared by many small spans would be copied into every row and a
+//! small request could decode to gigabytes. Nulls are null keys. Two batches
+//! (or two row groups of a part) may number the same value differently, so a
+//! key means something only together with the dictionary of its own array;
+//! [`SpanColumns`](crate::SpanColumns) resolves it and hands out plain slices.
 //!
 //! # Promoted columns
 //!
@@ -117,6 +131,7 @@ pub fn span_schema() -> SchemaRef {
 fn build() -> SchemaRef {
     use DataType::*;
     let f = |name: &str, ty: DataType, nullable: bool| Field::new(name, ty, nullable);
+    let dict = |value: DataType| Dictionary(Box::new(Int32), Box::new(value));
     Arc::new(Schema::new(vec![
         f(col::TRACE_ID, FixedSizeBinary(16), false),
         f(col::SPAN_ID, FixedSizeBinary(8), false),
@@ -129,11 +144,11 @@ fn build() -> SchemaRef {
         f(col::STATUS_MESSAGE, Utf8, true),
         f(col::TRACE_STATE, Utf8, true),
         f(col::FLAGS, UInt32, false),
-        f(col::SERVICE_NAME, Utf8, true),
-        f(col::SCOPE_NAME, Utf8, true),
-        f(col::SCOPE_VERSION, Utf8, true),
-        f(col::RESOURCE_SCHEMA_URL, Utf8, true),
-        f(col::SCOPE_SCHEMA_URL, Utf8, true),
+        f(col::SERVICE_NAME, dict(Utf8), true),
+        f(col::SCOPE_NAME, dict(Utf8), true),
+        f(col::SCOPE_VERSION, dict(Utf8), true),
+        f(col::RESOURCE_SCHEMA_URL, dict(Utf8), true),
+        f(col::SCOPE_SCHEMA_URL, dict(Utf8), true),
         f(col::OPERATION, Utf8, true),
         f(col::PROVIDER, Utf8, true),
         f(col::REQUEST_MODEL, Utf8, true),
@@ -146,8 +161,8 @@ fn build() -> SchemaRef {
         f(col::AGENT_NAME, Utf8, true),
         f(col::TOOL_NAME, Utf8, true),
         f(col::ERROR_TYPE, Utf8, true),
-        f(col::RESOURCE, LargeBinary, true),
-        f(col::SCOPE, LargeBinary, true),
+        f(col::RESOURCE, dict(LargeBinary), true),
+        f(col::SCOPE, dict(LargeBinary), true),
         f(col::ATTRS, LargeBinary, false),
         f(col::EVENTS, LargeBinary, true),
         f(col::LINKS, LargeBinary, true),
@@ -162,7 +177,7 @@ mod tests {
     use super::*;
 
     /// Pins name, type and nullability of every column, in order. If this
-    /// fails the on-disk format changed; that needs a format version bump.
+    /// fails the on-disk format changed.
     #[test]
     fn golden_span_schema() {
         let got: Vec<String> = span_schema()
@@ -189,11 +204,11 @@ mod tests {
             "status_message:Utf8:null",
             "trace_state:Utf8:null",
             "flags:UInt32:required",
-            "service_name:Utf8:null",
-            "scope_name:Utf8:null",
-            "scope_version:Utf8:null",
-            "resource_schema_url:Utf8:null",
-            "scope_schema_url:Utf8:null",
+            "service_name:Dictionary(Int32, Utf8):null",
+            "scope_name:Dictionary(Int32, Utf8):null",
+            "scope_version:Dictionary(Int32, Utf8):null",
+            "resource_schema_url:Dictionary(Int32, Utf8):null",
+            "scope_schema_url:Dictionary(Int32, Utf8):null",
             "operation:Utf8:null",
             "provider:Utf8:null",
             "request_model:Utf8:null",
@@ -206,8 +221,8 @@ mod tests {
             "agent_name:Utf8:null",
             "tool_name:Utf8:null",
             "error_type:Utf8:null",
-            "resource:LargeBinary:null",
-            "scope:LargeBinary:null",
+            "resource:Dictionary(Int32, LargeBinary):null",
+            "scope:Dictionary(Int32, LargeBinary):null",
             "attrs:LargeBinary:required",
             "events:LargeBinary:null",
             "links:LargeBinary:null",

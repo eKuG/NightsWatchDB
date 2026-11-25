@@ -3,7 +3,7 @@
 use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
 use crate::{SPANS_FILE, SUMMARY_FILE};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
 use nwdb_core::{
     Error, PartMeta, Result, SpanColumns, SummaryBatchBuilder, SummaryBuilder, TraceId,
@@ -644,8 +644,21 @@ fn create_dir_all_synced(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Bytes of the key a row holds for each dictionary column.
+const KEY_BYTES: u64 = 4;
+
+/// Total length of the values of a dictionary.
+fn dictionary_value_bytes(values: &ArrayRef) -> u64 {
+    match values.data_type() {
+        DataType::Utf8 => values.as_string::<i32>().value_data().len() as u64,
+        DataType::LargeBinary => values.as_binary::<i64>().value_data().len() as u64,
+        _ => 0,
+    }
+}
+
 /// Per-row sum of the lengths of every string and binary value, the same
-/// measure as [`BatchLimits`](nwdb_core::BatchLimits) uses.
+/// measure as [`BatchLimits`](nwdb_core::BatchLimits) uses: a dictionary
+/// column counts its 4-byte key in every row and its values once.
 fn row_value_bytes(batch: &RecordBatch) -> Vec<u64> {
     fn add<O: Copy + Into<i64>>(out: &mut [u64], offsets: &[O]) {
         for (sum, w) in out.iter_mut().zip(offsets.windows(2)) {
@@ -657,6 +670,18 @@ fn row_value_bytes(batch: &RecordBatch) -> Vec<u64> {
         match column.data_type() {
             DataType::Utf8 => add(&mut out, column.as_string::<i32>().value_offsets()),
             DataType::LargeBinary => add(&mut out, column.as_binary::<i64>().value_offsets()),
+            // A row holds its key; the values are stored once, so they are
+            // charged to the first row of the batch, once, instead of to
+            // every row that uses them.
+            DataType::Dictionary(_, _) => {
+                let dict = column.as_any_dictionary();
+                for sum in out.iter_mut() {
+                    *sum += KEY_BYTES;
+                }
+                if let Some(first) = out.first_mut() {
+                    *first += dictionary_value_bytes(dict.values());
+                }
+            }
             _ => {}
         }
     }
@@ -718,7 +743,12 @@ mod tests {
         }
         let batch = b.finish();
         assert_eq!(row_value_bytes(&batch), expected);
-        // A slice must measure the same as the rows it covers.
-        assert_eq!(row_value_bytes(&batch.slice(2, 2)), expected[2..4]);
+        // A slice measures the rows it covers, and carries the dictionary
+        // ("service", 7 bytes) on its first row, whether or not that row is
+        // the one that introduced the value.
+        assert_eq!(
+            row_value_bytes(&batch.slice(2, 2)),
+            [expected[2] + 7, expected[3]]
+        );
     }
 }

@@ -29,31 +29,52 @@ pub fn all_rows(batches: &[RecordBatch]) -> Vec<SpanRecord<'_>> {
     rows
 }
 
-/// Bytes of variable-length values in a row, as the batch builder counts them.
-pub fn value_bytes(r: &SpanRecord<'_>) -> usize {
-    let strings = [
-        Some(r.name),
-        r.status_message,
-        r.trace_state,
-        r.service_name,
-        r.scope_name,
-        r.scope_version,
-        r.resource_schema_url,
-        r.scope_schema_url,
-        r.operation,
-        r.provider,
-        r.request_model,
-        r.response_model,
-        r.conversation_id,
-        r.session_id,
-        r.user_id,
-        r.agent_name,
-        r.tool_name,
-        r.error_type,
-    ];
-    let raws = [r.resource, r.scope, Some(r.attrs), r.events, r.links];
-    strings.iter().flatten().map(|s| s.len()).sum::<usize>()
-        + raws.iter().flatten().map(|b| b.len()).sum::<usize>()
+/// Bytes of variable-length values in a batch, as the batch builder counts
+/// them: the strings and raw columns of every row, except that each distinct
+/// origin value counts once, plus a 4-byte key per origin column per row.
+pub fn value_bytes(batch: &RecordBatch) -> usize {
+    use std::collections::HashSet;
+    let cols = SpanColumns::try_new(batch).expect("span schema");
+    let mut origin: [HashSet<Vec<u8>>; 7] = Default::default();
+    let mut total = 0;
+    for row in 0..cols.len() {
+        let r = cols.record(row);
+        let strings = [
+            Some(r.name),
+            r.status_message,
+            r.trace_state,
+            r.operation,
+            r.provider,
+            r.request_model,
+            r.response_model,
+            r.conversation_id,
+            r.session_id,
+            r.user_id,
+            r.agent_name,
+            r.tool_name,
+            r.error_type,
+        ];
+        let raws = [Some(r.attrs), r.events, r.links];
+        total += strings.iter().flatten().map(|s| s.len()).sum::<usize>()
+            + raws.iter().flatten().map(|b| b.len()).sum::<usize>()
+            + 7 * 4;
+        let o = cols.origin(row);
+        let values: [Option<&[u8]>; 7] = [
+            o.resource,
+            o.service_name.map(str::as_bytes),
+            o.resource_schema_url.map(str::as_bytes),
+            o.scope,
+            o.scope_name.map(str::as_bytes),
+            o.scope_version.map(str::as_bytes),
+            o.scope_schema_url.map(str::as_bytes),
+        ];
+        for (set, v) in origin.iter_mut().zip(values) {
+            if let Some(v) = v {
+                set.insert(v.to_vec());
+            }
+        }
+    }
+    total + origin.iter().flatten().map(Vec::len).sum::<usize>()
 }
 
 /// Splits a length-prefixed column into its messages.

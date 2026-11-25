@@ -417,8 +417,9 @@ fn stats_count_what_was_copied() {
         assert_eq!(stats.spans as usize, rows.len());
         assert_eq!(
             stats.bytes_copied as usize,
-            rows.iter().map(value_bytes).sum::<usize>()
+            batches.iter().map(value_bytes).sum::<usize>()
         );
+        assert_eq!((stats.rejected_spans, stats.rejected_reason), (0, None));
         assert_eq!(stats.resources as usize, req.resource_spans.len());
         let scopes: usize = req.resource_spans.iter().map(|r| r.scope_spans.len()).sum();
         assert_eq!(stats.scopes as usize, scopes);
@@ -494,9 +495,8 @@ fn byte_bound_splits_batches_in_order() {
     assert_eq!(all_rows(&split), all_rows(&all));
     // Every batch but the last closed on the span that reached the bound.
     for b in &split[..split.len() - 1] {
-        let rows = all_rows(std::slice::from_ref(b));
-        let total: usize = rows.iter().map(value_bytes).sum();
-        let before_last = total - value_bytes(rows.last().unwrap());
+        let total = value_bytes(b);
+        let before_last = value_bytes(&b.slice(0, b.num_rows() - 1));
         assert!(total >= max_bytes && before_last < max_bytes);
     }
 }
