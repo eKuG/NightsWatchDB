@@ -21,3 +21,15 @@ the host directory. To start from a cold cache, remove those two volumes.
 
 The image has no rustfmt or clippy, so the script installs them at the start
 of each run (a few seconds).
+
+## e2e.sh
+
+Builds the server image (`Dockerfile`) and the load generator image
+(`bench/tracegen/Dockerfile`), starts the server in a container limited to 2
+CPUs and 1 GB, loads generated traces over OTLP gRPC and checks the data
+through the HTTP API: the span count must equal what the generator sent, and a
+listed trace must open with as many spans as its summary says. It repeats the
+checks after `kill -9` and after a `docker stop`, which must exit with code 0.
+It prints `PASS` or `FAIL` and removes its containers, network and volume on
+exit; the two images (`nightswatchdb:e2e`, `nwdb-tracegen:e2e`) stay.
+`E2E_TRACES` sets the number of traces (default 3000).

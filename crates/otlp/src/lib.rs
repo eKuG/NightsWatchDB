@@ -58,7 +58,9 @@
 
 mod decode;
 mod encode;
+mod json;
 mod wire;
 
 pub use decode::{DecodeStats, RECORD_TAG_OTLP_TRACES, TraceDecoder};
 pub use encode::encode_spans;
+pub use json::{attrs_to_json, events_to_json, links_to_json, resource_to_json};

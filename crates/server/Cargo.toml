@@ -1,0 +1,37 @@
+[package]
+name = "nightswatchdb"
+description = "The NightsWatchDB server: an OTLP gRPC door for traces and a small HTTP query API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "nwdb_server"
+
+[[bin]]
+name = "nightswatchdb"
+path = "src/main.rs"
+
+[dependencies]
+nwdb-core = { path = "../core" }
+nwdb-engine = { path = "../engine" }
+nwdb-otlp = { path = "../otlp" }
+nwdb-wal = { path = "../wal" }
+arrow-array.workspace = true
+serde_json.workspace = true
+bytes = "=1.12.2"
+tonic = { version = "=0.14.9", default-features = false, features = ["server", "router", "codegen", "transport", "gzip", "zstd"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+# The version tonic already depends on, so the build has one copy of it.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+prost = "=0.14.6"
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+
+[lints]
+workspace = true
