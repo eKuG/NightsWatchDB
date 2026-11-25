@@ -1,0 +1,23 @@
+[package]
+name = "nwdb-segment"
+description = "Writes and reads one immutable part of span data for NightsWatchDB: spans, trace index and trace summaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nwdb-core = { path = "../core" }
+arrow-array = "=60.2.0"
+arrow-schema = "=60.2.0"
+parquet = { version = "=60.2.0", default-features = false, features = ["arrow", "zstd"] }
+crc32c = "=0.6.9"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+rand = "=0.9.5"
+
+[lints]
+workspace = true

@@ -13,7 +13,8 @@
 //!   way to build a batch of it ([`SpanBatchBuilder`]) and the way to read one
 //!   back ([`SpanColumns`]).
 //! - The per-trace summary ([`TraceSummary`], [`SummaryBuilder`],
-//!   [`summary_schema`]).
+//!   [`summary_schema`]) and its batch form ([`SummaryBatchBuilder`],
+//!   [`SummaryColumns`]).
 //! - The metadata record that describes one immutable part ([`PartMeta`]).
 //!
 //! # What does not belong here
@@ -37,6 +38,7 @@ mod part;
 mod record;
 mod schema;
 mod summary;
+mod summary_batch;
 mod window;
 
 pub use builder::SpanBatchBuilder;
@@ -48,4 +50,5 @@ pub use part::{PartMeta, part_dir_name};
 pub use record::SpanRecord;
 pub use schema::{col, span_schema};
 pub use summary::{SummaryBuilder, TraceSummary, summary_schema};
+pub use summary_batch::{SummaryBatchBuilder, SummaryColumns};
 pub use window::{DEFAULT_WINDOW_NS, window_start};
