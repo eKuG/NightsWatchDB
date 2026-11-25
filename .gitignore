@@ -4,3 +4,4 @@ target/
 /bench/tracegen/tracegen
 /bench/corpusprep/corpusprep
 *.swp
+.claude/
