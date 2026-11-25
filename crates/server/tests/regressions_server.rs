@@ -462,19 +462,19 @@ async fn the_protobuf_view_of_an_accepted_trace_is_valid_otlp() {
         &attr("llm.output", &ld(1, &[0xed, 0xa0, 0xbd])),
         None,
     );
-    if export(&ch, odd).await.is_ok_and(|r| rejected(&r) == 0) {
-        let r = http(
-            server.api_addr(),
-            &format!("/api/v1/traces/{}", hex(&[0x50; 16])),
-            Some("application/x-protobuf"),
-        )
-        .await;
-        assert_eq!(r.status, 200);
-        if let Err(e) = ExportTraceServiceRequest::decode(r.body.as_slice()) {
-            panic!(
-                "the server acknowledged the request, but its protobuf view does not decode: {e}"
-            );
-        }
+    let reply = export(&ch, odd)
+        .await
+        .expect("the export of a string that is not UTF-8 must be accepted");
+    assert_eq!(rejected(&reply), 0, "the span must be stored, not skipped");
+    let r = http(
+        server.api_addr(),
+        &format!("/api/v1/traces/{}", hex(&[0x50; 16])),
+        Some("application/x-protobuf"),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    if let Err(e) = ExportTraceServiceRequest::decode(r.body.as_slice()) {
+        panic!("the server acknowledged the request, but its protobuf view does not decode: {e}");
     }
     server.shutdown().await.unwrap();
 }

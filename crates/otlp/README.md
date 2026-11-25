@@ -151,6 +151,17 @@ name and two timestamps is about 60 bytes on the wire and stays under the 8
 times bound.
 Both are pinned by `crates/otlp/tests/regressions_decode.rs`.
 
+That is the memory of the finished batches. While a request is being decoded
+the decoder also holds its interning tables and the builders' buffers, so the
+peak is higher: measured with an allocator that counts every heap byte, the
+worst shape is 13.6 times the request (a scope of its own for each span, a
+little past 1,000 spans), 12.5 for a resource of its own for each span and
+11.2 for requests of minimal spans, plus a fixed part of a few tens of KB that
+matters only for tiny requests. The server's door therefore charges 16
+times the decompressed size plus 64 KiB for decoding a request; the test
+`decoding_never_needs_more_than_the_door_charges` in the server crate checks
+that against these shapes.
+
 ## JSON view of the raw columns
 
 `write_attrs`, `write_resource`, `write_scope_attrs`, `write_events` and

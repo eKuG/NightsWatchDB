@@ -3,7 +3,7 @@
 //! runs on the blocking pool.
 
 use axum::Router;
-use axum::extract::{RawQuery, Request, State};
+use axum::extract::{Extension, RawQuery, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{Next, from_fn_with_state};
@@ -111,11 +111,17 @@ struct Guard {
     slots: Arc<Semaphore>,
 }
 
+/// A request's concurrency slot. Whoever works for the request holds a copy:
+/// the response body, a query on the blocking pool, the task that renders a
+/// trace. The slot is free only when all of them are done, so work that
+/// outlives a client that went away still counts as running.
+type Slot = Arc<OwnedSemaphorePermit>;
+
 /// A response body that keeps its request's slot until the body is finished
-/// or dropped, so a slow reader of a streamed response counts as running.
+/// or dropped.
 struct Held {
     inner: axum::body::Body,
-    _slot: OwnedSemaphorePermit,
+    _slot: Slot,
 }
 
 impl HttpBody for Held {
@@ -135,7 +141,7 @@ impl HttpBody for Held {
     }
 }
 
-async fn guard(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Response {
+async fn guard(State(g): State<Arc<Guard>>, mut req: Request, next: Next) -> Response {
     if !g.hosts.allows(req.headers().get(HOST)) {
         return ApiError::new(
             StatusCode::MISDIRECTED_REQUEST,
@@ -143,10 +149,17 @@ async fn guard(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Respons
         )
         .into_response();
     }
+    // These two answer from memory. They are what an operator looks at when
+    // every slot is taken, so they never wait for one.
+    if matches!(req.uri().path(), "/healthz" | "/api/v1/stats") {
+        return next.run(req).await;
+    }
     // The semaphore is never closed.
     let Ok(slot) = g.slots.clone().acquire_owned().await else {
         return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response();
     };
+    let slot = Arc::new(slot);
+    req.extensions_mut().insert(slot.clone());
     let (parts, body) = next.run(req).await.into_parts();
     Response::from_parts(
         parts,
@@ -222,13 +235,19 @@ impl Api {
         ApiError::new(status_of(e), e.to_string())
     }
 
-    /// Runs `f` on the blocking pool.
+    /// Runs `f` on the blocking pool. The slot goes with it, so that a client
+    /// that disconnects does not free the slot while its query still runs.
     async fn run<T: Send + 'static>(
         &self,
+        slot: Slot,
         f: impl FnOnce(Engine) -> nwdb_core::Result<T> + Send + 'static,
     ) -> Result<T, ApiError> {
         let engine = self.engine.clone();
-        match tokio::task::spawn_blocking(move || f(engine)).await {
+        let query = move || {
+            let _slot = slot;
+            f(engine)
+        };
+        match tokio::task::spawn_blocking(query).await {
             Ok(r) => r.map_err(|e| self.error(&e)),
             Err(_) => Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -397,6 +416,7 @@ async fn stats(State(api): State<Api>) -> Response {
 
 async fn get_trace(
     State(api): State<Api>,
+    Extension(slot): Extension<Slot>,
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -416,15 +436,20 @@ async fn get_trace(
             .ok_or_else(|| Error::not_found(format!("trace {trace_id}")))
     };
     if protobuf {
-        let body = api.run(move |engine| encode_spans(&found(engine)?)).await?;
+        let body = api
+            .run(slot, move |engine| encode_spans(&found(engine)?))
+            .await?;
         return Ok((StatusCode::OK, [(CONTENT_TYPE, PROTOBUF)], body).into_response());
     }
-    let batches = api.run(found).await?;
+    let batches = api.run(slot.clone(), found).await?;
     // The JSON is written by a blocking task and sent in chunks through a
-    // small channel, so a trace is never held as JSON, and a client that is
-    // slow or gone holds the task back or ends it.
+    // small channel, so a trace is never held as JSON. A client that is slow
+    // holds the task back; one that is gone, or that makes no progress for
+    // the write timeout (the connection is then closed), ends it. The task
+    // holds the slot as long as it holds the rows.
     let (tx, rx) = mpsc::channel(CHUNKS_IN_FLIGHT);
     tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let mut out = ChunkWriter {
             tx,
             buf: Vec::with_capacity(CHUNK),
@@ -636,6 +661,7 @@ fn write_span(out: &mut dyn Write, r: &SpanRecord<'_>) -> io::Result<()> {
 
 async fn list_traces(
     State(api): State<Api>,
+    Extension(slot): Extension<Slot>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, ApiError> {
     let mut p = Params::parse(raw)?;
@@ -663,7 +689,7 @@ async fn list_traces(
         limit,
     };
     p.finish()?;
-    let traces = api.run(move |e| e.list_traces(&query)).await?;
+    let traces = api.run(slot, move |e| e.list_traces(&query)).await?;
     let traces: Vec<Value> = traces.iter().map(summary_json).collect();
     Ok(json_response(StatusCode::OK, &json!({ "traces": traces })))
 }
@@ -691,7 +717,11 @@ fn summary_json(s: &TraceSummary) -> Value {
     Value::Object(m)
 }
 
-async fn tokens(State(api): State<Api>, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
+async fn tokens(
+    State(api): State<Api>,
+    Extension(slot): Extension<Slot>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
     let mut p = Params::parse(raw)?;
     let (from_ns, to_ns) = p.range()?;
     let query = AggQuery {
@@ -708,7 +738,7 @@ async fn tokens(State(api): State<Api>, RawQuery(raw): RawQuery) -> Result<Respo
             .ok_or_else(|| ApiError::bad(format!("`limit` must be 1 to {TOKENS_MAX_LIMIT}")))?,
     };
     p.finish()?;
-    let mut rows = api.run(move |e| e.aggregate_tokens(&query)).await?;
+    let mut rows = api.run(slot, move |e| e.aggregate_tokens(&query)).await?;
     rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.model.cmp(&b.model)));
     let truncated = rows.len() > limit;
     rows.truncate(limit);
@@ -824,5 +854,50 @@ mod tests {
         assert!(!allows("0.0.0.0", &["a.example"], "anything.example"));
         let check = HostCheck::new("127.0.0.1".parse().unwrap(), &[]);
         assert!(!check.allows(None));
+    }
+
+    /// A query that was started keeps its slot until it has finished, even if
+    /// the request that asked for it is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_query_keeps_its_slot_after_its_request_is_dropped() {
+        use nwdb_engine::EngineOptions;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(EngineOptions::new(dir.path()), Vec::new()).unwrap();
+        let api = Api {
+            engine: engine.clone(),
+            fatal: Arc::new(Notify::new()),
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        let slot: Slot = Arc::new(slots.clone().acquire_owned().await.unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let request = tokio::spawn(async move {
+            api.run(slot, move |_| {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        // The client goes away: its request's future is dropped.
+        request.abort();
+        assert!(request.await.is_err_and(|e| e.is_cancelled()));
+        assert_eq!(slots.available_permits(), 0, "the slot was given up");
+
+        // The query ends, and then the slot is free.
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slots.available_permits() == 0 {
+            assert!(Instant::now() < deadline, "the slot was never freed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::task::spawn_blocking(move || engine.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

@@ -56,7 +56,15 @@ async fn run(config: Config) -> ExitCode {
         env!("CARGO_PKG_VERSION"),
         config.data_dir.display()
     );
-    let server = match Server::start(options).await {
+    // Recovery can take long. A signal that arrives meanwhile ends the process
+    // at once: nothing has been accepted yet, and recovery is redone at the
+    // next start.
+    let started = tokio::select! {
+        r = Server::start(options) => r,
+        _ = term.recv() => quit_now("SIGTERM received while starting, exiting now"),
+        _ = int.recv() => quit_now("SIGINT received while starting, exiting now"),
+    };
+    let server = match started {
         Ok(s) => s,
         Err(e) => {
             eprintln!("nightswatchdb: cannot start: {e}");
@@ -95,8 +103,8 @@ async fn run(config: Config) -> ExitCode {
     tokio::pin!(shutdown);
     let result = tokio::select! {
         r = &mut shutdown => r,
-        _ = term.recv() => quit_now("SIGTERM"),
-        _ = int.recv() => quit_now("SIGINT"),
+        _ = term.recv() => quit_now("second SIGTERM received, exiting now"),
+        _ = int.recv() => quit_now("second SIGINT received, exiting now"),
     };
     if let Err(e) = result {
         eprintln!("error during shutdown: {e}");
@@ -112,7 +120,7 @@ async fn run(config: Config) -> ExitCode {
 
 /// Exits at once. Returning from `run` would wait for the engine's shutdown
 /// thread, which is what the sender of the signal does not want to wait for.
-fn quit_now(signal: &str) -> ! {
-    eprintln!("second {signal} received, exiting now");
+fn quit_now(message: &str) -> ! {
+    eprintln!("{message}");
     std::process::exit(130)
 }

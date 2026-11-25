@@ -30,6 +30,7 @@ const INVALID_ARGUMENT: u8 = 3;
 const DEADLINE_EXCEEDED: u8 = 4;
 const RESOURCE_EXHAUSTED: u8 = 8;
 const UNIMPLEMENTED: u8 = 12;
+const UNAVAILABLE: u8 = 14;
 
 // ---- client ----
 
@@ -202,9 +203,20 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
-/// A zstd frame with no content size in its header.
+/// A zstd frame with no content size in its header: the encoder is not told
+/// the size, and writes the header before it has seen the end of the input.
 fn zstd_unsized(data: &[u8]) -> Vec<u8> {
-    zstd::stream::encode_all(data, 3).unwrap()
+    let mut e = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    for piece in data.chunks(1000) {
+        e.write_all(piece).unwrap();
+    }
+    let frame = e.finish().unwrap();
+    assert!(
+        zstd::zstd_safe::get_frame_content_size(&frame)
+            .unwrap()
+            .is_none()
+    );
+    frame
 }
 
 fn set_gzip_claim(mut gz: Vec<u8>, claim: u32) -> Vec<u8> {
@@ -327,6 +339,7 @@ async fn a_sender_that_stalls_is_timed_out() {
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts(dir.path());
     o.stall_timeout = Duration::from_millis(300);
+    o.receive_timeout = Duration::from_millis(1_200);
     let server = Server::start(o).await.unwrap();
     let mut c = connect(server.otlp_grpc_addr()).await;
 
@@ -359,7 +372,37 @@ async fn a_sender_that_stalls_is_timed_out() {
     let call = call_with(&mut c, EXPORT, "application/grpc", None, vec![whole]).await;
     let r = call.reply(Duration::from_secs(5)).await;
     assert_eq!(r.code, DEADLINE_EXCEEDED);
+    assert!(r.message.contains("stall_timeout"), "{}", r.message);
     assert_eq!(trace_status(server.api_addr(), 0x31), 404);
+
+    // A sender that is never silent for the stall timeout but sends one byte
+    // at a time runs into the deadline for the whole message.
+    let mut header = vec![0u8];
+    header.extend_from_slice(&1000u32.to_be_bytes());
+    let call = call_with(
+        &mut c,
+        EXPORT,
+        "application/grpc",
+        None,
+        vec![header.into()],
+    )
+    .await;
+    let tx = call.tx.clone().unwrap();
+    let drip = tokio::spawn(async move {
+        while tx.send(Bytes::from_static(b"\0")).is_ok() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let began = Instant::now();
+    let r = call.reply(Duration::from_secs(10)).await;
+    drip.abort();
+    assert_eq!(r.code, DEADLINE_EXCEEDED, "{}", r.message);
+    assert!(r.message.contains("receive_timeout"), "{}", r.message);
+    assert!(
+        began.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        began.elapsed()
+    );
     server.shutdown().await.unwrap();
 }
 
@@ -627,4 +670,295 @@ async fn a_lost_log_is_refused_unless_accepted() {
         .unwrap();
     std::thread::spawn(move || lines.for_each(drop));
     assert_eq!(child.wait().unwrap().code(), Some(0));
+}
+
+// ---- waiting for budget and call slots ----
+
+fn message_stating(len: usize) -> Bytes {
+    let mut m = vec![0u8];
+    m.extend_from_slice(&(len as u32).to_be_bytes());
+    m.into()
+}
+
+/// A sender that holds the budget with a message it never finishes makes the
+/// others wait for `budget_wait` and no longer; they are told to retry and
+/// the reply names the limit. Once the holder is gone the budget is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_cannot_get_budget_is_refused_as_unavailable() {
+    const BUDGET: usize = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.max_inflight_bytes = BUDGET;
+    o.stall_timeout = Duration::from_secs(60);
+    o.receive_timeout = Duration::from_secs(60);
+    o.budget_wait = Duration::from_millis(400);
+    let server = Server::start(o).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+
+    // States the whole of the bytes-read half and sends none of it.
+    let mut holder = call_with(
+        &mut c,
+        EXPORT,
+        "application/grpc",
+        None,
+        vec![message_stating(BUDGET / 2)],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let began = Instant::now();
+    let r = export(&mut c, None, vec![message(false, &one_span(0x71))]).await;
+    assert_eq!((r.http, r.code), (200, UNAVAILABLE), "{}", r.message);
+    assert!(r.message.contains("bytes-read"), "{}", r.message);
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        began.elapsed()
+    );
+
+    // The holder's stream ends short of its length; its budget comes back.
+    holder.end();
+    let r = holder.reply(Duration::from_secs(5)).await;
+    assert_eq!(r.code, INVALID_ARGUMENT, "{}", r.message);
+    let r = export(&mut c, None, vec![message(false, &one_span(0x72))]).await;
+    assert_eq!(r.code, OK, "{}", r.message);
+    server.shutdown().await.unwrap();
+}
+
+/// A call takes a slot before it reads its body; one that cannot get a slot
+/// within `budget_wait` is refused, and says which limit it hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_cannot_get_a_slot_is_refused_as_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.max_calls = 2;
+    o.stall_timeout = Duration::from_secs(60);
+    o.budget_wait = Duration::from_millis(400);
+    let server = Server::start(o).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        held.push(call_with(&mut c, EXPORT, "application/grpc", None, vec![]).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let r = export(&mut c, None, vec![message(false, &one_span(0x73))]).await;
+    assert_eq!((r.http, r.code), (200, UNAVAILABLE), "{}", r.message);
+    assert!(r.message.contains("max_calls"), "{}", r.message);
+
+    // A call that ends frees its slot.
+    held[0].end();
+    let r = held.remove(0).reply(Duration::from_secs(5)).await;
+    assert_eq!(r.code, INVALID_ARGUMENT, "{}", r.message);
+    let r = export(&mut c, None, vec![message(false, &one_span(0x74))]).await;
+    assert_eq!(r.code, OK, "{}", r.message);
+    held[0].end();
+    let r = held.remove(0).reply(Duration::from_secs(5)).await;
+    assert_eq!(r.code, INVALID_ARGUMENT, "{}", r.message);
+    server.shutdown().await.unwrap();
+}
+
+// ---- zstd frames that do not state their size ----
+
+/// A request of `n` spans with distinct ids and a long name each (the same
+/// name): megabytes that compress to a few KB.
+fn long_spans(n: u32) -> Vec<u8> {
+    let spans = (0..n)
+        .map(|i| Span {
+            trace_id: vec![0x75; 16],
+            span_id: [i.to_be_bytes(), [1; 4]].concat(),
+            name: "x".repeat(2000),
+            start_time_unix_nano: 1_000,
+            end_time_unix_nano: 2_000,
+            ..Default::default()
+        })
+        .collect();
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn span_count(api: SocketAddr) -> u64 {
+    let mut s = TcpStream::connect(api).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    write!(
+        s,
+        "GET /api/v1/traces?from=0&to=9000000000000000000 HTTP/1.1\r\nHost: localhost\r\n\
+         Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    let n = text.split("\"span_count\":").nth(1).expect(&text);
+    n.split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsized_zstd_frame_within_the_assumed_size_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let frame = zstd_unsized(&one_span(0x76));
+    let r = export(&mut c, Some("zstd"), vec![message(true, &frame)]).await;
+    assert_eq!(r.code, OK, "{}", r.message);
+    assert_eq!(trace_status(server.api_addr(), 0x76), 200);
+    server.shutdown().await.unwrap();
+}
+
+/// Output beyond the assumed size (1 MiB for a frame this small) is not an
+/// error: the frame is expanded again under the limit, and stored whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsized_zstd_frame_beyond_the_assumed_size_is_still_accepted() {
+    const SPANS: u32 = 2_000;
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let raw = long_spans(SPANS);
+    let frame = zstd_unsized(&raw);
+    // Beyond what is assumed for such a frame: 64 times its length, but at
+    // least 1 MiB.
+    assert!(raw.len() > 1 << 20, "{}", raw.len());
+    assert!(frame.len() * 64 < raw.len(), "{}", frame.len());
+    let r = export(&mut c, Some("zstd"), vec![message(true, &frame)]).await;
+    assert_eq!(r.code, OK, "{}", r.message);
+    assert_eq!(server.engine().stats().records_ingested, 1);
+    assert_eq!(span_count(server.api_addr()), u64::from(SPANS));
+    server.shutdown().await.unwrap();
+}
+
+/// A zstd frame with no content size made of run-length blocks: `n` bytes of
+/// zero in a few KB.
+fn zstd_zeros(n: usize) -> Vec<u8> {
+    // Magic, a descriptor with no content size or checksum, a 1 MiB window.
+    let mut f = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 10 << 3];
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(128 * 1024);
+        left -= k;
+        let h = u32::from(left == 0) | 1 << 1 | (k as u32) << 3;
+        f.extend_from_slice(&h.to_le_bytes()[..3]);
+        f.push(0);
+    }
+    f
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unsized_zstd_frame_beyond_the_limit_is_resource_exhausted() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(opts(dir.path())).await.unwrap();
+    let mut c = connect(server.otlp_grpc_addr()).await;
+    let frame = zstd_zeros(MAX_MESSAGE + 1);
+    assert!(frame.len() < 8192, "{}", frame.len());
+    let r = export(&mut c, Some("zstd"), vec![message(true, &frame)]).await;
+    assert_eq!((r.http, r.code), (200, RESOURCE_EXHAUSTED), "{}", r.message);
+    // One byte less is within the limit: it is expanded, and refused only
+    // because zeros are not a request.
+    let frame = zstd_zeros(MAX_MESSAGE);
+    let r = export(&mut c, Some("zstd"), vec![message(true, &frame)]).await;
+    assert_eq!(r.code, INVALID_ARGUMENT, "{}", r.message);
+    assert_eq!(server.engine().stats().records_ingested, 0);
+    server.shutdown().await.unwrap();
+}
+
+// ---- the stream limit, from a client that does not obey it ----
+
+fn h2_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&stream.to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+fn hpack_str(out: &mut Vec<u8>, s: &str) {
+    out.push(s.len() as u8);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// The request headers of an export, in HPACK without Huffman coding or
+/// indexing.
+fn export_headers() -> Vec<u8> {
+    let mut h = vec![0x83, 0x86, 0x04];
+    hpack_str(&mut h, EXPORT);
+    h.push(0x01);
+    hpack_str(&mut h, "localhost");
+    for (name, value) in [("content-type", "application/grpc"), ("te", "trailers")] {
+        h.push(0x00);
+        hpack_str(&mut h, name);
+        hpack_str(&mut h, value);
+    }
+    h
+}
+
+/// One HTTP/2 frame: type, flags, stream, payload.
+fn read_h2_frame(s: &mut TcpStream) -> std::io::Result<(u8, u8, u32, Vec<u8>)> {
+    let mut head = [0u8; 9];
+    s.read_exact(&mut head)?;
+    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+    let stream = u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]);
+    let mut payload = vec![0u8; len];
+    s.read_exact(&mut payload)?;
+    Ok((head[3], head[4], stream, payload))
+}
+
+/// The server allows 64 streams at once and says so in its settings. A
+/// client that opens a 65th regardless is refused with REFUSED_STREAM, and
+/// the 64 that were allowed stay open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_65th_stream_opened_regardless_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.stall_timeout = Duration::from_secs(60);
+    let server = Server::start(o).await.unwrap();
+    let addr = server.otlp_grpc_addr();
+    let reset = tokio::task::spawn_blocking(move || {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        h2_frame(&mut out, 4, 0, 0, &[]);
+        s.write_all(&out).unwrap();
+        // The server's settings, which must be acknowledged; they carry the
+        // stream limit (setting 3).
+        let limit = loop {
+            let (kind, flags, _, payload) = read_h2_frame(&mut s).unwrap();
+            if kind == 4 && flags & 1 == 0 {
+                break payload
+                    .chunks(6)
+                    .find(|e| e[..2] == [0, 3])
+                    .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]));
+            }
+        };
+        assert_eq!(limit, Some(64));
+        let mut out = Vec::new();
+        h2_frame(&mut out, 4, 1, 0, &[]);
+        // 64 calls that are never ended, then a 65th.
+        for i in 0..65u32 {
+            h2_frame(&mut out, 1, 0x4, 1 + 2 * i, &export_headers());
+        }
+        s.write_all(&out).unwrap();
+        loop {
+            let (kind, _, stream, payload) = read_h2_frame(&mut s).unwrap();
+            if kind == 3 {
+                // RST_STREAM carries a four byte error code.
+                break (stream, u32::from_be_bytes(payload[..4].try_into().unwrap()));
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // The first reset is of the 65th stream, with REFUSED_STREAM (7).
+    assert_eq!(reset, (129, 7));
+    server.shutdown().await.unwrap();
 }

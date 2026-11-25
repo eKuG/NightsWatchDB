@@ -104,37 +104,59 @@ before it is held. Service `opentelemetry.proto.collector.trace.v1.TraceService`
 method `Export`. Messages up to 64 MiB are accepted (or the log's record
 limit, if that is smaller), uncompressed or after decompression.
 
-Limits, with their defaults:
+Limits, with their defaults. The ones with a field name are set in
+`ServerOptions` (for a program that embeds the server); the binary uses the
+defaults and has no flags for them.
 
 | Limit | Default |
 |---|---|
-| Open connections | 1024; more wait in the accept queue |
-| Concurrent streams per connection | 64 |
+| Open connections (`otlp_max_connections`) | 1024; more wait in the accept queue |
+| Concurrent streams per connection | 64; a 65th is refused with `REFUSED_STREAM` |
+| Export calls in progress (`max_calls`) | 256, counted from before the first byte of the body is read |
 | Header list size | 16 KiB |
+| HTTP/2 flow-control window | 128 KiB per stream and per connection, adaptive windows off; largest frame 16 KiB |
 | Keepalive pings | every 30 s, a connection that does not answer within 10 s is closed |
-| Silence from a sender in the middle of a call | 20 s, then `DEADLINE_EXCEEDED` |
-| Budget (`max_inflight_bytes`) | 256 MiB, see below |
+| Silence from a sender in the middle of a call (`stall_timeout`) | 20 s, then `DEADLINE_EXCEEDED` |
+| Time to deliver a whole message (`receive_timeout`) | 30 s from the moment its budget is taken, then `DEADLINE_EXCEEDED` |
+| Wait for a call slot or for budget (`budget_wait`) | 5 s, then `UNAVAILABLE` |
+| Budget (`max_inflight_bytes`) | 512 MiB, see below |
 | Zstd window | at most 8 MiB |
 
 For each call:
 
 1. `grpc-encoding` may be absent, `identity`, `gzip` or `zstd`. Replies always
    carry `grpc-accept-encoding: identity,gzip,zstd`.
-2. The 5-byte message header is read. A length above the limit is refused at
+2. The call takes one of the `max_calls` slots before the first byte of its
+   body is read, and keeps it until the call ends. A call that cannot get a
+   slot within `budget_wait` is refused with `UNAVAILABLE`.
+3. The 5-byte message header is read. A length above the limit is refused at
    once, before any payload is read.
-3. The length is taken from the budget, then the payload is read.
-4. The stream must end after the message. A second message, or any further
+4. The length is taken from the budget, then the payload is read. A call that
+   cannot get the budget within `budget_wait` is refused with `UNAVAILABLE`.
+   From the moment the budget is taken the sender has `receive_timeout` to
+   deliver the whole message, however steadily it sends; after that the call
+   fails with `DEADLINE_EXCEEDED`, the stream is dropped and the budget is
+   free. This deadline stops counting when the message is complete: the time
+   the server spends decoding and waiting for the log is not held against the
+   sender, because a failure reply after the record is durable would make it
+   retry something that is already stored.
+5. The stream must end after the message. A second message, or any further
    byte, is an error and nothing is stored.
-5. A compressed message states its size: the gzip trailer, or the zstd frame's
-   content size (a frame without one is assumed to be as large as the limit).
-   A size above the limit is refused. Decompression stops at the stated size;
+6. A compressed message states its size: the gzip trailer, or the zstd frame's
+   content size. Streaming zstd encoders (the ones gRPC libraries in Go use)
+   write frames without a size; for those the size is assumed to be 64 times
+   the frame's length, at least 1 MiB and at most the limit. If the frame
+   expands to more than that, the output is discarded, the charge is given
+   back, the whole decoding pool is taken (so this call runs alone) and the
+   frame is expanded again with the limit as the cap; more than the limit is
+   `RESOURCE_EXHAUSTED`. A size above the limit is refused. For a stated size,
    more output, a different size, bytes after the compressed data, or corrupt
    data is an error.
-6. The request is decoded on a blocking thread. Spans that cannot be stored (a
+7. The request is decoded on a blocking thread. Spans that cannot be stored (a
    trace or span id of the wrong length or all zero, a resource or scope over
    the decoder's limit) are skipped and counted; the rest is stored. A request
    with no spans left gets a success reply and nothing is logged.
-7. Otherwise it is handed to the engine. **The reply is sent only after the
+8. Otherwise it is handed to the engine. **The reply is sent only after the
    record is durable in the write-ahead log.** The reply is HTTP 200 with
    `content-type: application/grpc`, one message and the trailer
    `grpc-status: 0`. The message is an empty `ExportTraceServiceResponse`, or,
@@ -148,47 +170,93 @@ headers and no body:
 |---|---|---|
 | Not `TraceService/Export`, not `application/grpc`, unknown `grpc-encoding` | `UNIMPLEMENTED` | not retry |
 | Request does not decode; bad framing; second message; bad or mismatched compressed data | `INVALID_ARGUMENT` | not retry |
-| Message, or its stated decompressed size, above the limit | `RESOURCE_EXHAUSTED` | not retry: it can never succeed |
-| Sender silent for too long in the middle of a call | `DEADLINE_EXCEEDED` | retry |
+| Message, or its decompressed size, above the limit | `RESOURCE_EXHAUSTED` | not retry: it can never succeed |
+| Sender silent for too long (`stall_timeout`), or the whole message not delivered in time (`receive_timeout`) | `DEADLINE_EXCEEDED` | retry |
+| No call slot or no budget within `budget_wait`; the message says which limit | `UNAVAILABLE` | retry with back-off |
 | Buffers full (`Unavailable`), or shutting down | `UNAVAILABLE` | retry later |
 | Fatal engine error | `UNAVAILABLE` | retry; the process shuts down and exits with code 1 so a supervisor restarts it and recovery runs |
 | Anything else | `INTERNAL` | |
 
 ### What the budget bounds
 
-The budget (256 MiB by default) is split in two halves of one pool each:
+The budget (`max_inflight_bytes`, 512 MiB by default) is split in two halves
+of one pool each:
 
 - **Bytes read.** A message takes its length from the first half before its
-  payload is read, and keeps it until the reply is sent or the stream is gone.
-  Stalled senders therefore hold only what they have sent, and only up to the
-  budget. Before a message has its bytes, a stream holds at most one HTTP/2
-  frame (16 KiB), and a connection has a flow-control window of 128 KiB.
+  payload is read, and keeps it until the record is durable or the call has
+  failed. Stalled and slow senders therefore hold only what they have sent, and
+  only up to the budget, and only until `receive_timeout`.
 - **Expansion and decoding.** Before decompression and decoding a message
-  takes 11 times its decompressed size (the stated size for compressed
-  messages) from the second half. Decoded batches are the main memory use. The
-  number comes from the decoder's measured worst case: 10.1 times the request
-  for requests made only of spans that carry nothing but their ids (see the
-  README of the otlp crate), rounded up; each batch also adds a fixed 64 KiB.
+  takes 16 times its decompressed size plus 64 KiB from the second half (the
+  stated size for compressed messages, the assumed size for zstd frames that
+  state none). Decoded batches are the main memory use. The factor comes from
+  the heap the decoder holds at its peak, which is more than the finished
+  batches: the worst shape measured is 13.6 times the request (see the README
+  of the otlp crate), and a compressed message also has its decompressed
+  request in this pool, one more time its size. The test
+  `decoding_never_needs_more_than_the_door_charges` checks the charge against
+  the worst shapes at several sizes, using the constants the door uses.
 
 Two pools, not one, so that a request never waits for more of a pool it holds
 a part of. A request that needs more than a whole pool is charged the whole
 pool: it runs alone instead of never. So the budget is a bound for requests
 that fit it; a single request can use more (up to about 64 MiB uncompressed,
-more while decoding). The engine's own buffers are not part of the budget.
+more while decoding).
+
+The permits are held by the work, not by the call. If the sender resets its
+stream or closes the connection while a message is being expanded and decoded,
+the blocking task goes on, and the charge stays taken until that task has
+finished and freed its memory. Once the record is handed to the engine, the
+charge is given back when the log has it, whether or not the call is still
+there.
+
+What remains **outside** the budget, and its bound:
+
+- **First frames.** A call reads the first DATA frame of its body (up to
+  16 KiB) before it knows the message's length and so before it can wait for
+  budget. At most `max_calls` calls are past the slot at once, so this is at
+  most `max_calls` x 16 KiB: 4 MiB by default. Streams that wait for a slot
+  have read nothing.
+- **What HTTP/2 buffers.** Data a client has sent that no call has read yet
+  waits in the HTTP/2 library, bounded by flow control: the connection window
+  is 128 KiB and is shared by all streams of the connection, so a connection
+  holds at most 128 KiB of unread data (128 MiB for 1024 connections).
+  Windows are set explicitly (128 KiB per stream and per connection, no
+  adaptive resizing, frames of 16 KiB). Each open stream also holds its
+  request headers, at most 16 KiB (the header list limit) and in practice a
+  few hundred bytes; with 64 streams a connection can hold up to 1 MiB of
+  them. These bounds multiply with `otlp_max_connections`; lower it if the
+  door is exposed to many untrusted connections.
+- **The engine's buffers**, which hold accepted records until they are flushed
+  and have their own limits (see the engine README).
 
 ## The HTTP API
 
 The API speaks HTTP/1.1 only. It serves at most 256 connections at once (more
-wait in the accept queue), gives a client 10 s to send the request headers, and
-runs at most 64 requests at once (more wait).
+wait in the accept queue), gives a client 10 s to send the request headers,
+and runs at most 64 requests at once (more wait), except `/healthz` and
+`/api/v1/stats`, which answer from memory and never wait for a slot. A request
+holds its slot until its response has been sent, and also as long as work for it
+is running: a query that was started keeps the slot until it has finished even
+if the client has gone, and the task that renders a trace keeps it for as long
+as it holds the trace's rows.
+
+A client that does not read its response cannot hold a slot for ever: a
+response that makes no progress on the socket for `api_write_timeout` (30 s by
+default, a field of `ServerOptions`) is aborted. The connection is closed, the
+task that renders the response ends, and its rows and its slot are freed. A
+client that reads slowly but steadily is not cut off.
 
 All responses are JSON, except `/healthz` and the protobuf form of a trace.
 Errors are always `{"error": "<message>"}`: 400 for bad input (including an
 unknown parameter name and percent-encoding that is wrong or not UTF-8), 404
 for a missing trace or path, 405 for a method other than GET, 421 for a `Host`
 that is not allowed (see Security), 503 for an engine that is unavailable or
-fatal, 500 otherwise. Fields that are null are left out. In percent-encoding
-`%` must be followed by exactly two hex digits.
+fatal, 500 otherwise. The one exception is a request that the HTTP library
+cannot parse at all (for example a header line without a colon): the library
+answers it itself with status 400 and no body, before any of this code runs.
+Fields that are null are left out. In percent-encoding `%` must be followed by
+exactly two hex digits.
 
 Time values are Unix nanoseconds, written as the unsigned numbers the sender
 sent. `from` is inclusive and `to` exclusive (both are signed 64-bit numbers).
@@ -277,7 +345,11 @@ open but stalled export stream or an idle client never delays shutdown. Then
 it flushes the engine and exits with code 0. After a fatal engine error (met by
 a request, or by the background flush, which is checked once a second) it
 does the same and exits with code 1. A second SIGTERM or SIGINT exits at once
-with code 130; that is safe, because the next start replays the log. After a
+with code 130; that is safe, because the next start replays the log. So does
+a SIGTERM or SIGINT that arrives while the server is still starting (opening
+the database and replaying the log can take long): nothing has been accepted
+yet, the process exits with code 130 at once, and recovery is redone at the
+next start. After a
 crash or `kill -9` the next start replays the log; nothing that was
 acknowledged is lost. Requests that were cut off by the drain deadline were not
 acknowledged, and their senders retry.
