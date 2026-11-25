@@ -19,6 +19,8 @@ const TIME: i64 = 8_000;
 struct Gen {
     next_span: u64,
     rooted: HashSet<u128>,
+    /// The id each trace's spans mostly carry, so most traces agree.
+    session: std::collections::HashMap<u128, String>,
 }
 
 impl Gen {
@@ -30,9 +32,26 @@ impl Gen {
                 self.next_span += 1;
                 let start = rng.random_range(0..TIME);
                 let mut s = TSpan::new(trace, self.next_span, start);
-                if self.rooted.insert(trace) {
+                // The first span of a trace is its root; now and then a
+                // second root appears (a malformed trace).
+                if self.rooted.insert(trace) || rng.random_bool(0.03) {
                     s.parent = None;
                 }
+                let home = self
+                    .session
+                    .entry(trace)
+                    .or_insert_with(|| format!("s{}", rng.random_range(0..4)))
+                    .clone();
+                s.session = match rng.random_range(0..10) {
+                    0 => None,
+                    1 => Some(format!("s{}", rng.random_range(0..4))),
+                    _ => Some(home),
+                };
+                s.user = match rng.random_range(0..10) {
+                    0 => None,
+                    1 => Some(format!("u{}", rng.random_range(0..4))),
+                    _ => Some(format!("u{}", trace % 4)),
+                };
                 s.end = start + rng.random_range(1..200);
                 s.service = [None, Some("a"), Some("b"), Some("c")][rng.random_range(0..4)]
                     .map(str::to_owned);
@@ -76,37 +95,55 @@ fn random_list(rng: &mut StdRng) -> ListQuery {
     }
 }
 
-fn open_random(dir: &std::path::Path, rng: &mut StdRng) -> nwdb_engine::Engine {
+fn open_random(dir: &std::path::Path, rng: &mut StdRng) -> (nwdb_engine::Engine, bool) {
     let mut o = opts(dir);
-    if rng.random_bool(0.3) {
+    let background = rng.random_bool(0.3);
+    if background {
         // Flushes now also happen in the background, between steps.
         o.flush_interval = Duration::from_millis(15);
     }
-    open(o)
+    (open(o), background)
 }
 
 #[test]
 fn random_operations_agree_with_the_model() {
     let mut rng = StdRng::seed_from_u64(SEED);
     let dir = tempfile::tempdir().unwrap();
-    let mut e = open_random(dir.path(), &mut rng);
+    let (mut e, mut background) = open_random(dir.path(), &mut rng);
     let mut model = Model::default();
     let mut gen_ = Gen {
         next_span: 0,
         rooted: HashSet::new(),
+        session: Default::default(),
     };
+    // The last request sent, while a retry of it would still land in the same
+    // buffers. A flush or restart makes a retry cross into a part, where the
+    // engine documents it is counted twice, so those clear it.
+    let mut retryable: Option<Vec<TSpan>> = None;
     let (mut flushes, mut reopens, mut queries) = (0, 0, 0);
 
     for step in 0..STEPS {
         let what = format!("step {step}");
         match rng.random_range(0..100) {
             0..55 => {
-                let spans = gen_.request(&mut rng);
+                let mut spans = gen_.request(&mut rng);
+                if rng.random_bool(0.15) {
+                    // A retried request: the same spans sent again.
+                    if let Some(prev) = retryable.take().filter(|_| !background) {
+                        spans = prev;
+                    }
+                } else if rng.random_bool(0.1) {
+                    // A duplicate inside one request.
+                    let first = spans[0].clone();
+                    spans.push(first);
+                }
                 ingest(&e, &spans).unwrap();
                 model.add(&spans);
+                retryable = Some(spans);
             }
             55..67 => {
                 e.flush().unwrap();
+                retryable = None;
                 flushes += 1;
             }
             67..75 => {
@@ -114,7 +151,8 @@ fn random_operations_agree_with_the_model() {
                     e.shutdown().unwrap();
                 }
                 drop(e);
-                e = open_random(dir.path(), &mut rng);
+                (e, background) = open_random(dir.path(), &mut rng);
+                retryable = None;
                 reopens += 1;
             }
             _ => {

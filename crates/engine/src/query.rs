@@ -266,7 +266,8 @@ impl Snapshot {
     /// never split. Summaries of all candidates are held in memory. The
     /// buffers are summarised in full on every call.
     ///
-    /// A span delivered twice into different parts is counted twice.
+    /// A span delivered twice into different parts, or into a part and the
+    /// buffers, is counted twice.
     pub fn list_traces(&self, query: &ListQuery) -> Result<Vec<TraceSummary>> {
         if query.limit == 0 || query.to_ns <= query.from_ns {
             return Ok(Vec::new());
@@ -361,45 +362,41 @@ impl Snapshot {
     ///
     /// Parts are read through the span scan, which skips row groups outside
     /// the range using their statistics and returns only the five columns
-    /// needed; the buffers are scanned in full. A span delivered twice into
-    /// different parts is counted twice.
+    /// needed. The buffers (the frozen one and the active one together) go
+    /// through the same grouping as `list_traces`, so a span id that appears
+    /// twice for one trace in the buffers is counted once, and the three
+    /// queries agree inside one snapshot. A span delivered twice into
+    /// different parts, or into a part and the buffers, is still counted
+    /// twice until compaction exists.
     pub fn aggregate_tokens(&self, query: &AggQuery) -> Result<Vec<TokenAgg>> {
         let mut acc: BTreeMap<Option<String>, TokenAgg> = BTreeMap::new();
         if query.to_ns <= query.from_ns {
             return Ok(Vec::new());
         }
-        let mut add = |batch: &RecordBatch| -> Result<()> {
-            let start: &Int64Array = column(batch, col::START_NS)?;
-            let op: &StringArray = column(batch, col::OPERATION)?;
-            let model: &StringArray = column(batch, col::REQUEST_MODEL)?;
-            let input: &Int64Array = column(batch, col::INPUT_TOKENS)?;
-            let output: &Int64Array = column(batch, col::OUTPUT_TOKENS)?;
-            for r in 0..batch.num_rows() {
-                let s = start.value(r);
-                if s < query.from_ns || s >= query.to_ns {
-                    continue;
-                }
-                if let Some(want) = &query.operation
-                    && (op.is_null(r) || op.value(r) != want)
-                {
-                    continue;
-                }
-                let key = model.is_valid(r).then(|| model.value(r).to_owned());
-                let e = acc.entry(key.clone()).or_insert(TokenAgg {
-                    model: key,
+        let mut add = |start: i64,
+                       op: Option<&str>,
+                       model: Option<&str>,
+                       input: Option<i64>,
+                       output: Option<i64>| {
+            if start < query.from_ns || start >= query.to_ns {
+                return;
+            }
+            if let Some(want) = &query.operation
+                && op != Some(want.as_str())
+            {
+                return;
+            }
+            let e = acc
+                .entry(model.map(str::to_owned))
+                .or_insert_with(|| TokenAgg {
+                    model: model.map(str::to_owned),
                     count: 0,
                     input_tokens: 0,
                     output_tokens: 0,
                 });
-                e.count += 1;
-                if input.is_valid(r) {
-                    e.input_tokens = e.input_tokens.saturating_add(input.value(r));
-                }
-                if output.is_valid(r) {
-                    e.output_tokens = e.output_tokens.saturating_add(output.value(r));
-                }
-            }
-            Ok(())
+            e.count += 1;
+            e.input_tokens = e.input_tokens.saturating_add(input.unwrap_or(0));
+            e.output_tokens = e.output_tokens.saturating_add(output.unwrap_or(0));
         };
         let projection = [
             col::START_NS,
@@ -418,11 +415,37 @@ impl Snapshot {
                 start_ns_max: Some(query.to_ns - 1),
             })?;
             for batch in scan {
-                add(&batch?)?;
+                let batch = batch?;
+                let start: &Int64Array = column(&batch, col::START_NS)?;
+                let op: &StringArray = column(&batch, col::OPERATION)?;
+                let model: &StringArray = column(&batch, col::REQUEST_MODEL)?;
+                let input: &Int64Array = column(&batch, col::INPUT_TOKENS)?;
+                let output: &Int64Array = column(&batch, col::OUTPUT_TOKENS)?;
+                for r in 0..batch.num_rows() {
+                    add(
+                        start.value(r),
+                        op.is_valid(r).then(|| op.value(r)),
+                        model.is_valid(r).then(|| model.value(r)),
+                        input.is_valid(r).then(|| input.value(r)),
+                        output.is_valid(r).then(|| output.value(r)),
+                    );
+                }
             }
         }
-        for b in self.buffer() {
-            add(b)?;
+        let batches: Vec<&Arc<RecordBatch>> = self.buffer().collect();
+        let cols = batches
+            .iter()
+            .map(|b| SpanColumns::try_new(b))
+            .collect::<Result<Vec<_>>>()?;
+        for e in &group_traces(&cols).entries {
+            let r = cols[e.batch as usize].record(e.row as usize);
+            add(
+                r.start_ns,
+                r.operation,
+                r.request_model,
+                r.input_tokens,
+                r.output_tokens,
+            );
         }
         Ok(acc.into_values().collect())
     }

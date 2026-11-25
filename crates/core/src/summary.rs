@@ -3,7 +3,6 @@
 
 use crate::{Error, Result, SpanRecord, TraceId};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -17,8 +16,11 @@ pub struct TraceSummary {
     /// Latest span end, Unix nanoseconds.
     pub end_ns: i64,
     /// `service_name` of the root span, if there is a root and it has one.
+    /// With several roots, the one of the root with the smallest
+    /// `(name, service)` pair.
     pub root_service: Option<String>,
-    /// `name` of the root span, if there is a root.
+    /// `name` of the root span, if there is a root. With several roots, the
+    /// smallest name.
     pub root_name: Option<String>,
     /// Number of spans.
     pub span_count: u32,
@@ -30,16 +32,19 @@ pub struct TraceSummary {
     pub output_tokens: i64,
     /// Sorted distinct `request_model` values.
     pub models: Vec<String>,
-    /// First non-null `session_id` in span order.
+    /// Smallest non-null `session_id` among the spans, byte-wise.
     pub session_id: Option<String>,
-    /// First non-null `user_id` in span order.
+    /// Smallest non-null `user_id` among the spans, byte-wise.
     pub user_id: Option<String>,
 }
 
 impl TraceSummary {
     /// Merges the summary of another part of the same trace into this one.
     ///
-    /// Rules, chosen so that `a.merge(b)` and `b.merge(a)` give equal results:
+    /// A trace's summary is a function of its set of spans only, so merging
+    /// partial summaries in any order and grouping gives the summary of all
+    /// the spans together (the operation is commutative and associative).
+    /// Rules:
     ///
     /// - The trace ids must be equal, else [`Error::InvalidArgument`] and
     ///   `self` is unchanged.
@@ -48,12 +53,14 @@ impl TraceSummary {
     /// - `error` is the logical or.
     /// - `models` is the sorted distinct union.
     /// - `root_service` and `root_name` come from the summary that has a root
-    ///   (a `root_name`). If both do, from the one with the earlier
-    ///   `start_ns`; on equal starts, from the one with the smaller
-    ///   `(root_name, root_service)`.
-    /// - `session_id` and `user_id` are the first non-null value, preferring
-    ///   the summary with the earlier `start_ns`; on equal starts the smaller
-    ///   string wins.
+    ///   (a `root_name`). If both do, from the one with the smaller
+    ///   `(root_name, root_service)` pair, so they always come from one span.
+    /// - `session_id` and `user_id` are the smaller non-null value, byte-wise.
+    ///
+    /// The root rule for a malformed trace with several roots picks the
+    /// smallest name, not the earliest root. Showing the earliest root would
+    /// need the root's start time and span id stored in the summary, which
+    /// would be a new column.
     pub fn merge(&mut self, other: &TraceSummary) -> Result<()> {
         if self.trace_id != other.trace_id {
             return Err(Error::invalid_argument(format!(
@@ -61,39 +68,22 @@ impl TraceSummary {
                 other.trace_id, self.trace_id
             )));
         }
-        let other_first = match other.start_ns.cmp(&self.start_ns) {
-            Ordering::Less => Some(true),
-            Ordering::Greater => Some(false),
-            Ordering::Equal => None,
-        };
-        // Whether to take the other side's value when both are present;
-        // `tie` decides when the starts are equal.
-        let pick_other = |tie: bool| other_first.unwrap_or(tie);
-
-        match (&self.root_name, &other.root_name) {
-            (None, Some(_)) => {
-                self.root_name = other.root_name.clone();
-                self.root_service = other.root_service.clone();
-            }
-            (Some(_), Some(_)) => {
-                let tie =
-                    (&other.root_name, &other.root_service) < (&self.root_name, &self.root_service);
-                if pick_other(tie) {
-                    self.root_name = other.root_name.clone();
-                    self.root_service = other.root_service.clone();
-                }
-            }
-            _ => {}
+        if other.root_name.is_some()
+            && (self.root_name.is_none()
+                || (&other.root_name, &other.root_service) < (&self.root_name, &self.root_service))
+        {
+            self.root_name = other.root_name.clone();
+            self.root_service = other.root_service.clone();
         }
-        let first_non_null = |mine: &mut Option<String>, theirs: &Option<String>| {
+        let smaller = |mine: &mut Option<String>, theirs: &Option<String>| {
             if let Some(t) = theirs
-                && mine.as_ref().is_none_or(|m| pick_other(t < m))
+                && mine.as_ref().is_none_or(|m| t < m)
             {
                 *mine = Some(t.clone());
             }
         };
-        first_non_null(&mut self.session_id, &other.session_id);
-        first_non_null(&mut self.user_id, &other.user_id);
+        smaller(&mut self.session_id, &other.session_id);
+        smaller(&mut self.user_id, &other.user_id);
 
         self.start_ns = self.start_ns.min(other.start_ns);
         self.end_ns = self.end_ns.max(other.end_ns);
@@ -139,17 +129,12 @@ pub fn summary_schema() -> SchemaRef {
 /// OTLP `Status.StatusCode` value for an error.
 const STATUS_CODE_ERROR: i32 = 2;
 
-struct Root {
-    start_ns: i64,
-    service: Option<String>,
-    name: String,
-}
-
 struct Acc {
     trace_id: TraceId,
     start_ns: i64,
     end_ns: i64,
-    root: Option<Root>,
+    /// `(name, service)` of the smallest root so far.
+    root: Option<(String, Option<String>)>,
     span_count: u32,
     error: bool,
     input_tokens: i64,
@@ -165,13 +150,15 @@ struct Acc {
 ///
 /// - `start_ns` is the earliest span start and `end_ns` the latest span end.
 /// - The root is the span with no parent. With several, the one with the
-///   earliest start (the first pushed on a tie). With none, `root_service`
-///   and `root_name` are `None`.
+///   smallest `(name, service)` pair. With none, `root_service` and
+///   `root_name` are `None`. See [`TraceSummary::merge`] for the limit of
+///   this choice.
 /// - `error` is true if any span has a non-null `error_type` or a
 ///   `status_code` of 2.
 /// - Token sums treat null as 0 and saturate instead of overflowing.
 /// - `models` is the sorted distinct non-null `request_model` values.
-/// - `session_id` and `user_id` are the first non-null values in push order.
+/// - `session_id` and `user_id` are the smallest non-null values, so the result
+///   does not depend on push order.
 #[derive(Default)]
 pub struct SummaryBuilder {
     acc: Option<Acc>,
@@ -223,23 +210,30 @@ impl SummaryBuilder {
             .output_tokens
             .saturating_add(s.output_tokens.unwrap_or(0));
 
-        if s.parent_span_id.is_none() && acc.root.as_ref().is_none_or(|r| s.start_ns < r.start_ns) {
-            acc.root = Some(Root {
-                start_ns: s.start_ns,
-                service: s.service_name.map(str::to_owned),
-                name: s.name.to_owned(),
-            });
+        if s.parent_span_id.is_none() {
+            let cand = (s.name, s.service_name);
+            if acc
+                .root
+                .as_ref()
+                .is_none_or(|(n, v)| cand < (n.as_str(), v.as_deref()))
+            {
+                acc.root = Some((s.name.to_owned(), s.service_name.map(str::to_owned)));
+            }
         }
         if let Some(m) = s.request_model
             && !acc.models.contains(m)
         {
             acc.models.insert(m.to_owned());
         }
-        if acc.session_id.is_none() {
-            acc.session_id = s.session_id.map(str::to_owned);
-        }
-        if acc.user_id.is_none() {
-            acc.user_id = s.user_id.map(str::to_owned);
+        for (mine, theirs) in [
+            (&mut acc.session_id, s.session_id),
+            (&mut acc.user_id, s.user_id),
+        ] {
+            if let Some(t) = theirs
+                && mine.as_deref().is_none_or(|m| t < m)
+            {
+                *mine = Some(t.to_owned());
+            }
         }
         Ok(())
     }
@@ -249,7 +243,7 @@ impl SummaryBuilder {
     pub fn finish_trace(&mut self) -> Option<TraceSummary> {
         let a = self.acc.take()?;
         let (root_service, root_name) = match a.root {
-            Some(r) => (r.service, Some(r.name)),
+            Some((name, service)) => (service, Some(name)),
             None => (None, None),
         };
         Some(TraceSummary {
@@ -352,22 +346,20 @@ mod tests {
     }
 
     #[test]
-    fn two_roots_pick_the_earliest() {
-        let mut late = span(1, None, 100, 200);
-        late.name = "late";
-        let mut early = span(2, None, 10, 20);
-        early.name = "early";
-        assert_eq!(
-            summarise(&[late, early]).root_name.as_deref(),
-            Some("early")
-        );
+    fn two_roots_pick_the_smallest_pair() {
+        let mut late = span(1, None, 10, 20);
+        late.name = "b";
+        let mut early = span(2, None, 100, 200);
+        early.name = "a";
+        assert_eq!(summarise(&[late, early]).root_name.as_deref(), Some("a"));
 
-        // A tie goes to the first pushed.
+        // Same name: the smaller service, with none before any.
         let mut a = span(1, None, 10, 20);
-        a.name = "first";
+        a.service_name = Some("z");
         let mut b = span(2, None, 10, 20);
-        b.name = "second";
-        assert_eq!(summarise(&[a, b]).root_name.as_deref(), Some("first"));
+        b.service_name = Some("y");
+        let c = span(3, None, 10, 20);
+        assert_eq!(summarise(&[a, b, c]).root_service, None);
     }
 
     #[test]
@@ -422,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn session_and_user_are_first_non_null() {
+    fn session_and_user_are_smallest_non_null() {
         let mut a = span(1, None, 0, 1);
         a.user_id = Some("u1");
         let mut b = span(2, Some(1), 0, 1);
@@ -433,6 +425,9 @@ mod tests {
         let s = summarise(&[a, b, c]);
         assert_eq!(s.session_id.as_deref(), Some("s1"));
         assert_eq!(s.user_id.as_deref(), Some("u1"));
+        let mut c2 = span(3, Some(1), 0, 1);
+        c2.session_id = Some("s0");
+        assert_eq!(summarise(&[c2]).session_id.as_deref(), Some("s0"));
     }
 
     #[test]
@@ -530,15 +525,15 @@ mod tests {
     }
 
     #[test]
-    fn merge_with_two_roots_takes_the_earlier_one() {
-        let early = full(1, 10, Some(("early", None)));
-        let late = full(1, 20, Some(("late", Some("svc"))));
+    fn merge_with_two_roots_takes_the_smallest_pair() {
+        let early = full(1, 10, Some(("b", None)));
+        let late = full(1, 20, Some(("a", Some("svc"))));
         let m = merged(&early, &late);
-        // The service is the early root's, which has none.
-        assert_eq!(m.root_name.as_deref(), Some("early"));
-        assert_eq!(m.root_service, None);
+        // The service is that of the root that won the name.
+        assert_eq!(m.root_name.as_deref(), Some("a"));
+        assert_eq!(m.root_service.as_deref(), Some("svc"));
 
-        // Equal starts: the smaller (name, service) wins in either order.
+        // The smaller (name, service) wins in either order.
         let a = full(1, 10, Some(("a", Some("z"))));
         let b = full(1, 10, Some(("b", Some("a"))));
         assert_eq!(merged(&a, &b).root_name.as_deref(), Some("a"));
@@ -547,18 +542,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_session_and_user_prefer_the_earlier_summary() {
+    fn merge_session_and_user_take_the_smaller() {
         let mut early = full(1, 10, None);
-        early.session_id = Some("s-early".into());
+        early.session_id = Some("s-b".into());
         let mut late = full(1, 20, None);
-        late.session_id = Some("s-late".into());
+        late.session_id = Some("s-a".into());
         late.user_id = Some("u-late".into());
         let m = merged(&early, &late);
-        // Session from the earlier summary, user from the only one that has it.
-        assert_eq!(m.session_id.as_deref(), Some("s-early"));
+        // Smaller session, and the user from the only one that has it.
+        assert_eq!(m.session_id.as_deref(), Some("s-a"));
         assert_eq!(m.user_id.as_deref(), Some("u-late"));
 
-        // Equal starts: the smaller string, in either order.
+        // The smaller string, in either order.
         let mut a = full(1, 10, None);
         a.user_id = Some("b".into());
         let mut b = full(1, 10, None);
@@ -577,5 +572,94 @@ mod tests {
         other.trace_id = TraceId([8; 16]);
         assert!(matches!(b.push(&other), Err(Error::InvalidArgument(_))));
         assert_eq!(b.finish_trace().unwrap().span_count, 1);
+    }
+
+    /// Seeded generator: traces with several roots, missing and conflicting
+    /// session and user ids, and equal start times.
+    fn random_spans(rng: &mut impl rand::Rng) -> Vec<SpanRecord<'static>> {
+        const NAMES: [&str; 3] = ["a", "b", "c"];
+        const SERVICES: [Option<&str>; 3] = [None, Some("x"), Some("y")];
+        const IDS: [Option<&str>; 4] = [None, Some("p"), Some("q"), Some("")];
+        const MODELS: [Option<&str>; 3] = [None, Some("m1"), Some("m2")];
+        let n = rng.random_range(1..=7u8);
+        (0..n)
+            .map(|i| {
+                let mut s = span(
+                    i + 1,
+                    if rng.random_bool(0.4) { None } else { Some(99) },
+                    rng.random_range(0..3),
+                    rng.random_range(3..6),
+                );
+                s.name = NAMES[rng.random_range(0..3)];
+                s.service_name = SERVICES[rng.random_range(0..3)];
+                s.session_id = IDS[rng.random_range(0..4)];
+                s.user_id = IDS[rng.random_range(0..4)];
+                s.request_model = MODELS[rng.random_range(0..3)];
+                s.input_tokens = rng.random_bool(0.5).then(|| rng.random_range(0..9));
+                s.status_code = rng.random_range(0..3);
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn summary_is_a_function_of_the_span_set() {
+        use rand::seq::SliceRandom;
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5eed);
+        for _ in 0..2000 {
+            let mut spans = random_spans(&mut rng);
+            let want = summarise(&spans);
+
+            // Any order of the spans.
+            spans.shuffle(&mut rng);
+            assert_eq!(summarise(&spans), want, "order changed the summary");
+
+            // Any partition into parts, merged in any order and grouping.
+            let parts = rng.random_range(1..=spans.len());
+            let mut groups: Vec<Vec<SpanRecord<'_>>> = (0..parts).map(|_| Vec::new()).collect();
+            for (i, s) in spans.iter().enumerate() {
+                // The first `parts` spans make sure no group is empty.
+                let g = if i < parts {
+                    i
+                } else {
+                    rng.random_range(0..parts)
+                };
+                groups[g].push(*s);
+            }
+            let mut partials: Vec<TraceSummary> = groups.iter().map(|g| summarise(g)).collect();
+            partials.shuffle(&mut rng);
+            // Left fold.
+            let mut left = partials[0].clone();
+            for p in &partials[1..] {
+                left.merge(p).unwrap();
+            }
+            assert_eq!(left, want, "partition changed the summary");
+            // Random pairwise grouping.
+            while partials.len() > 1 {
+                let b = partials.swap_remove(rng.random_range(0..partials.len()));
+                let i = rng.random_range(0..partials.len());
+                partials[i].merge(&b).unwrap();
+            }
+            assert_eq!(partials[0], want, "grouping changed the summary");
+        }
+    }
+
+    #[test]
+    fn merge_is_associative_and_commutative() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..2000 {
+            let a = summarise(&random_spans(&mut rng));
+            let b = summarise(&random_spans(&mut rng));
+            let c = summarise(&random_spans(&mut rng));
+            let m = |x: &TraceSummary, y: &TraceSummary| {
+                let mut x = x.clone();
+                x.merge(y).unwrap();
+                x
+            };
+            assert_eq!(m(&a, &b), m(&b, &a));
+            assert_eq!(m(&m(&a, &b), &c), m(&a, &m(&b, &c)));
+        }
     }
 }

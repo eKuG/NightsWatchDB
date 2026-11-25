@@ -162,15 +162,27 @@ does not block, and is not blocked by, ingest or flush.
   and one summary row-group read per extra part that holds the trace;
   candidates' summaries are held in memory, and the buffer is summarised on
   every call.
-- `aggregate_tokens`: a pruned scan of five columns per part and a scan of the
-  buffer.
+- `aggregate_tokens`: a pruned scan of five columns per part, and the buffers
+  (frozen and active together, as one set) grouped by `group_traces`, the same
+  routine `list_traces` uses, so a span id seen twice for one trace in the
+  buffers is counted once and the three queries agree inside one snapshot.
+
+A trace's summary is a function of its set of spans only: merging partial
+summaries in any order gives the same result as summarising all the spans at
+once. `session_id` and `user_id` are the smallest non-null value among the
+spans, and the root fields come from the root with the smallest `(name,
+service)`. A malformed trace with several roots therefore shows the smallest
+root, not the earliest.
 
 ## Known limits
 
-- Duplicate spans that landed in different parts (a sender retry that crossed
-  a flush) are removed by `get_trace` but still counted by `list_traces`
-  (`span_count`, token sums) and `aggregate_tokens`. Within one flush they are
-  removed. The compactor will remove the rest.
+- Duplicate spans (same trace id and span id) are removed only among the rows
+  that are in the buffers (the frozen and the active one together) at the
+  moment of a query, and within one flush. A duplicate that landed in a part and
+  again in the buffers, or in two different parts (a sender retry that crossed
+  a flush), is removed by `get_trace` but still counted by `list_traces`
+  (`span_count`, token sums) and `aggregate_tokens`. The compactor will remove
+  the rest.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few

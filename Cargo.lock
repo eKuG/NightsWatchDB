@@ -786,6 +786,7 @@ version = "0.0.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "rand",
  "serde",
  "serde_json",
  "thiserror",

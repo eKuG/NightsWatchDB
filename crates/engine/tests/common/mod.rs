@@ -37,6 +37,8 @@ pub struct TSpan {
     pub input: Option<i64>,
     pub output: Option<i64>,
     pub error_type: Option<String>,
+    pub session: Option<String>,
+    pub user: Option<String>,
     pub attrs: Vec<u8>,
 }
 
@@ -56,6 +58,8 @@ impl TSpan {
             input: None,
             output: None,
             error_type: None,
+            session: None,
+            user: None,
             attrs: Vec::new(),
         }
     }
@@ -119,6 +123,8 @@ pub fn encode(spans: &[TSpan]) -> Vec<u8> {
         put_opt_i64(&mut out, s.input);
         put_opt_i64(&mut out, s.output);
         put_opt_str(&mut out, &s.error_type);
+        put_opt_str(&mut out, &s.session);
+        put_opt_str(&mut out, &s.user);
         out.extend((s.attrs.len() as u32).to_le_bytes());
         out.extend(&s.attrs);
     }
@@ -191,6 +197,8 @@ pub fn decode_spans(bytes: &[u8]) -> Result<Vec<TSpan>> {
         let input = r.opt_i64()?;
         let output = r.opt_i64()?;
         let error_type = r.opt_str()?;
+        let session = r.opt_str()?;
+        let user = r.opt_str()?;
         let alen = r.u32()? as usize;
         let attrs = r.take(alen)?.to_vec();
         out.push(TSpan {
@@ -207,6 +215,8 @@ pub fn decode_spans(bytes: &[u8]) -> Result<Vec<TSpan>> {
             input,
             output,
             error_type,
+            session,
+            user,
             attrs,
         });
     }
@@ -234,6 +244,8 @@ pub fn to_batches(spans: &[TSpan]) -> Vec<RecordBatch> {
             input_tokens: s.input,
             output_tokens: s.output,
             error_type: s.error_type.as_deref(),
+            session_id: s.session.as_deref(),
+            user_id: s.user.as_deref(),
             attrs: &s.attrs,
             ..SpanRecord::default()
         });
@@ -266,6 +278,8 @@ pub fn from_batches(batches: &[RecordBatch]) -> Vec<TSpan> {
                 input: r.input_tokens,
                 output: r.output_tokens,
                 error_type: r.error_type.map(str::to_owned),
+                session: r.session_id.map(str::to_owned),
+                user: r.user_id.map(str::to_owned),
                 attrs: r.attrs.to_vec(),
             });
         }
@@ -342,26 +356,43 @@ impl Model {
         self.spans.iter().map(|s| s.trace).collect()
     }
 
+    /// Every span once per `(trace, span id)`, the first copy sent. Retries
+    /// are exact copies in the tests, and they only happen where the engine
+    /// promises to remove them (see `Engine` docs: same buffers), so the
+    /// model removes them everywhere.
+    pub fn unique(&self) -> Vec<&TSpan> {
+        let mut seen = BTreeSet::new();
+        self.spans
+            .iter()
+            .filter(|s| seen.insert((s.trace, s.span)))
+            .collect()
+    }
+
     /// The spans of a trace, ordered by (start, span id), one per span id.
     pub fn get_trace(&self, trace: u128) -> Vec<TSpan> {
-        let mut seen = BTreeSet::new();
         let mut v: Vec<TSpan> = self
-            .spans
-            .iter()
-            .filter(|s| s.trace == trace && seen.insert(s.span))
+            .unique()
+            .into_iter()
+            .filter(|s| s.trace == trace)
             .cloned()
             .collect();
         v.sort_by_key(|s| (s.start, s.span));
         v
     }
 
-    /// One summary per trace. Assumes each trace has at most one root, which
-    /// is what the tests generate.
+    /// One summary per trace, by the documented rules: session and user are
+    /// the smallest non-null value, the root is the root with the smallest
+    /// `(name, service)` pair.
     pub fn summaries(&self) -> BTreeMap<u128, TraceSummary> {
         let mut out = BTreeMap::new();
         for t in self.trace_ids() {
             let spans = self.get_trace(t);
-            let root = spans.iter().find(|s| s.parent.is_none());
+            let root = spans
+                .iter()
+                .filter(|s| s.parent.is_none())
+                .min_by_key(|s| (&s.name, &s.service));
+            let smallest =
+                |f: fn(&TSpan) -> &Option<String>| spans.iter().filter_map(|s| f(s).clone()).min();
             let mut models: Vec<String> = spans.iter().filter_map(|s| s.model.clone()).collect();
             models.sort();
             models.dedup();
@@ -380,8 +411,8 @@ impl Model {
                     input_tokens: spans.iter().filter_map(|s| s.input).sum(),
                     output_tokens: spans.iter().filter_map(|s| s.output).sum(),
                     models,
-                    session_id: None,
-                    user_id: None,
+                    session_id: smallest(|s| &s.session),
+                    user_id: smallest(|s| &s.user),
                 },
             );
         }
@@ -412,7 +443,7 @@ impl Model {
 
     pub fn agg(&self, q: &AggQuery) -> Vec<TokenAgg> {
         let mut m: BTreeMap<Option<String>, TokenAgg> = BTreeMap::new();
-        for s in &self.spans {
+        for s in self.unique() {
             if s.start < q.from_ns || s.start >= q.to_ns {
                 continue;
             }
@@ -458,11 +489,55 @@ impl Model {
             error: None,
             limit: usize::MAX,
         };
-        assert_eq!(
-            snap.list_traces(&all).unwrap(),
-            self.list(&all),
-            "{what}: list all"
-        );
+        let listed = snap.list_traces(&all).unwrap();
+        let want = self.list(&all);
+        assert_eq!(listed.len(), want.len(), "{what}: list all, trace count");
+        for (got, want) in listed.iter().zip(&want) {
+            assert_eq!(got.trace_id, want.trace_id, "{what}: list all, order");
+            assert_eq!(
+                got.start_ns, want.start_ns,
+                "{what}: {} start",
+                got.trace_id
+            );
+            assert_eq!(got.end_ns, want.end_ns, "{what}: {} end", got.trace_id);
+            assert_eq!(
+                got.root_service, want.root_service,
+                "{what}: {} root_service",
+                got.trace_id
+            );
+            assert_eq!(
+                got.root_name, want.root_name,
+                "{what}: {} root_name",
+                got.trace_id
+            );
+            assert_eq!(
+                got.span_count, want.span_count,
+                "{what}: {} span_count",
+                got.trace_id
+            );
+            assert_eq!(got.error, want.error, "{what}: {} error", got.trace_id);
+            assert_eq!(
+                got.input_tokens, want.input_tokens,
+                "{what}: {} input",
+                got.trace_id
+            );
+            assert_eq!(
+                got.output_tokens, want.output_tokens,
+                "{what}: {} output",
+                got.trace_id
+            );
+            assert_eq!(got.models, want.models, "{what}: {} models", got.trace_id);
+            assert_eq!(
+                got.session_id, want.session_id,
+                "{what}: {} session_id",
+                got.trace_id
+            );
+            assert_eq!(
+                got.user_id, want.user_id,
+                "{what}: {} user_id",
+                got.trace_id
+            );
+        }
         assert_eq!(
             snap.aggregate_tokens(&AggQuery {
                 from_ns: i64::MIN,
