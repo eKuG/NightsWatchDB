@@ -6,7 +6,7 @@ set -eu
 NAME=$1; BZ=$2; LIFE=${3:-30s}; shift 3 || shift $#
 DOORFLAGS=${*:---decode full --wal /wal --exit-after-idle-s 12}
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${OUT:-/tmp/nightwatchdb-expC-otap}
+OUT=${OUT:-/tmp/nightswatchdb-expC-otap}
 mkdir -p "$OUT"
 for v in expC-otap-data expC-otap-wal; do docker volume create $v >/dev/null; done
 docker rm -f expc-otap-door expc-otap-collector >/dev/null 2>&1 || true

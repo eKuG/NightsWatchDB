@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# The experiments are standalone packages and keep building on their own.
+exclude = ["experiments"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/eKuG/NightsWatchDB"
+publish = false
+rust-version = "1.100"
+
+[workspace.dependencies]
+# arrow and parquet must always move together: every arrow-* crate and any
+# future parquet crate must be pinned to the same version, and bumped in one
+# commit.
+arrow-array = "=60.2.0"
+arrow-schema = "=60.2.0"
+
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+thiserror = "=2.0.17"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

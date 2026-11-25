@@ -18,7 +18,7 @@ engine was written. They are not benchmarks of a finished product.
 
 - Warm caches and a virtualised local disk. The cache-dropping step did not
   produce truly cold reads on this machine. Object storage will be slower.
-- The NightwatchDB side was experiment code timed in-process, one query at a
+- The NightsWatchDB side was experiment code timed in-process, one query at a
   time, with files and metadata already open. ClickHouse is a complete server
   parsing and planning SQL. Part of every sub-millisecond gap is that.
 - ClickHouse ran the exporter's schema as shipped. A schema tuned for this

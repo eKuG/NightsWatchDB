@@ -1,0 +1,207 @@
+//! The span table.
+//!
+//! One row per span. The columns are, in order:
+//!
+//! 1. The span itself: `trace_id`, `span_id`, `parent_span_id`, `name`,
+//!    `kind`, `start_ns`, `end_ns`, `status_code`, `status_message`,
+//!    `trace_state`, `flags`.
+//! 2. Where it came from: `service_name`, `scope_name`, `scope_version`.
+//! 3. Promoted fields (all nullable): `operation`, `provider`,
+//!    `request_model`, `response_model`, `input_tokens`, `output_tokens`,
+//!    `conversation_id`, `session_id`, `user_id`, `agent_name`, `tool_name`,
+//!    `error_type`.
+//! 4. The raw, lossless parts (`LargeBinary`): `resource`, `attrs`, `events`,
+//!    `links`.
+//! 5. `dropped_attributes_count`, `dropped_events_count`,
+//!    `dropped_links_count`.
+//!
+//! # Promoted columns
+//!
+//! The promoted columns are copies of well-known attributes (model name,
+//! token counts, session id and so on) made at ingest so that common queries
+//! do not have to decode `attrs`. `attrs` always keeps the originals, under
+//! the names the sender used; a promoted column is never the only place a
+//! value lives.
+//!
+//! # Encoding of the raw columns
+//!
+//! `attrs`, `events` and `links` are each a concatenation of the original OTLP
+//! messages, in the order received:
+//!
+//! | Column   | Message repeated                         |
+//! |----------|------------------------------------------|
+//! | `attrs`  | `opentelemetry.proto.common.v1.KeyValue` |
+//! | `events` | `opentelemetry.proto.trace.v1.Span.Event`|
+//! | `links`  | `opentelemetry.proto.trace.v1.Span.Link` |
+//!
+//! Each message is preceded by its length in bytes as a protobuf varint
+//! (the same framing as length-delimited protobuf streams). An empty list is
+//! zero bytes. `events` and `links` are null when the span had none and may
+//! also be zero bytes; both mean "empty". `attrs` is never null.
+//!
+//! `resource` is the serialized OTLP `Resource` message exactly as received
+//! (no length prefix), or null if the sender sent none.
+//!
+//! Core does not parse these bytes; the ingest crates write them and the
+//! query layer reads them.
+
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use std::sync::{Arc, OnceLock};
+
+macro_rules! columns {
+    ($($id:ident = $name:literal),* $(,)?) => {
+        $(
+            #[doc = concat!("The `", $name, "` column.")]
+            pub const $id: &str = $name;
+        )*
+    };
+}
+
+/// Column names of the span table.
+pub mod col {
+    columns! {
+        TRACE_ID = "trace_id",
+        SPAN_ID = "span_id",
+        PARENT_SPAN_ID = "parent_span_id",
+        NAME = "name",
+        KIND = "kind",
+        START_NS = "start_ns",
+        END_NS = "end_ns",
+        STATUS_CODE = "status_code",
+        STATUS_MESSAGE = "status_message",
+        TRACE_STATE = "trace_state",
+        FLAGS = "flags",
+        SERVICE_NAME = "service_name",
+        SCOPE_NAME = "scope_name",
+        SCOPE_VERSION = "scope_version",
+        OPERATION = "operation",
+        PROVIDER = "provider",
+        REQUEST_MODEL = "request_model",
+        RESPONSE_MODEL = "response_model",
+        INPUT_TOKENS = "input_tokens",
+        OUTPUT_TOKENS = "output_tokens",
+        CONVERSATION_ID = "conversation_id",
+        SESSION_ID = "session_id",
+        USER_ID = "user_id",
+        AGENT_NAME = "agent_name",
+        TOOL_NAME = "tool_name",
+        ERROR_TYPE = "error_type",
+        RESOURCE = "resource",
+        ATTRS = "attrs",
+        EVENTS = "events",
+        LINKS = "links",
+        DROPPED_ATTRIBUTES_COUNT = "dropped_attributes_count",
+        DROPPED_EVENTS_COUNT = "dropped_events_count",
+        DROPPED_LINKS_COUNT = "dropped_links_count",
+    }
+}
+
+/// The Arrow schema of the span table. Built once and shared.
+pub fn span_schema() -> SchemaRef {
+    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+    SCHEMA.get_or_init(build).clone()
+}
+
+fn build() -> SchemaRef {
+    use DataType::*;
+    let f = |name: &str, ty: DataType, nullable: bool| Field::new(name, ty, nullable);
+    Arc::new(Schema::new(vec![
+        f(col::TRACE_ID, FixedSizeBinary(16), false),
+        f(col::SPAN_ID, FixedSizeBinary(8), false),
+        f(col::PARENT_SPAN_ID, FixedSizeBinary(8), true),
+        f(col::NAME, Utf8, false),
+        f(col::KIND, Int32, false),
+        f(col::START_NS, Int64, false),
+        f(col::END_NS, Int64, false),
+        f(col::STATUS_CODE, Int32, false),
+        f(col::STATUS_MESSAGE, Utf8, true),
+        f(col::TRACE_STATE, Utf8, true),
+        f(col::FLAGS, UInt32, false),
+        f(col::SERVICE_NAME, Utf8, true),
+        f(col::SCOPE_NAME, Utf8, true),
+        f(col::SCOPE_VERSION, Utf8, true),
+        f(col::OPERATION, Utf8, true),
+        f(col::PROVIDER, Utf8, true),
+        f(col::REQUEST_MODEL, Utf8, true),
+        f(col::RESPONSE_MODEL, Utf8, true),
+        f(col::INPUT_TOKENS, Int64, true),
+        f(col::OUTPUT_TOKENS, Int64, true),
+        f(col::CONVERSATION_ID, Utf8, true),
+        f(col::SESSION_ID, Utf8, true),
+        f(col::USER_ID, Utf8, true),
+        f(col::AGENT_NAME, Utf8, true),
+        f(col::TOOL_NAME, Utf8, true),
+        f(col::ERROR_TYPE, Utf8, true),
+        f(col::RESOURCE, LargeBinary, true),
+        f(col::ATTRS, LargeBinary, false),
+        f(col::EVENTS, LargeBinary, true),
+        f(col::LINKS, LargeBinary, true),
+        f(col::DROPPED_ATTRIBUTES_COUNT, UInt32, false),
+        f(col::DROPPED_EVENTS_COUNT, UInt32, false),
+        f(col::DROPPED_LINKS_COUNT, UInt32, false),
+    ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins name, type and nullability of every column, in order. If this
+    /// fails the on-disk format changed; that needs a format version bump.
+    #[test]
+    fn golden_span_schema() {
+        let got: Vec<String> = span_schema()
+            .fields()
+            .iter()
+            .map(|f| {
+                format!(
+                    "{}:{}:{}",
+                    f.name(),
+                    f.data_type(),
+                    if f.is_nullable() { "null" } else { "required" }
+                )
+            })
+            .collect();
+        let want = [
+            "trace_id:FixedSizeBinary(16):required",
+            "span_id:FixedSizeBinary(8):required",
+            "parent_span_id:FixedSizeBinary(8):null",
+            "name:Utf8:required",
+            "kind:Int32:required",
+            "start_ns:Int64:required",
+            "end_ns:Int64:required",
+            "status_code:Int32:required",
+            "status_message:Utf8:null",
+            "trace_state:Utf8:null",
+            "flags:UInt32:required",
+            "service_name:Utf8:null",
+            "scope_name:Utf8:null",
+            "scope_version:Utf8:null",
+            "operation:Utf8:null",
+            "provider:Utf8:null",
+            "request_model:Utf8:null",
+            "response_model:Utf8:null",
+            "input_tokens:Int64:null",
+            "output_tokens:Int64:null",
+            "conversation_id:Utf8:null",
+            "session_id:Utf8:null",
+            "user_id:Utf8:null",
+            "agent_name:Utf8:null",
+            "tool_name:Utf8:null",
+            "error_type:Utf8:null",
+            "resource:LargeBinary:null",
+            "attrs:LargeBinary:required",
+            "events:LargeBinary:null",
+            "links:LargeBinary:null",
+            "dropped_attributes_count:UInt32:required",
+            "dropped_events_count:UInt32:required",
+            "dropped_links_count:UInt32:required",
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn schema_is_shared() {
+        assert!(Arc::ptr_eq(&span_schema(), &span_schema()));
+    }
+}

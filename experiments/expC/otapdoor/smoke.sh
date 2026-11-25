@@ -8,7 +8,7 @@ set -eu
 NAME=$1; TG=$2; LIFE=${3:-30s}; shift 3 || shift $#
 DOORFLAGS=${*:---decode full --wal /wal}
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${OUT:-/tmp/nightwatchdb-expC-otap}
+OUT=${OUT:-/tmp/nightswatchdb-expC-otap}
 CORPUS=$(cd "$(dirname "$0")/../../.." && pwd)/.data/corpus
 mkdir -p "$OUT"
 for v in expC-otap-data expC-otap-wal; do docker volume create $v >/dev/null; done

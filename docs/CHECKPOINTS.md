@@ -23,5 +23,7 @@ its tests pass in a Linux container, it is committed, tagged
 | 14 | Entity graph | |
 | 15 | Profiles | |
 
+Checkpoint 1 so far: the Cargo workspace and `nwdb-core` exist.
+
 Benchmarks against the baseline are re-run when a checkpoint changes the
 write or read path, and added to [benchmarks](benchmarks/README.md).

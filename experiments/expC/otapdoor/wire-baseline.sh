@@ -6,7 +6,7 @@
 set -eu
 NAME=$1; TG=$2
 HERE=$(cd "$(dirname "$0")" && pwd)
-OUT=${OUT:-/tmp/nightwatchdb-expC-otap}
+OUT=${OUT:-/tmp/nightswatchdb-expC-otap}
 CORPUS=$(cd "$(dirname "$0")/../../.." && pwd)/.data/corpus
 docker rm -f expc-otap-sink expc-otap-collector >/dev/null 2>&1 || true
 docker run -d --name expc-otap-sink --network expc-otap-net -v "$HERE/collector/sink.yaml:/etc/otelcol/config.yaml:ro" \

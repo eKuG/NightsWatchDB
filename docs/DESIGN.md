@@ -1,6 +1,6 @@
 # Design
 
-This document states what NightwatchDB is, the choices that shape it, and why
+This document states what NightsWatchDB is, the choices that shape it, and why
 each was made. Where a choice was tested, the experiment is named; the
 measurements are in [benchmarks](benchmarks/README.md).
 
@@ -98,7 +98,7 @@ A crate may depend only on crates in lower layers.
 
 | Layer | Crates |
 |---|---|
-| 5 | `nightwatchdb` (the binary) |
+| 5 | `nightswatchdb` (the binary) |
 | 4 | `nwdb-sql` (the only crate that uses the SQL engine; optional) |
 | 3 | `nwdb-engine`, `nwdb-otlp`, `nwdb-otap` |
 | 2 | `nwdb-manifest`, later: summaries, entity graph |

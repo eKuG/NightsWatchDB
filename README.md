@@ -1,4 +1,4 @@
-# NightwatchDB
+# NightsWatchDB
 
 A self-hosted database for OpenTelemetry data, built first for LLM and agent
 traces. One binary, written in Rust, storing data on a local disk or an object
@@ -17,7 +17,7 @@ conversation so far. On public agent traces, 92 to 97% of the text in a call is
 an exact repeat of an earlier call in the same trace. A span is tens of
 kilobytes, a trace is megabytes, and almost all of it is repetition.
 
-NightwatchDB is built around that shape:
+NightsWatchDB is built around that shape:
 
 - **A trace's spans are stored next to each other**, in time-windowed immutable
   segments, with a small trace index and a one-row-per-trace summary. Opening a
@@ -39,7 +39,7 @@ container with 2 CPUs and 4 GB. ClickHouse was loaded through the
 OpenTelemetry Collector with the exporter's own schema, unchanged, as the
 baseline.
 
-| | NightwatchDB design | ClickHouse baseline |
+| | NightsWatchDB design | ClickHouse baseline |
 |---|---|---|
 | 8 GB of agent-trace text, stored | 62 MB text + 4 MB span tables | 496 MB |
 | ... with a text index | + 24 MB | + 119 MB index and a second copy of the text |
@@ -52,7 +52,7 @@ baseline.
 Every query returned identical results on both sides.
 
 **Read these numbers with care.** They come from Docker on a laptop with warm
-caches. The NightwatchDB side was experiment code timed in-process with files
+caches. The NightsWatchDB side was experiment code timed in-process with files
 already open; ClickHouse is a complete server parsing SQL. ClickHouse ran the
 exporter's schema as shipped, and a schema tuned for this workload would close
 much of the list and aggregate gap. The numbers were good enough to commit to
