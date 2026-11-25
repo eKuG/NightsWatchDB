@@ -634,7 +634,7 @@ fn leftover_part_directories_are_removed_and_ids_are_not_reused() {
 }
 
 #[test]
-fn a_deleted_log_is_renumbered_above_the_manifest_position() {
+fn a_deleted_log_is_renumbered_above_the_manifest_position_when_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let e = open(opts(dir.path()));
     let mut m = Model::default();
@@ -649,7 +649,9 @@ fn a_deleted_log_is_renumbered_above_the_manifest_position() {
     assert_eq!(manifest_state(dir.path()).wal_flushed_lsn, 100);
     std::fs::remove_dir_all(dir.path().join("wal")).unwrap();
 
-    let e = open(opts(dir.path()));
+    let mut o = opts(dir.path());
+    o.accept_lost_log = true;
+    let e = open(o.clone());
     m.check(&e, "after losing the log");
     for t in 100..103u128 {
         let s = sample(t + 1, 100);
@@ -682,6 +684,7 @@ fn a_log_that_starts_too_late_refuses_to_start() {
         WalOptions {
             sync: SyncMode::None,
             min_next_lsn: Some(3),
+            allow_lost_log: true,
             ..WalOptions::default()
         },
     )

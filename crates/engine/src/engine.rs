@@ -2,10 +2,9 @@
 //! threads, and shutdown.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -16,7 +15,8 @@ use nwdb_core::{
     TraceSummary,
 };
 use nwdb_manifest::{
-    Edit, Manifest, ManifestOptions, OpenMode, highest_part_dir_id, unreferenced_part_dirs,
+    Edit, Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id,
+    unreferenced_part_dirs,
 };
 use nwdb_segment::PartReader;
 use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
@@ -29,9 +29,10 @@ use crate::query::{AggQuery, ListQuery, Snapshot, TokenAgg};
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Settings for [`Engine::open`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct EngineOptions {
-    /// The data directory. It holds `LOCK`, `manifest/`, `parts/` and `wal/`.
+    /// The data directory, which the engine locks exclusively. It holds
+    /// `manifest/`, `parts/` and `wal/`.
     pub data_dir: PathBuf,
     /// Create the data directory and an empty database if there is none.
     /// When false, a missing database is [`Error::NotFound`]. Default true.
@@ -56,11 +57,84 @@ pub struct EngineOptions {
     /// [`Engine::ingest`] returns `Unavailable` while the log holds more than
     /// this many bytes of records not yet durable. Default 256 MiB.
     pub max_wal_pending_bytes: u64,
-    /// Settings of the write-ahead log. The engine overrides `min_next_lsn`.
+    /// Settings of the write-ahead log. The engine overrides `min_next_lsn`
+    /// and `allow_lost_log`.
     pub wal: WalOptions,
     /// Byte and row bounds of the batches built for parts and for query
     /// results.
     pub batch_limits: BatchLimits,
+    /// What to do when the log ends below the position the manifest records:
+    /// log files were lost, and the records acknowledged after the last flush
+    /// are gone. By default `open` returns [`Error::Corrupt`], naming the
+    /// missing records, and changes nothing. When true, it starts a new log
+    /// above the position and carries on, **accepting that loss**. A new
+    /// database is never refused. Default false.
+    pub accept_lost_log: bool,
+    /// A test facility, in the manner of the log's `sync_hook`: called at each
+    /// [`Stage`] of start-up and of a flush. An error it returns at a stage
+    /// before the manifest commit is handled exactly as if that step had
+    /// failed with that error; at a stage after the commit the return value
+    /// is ignored. A panic in it before the commit is a fatal flush error.
+    /// Leave it `None` outside tests.
+    pub stage_hook: Option<StageHook>,
+}
+
+/// The type of [`EngineOptions::stage_hook`].
+pub type StageHook = Arc<dyn Fn(Stage) -> Result<()> + Send + Sync>;
+
+/// A point of start-up or of a flush, for [`EngineOptions::stage_hook`]. A
+/// test facility: the names and the points may change with the engine.
+///
+/// The open stages are called in the order listed; the first is before the
+/// first change to `manifest/` and `parts/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// Every check that can refuse the start has passed.
+    OpenChecked,
+    /// The first manifest version exists if the database is new, and part ids
+    /// on disk are below `next_part_id`.
+    IdsRaised,
+    /// The log was replayed (including any flushes it needed).
+    ReplayFinished,
+    /// Part directories the manifest does not reference were deleted.
+    LeftoversDeleted,
+    /// A flush froze the buffer. Nothing is written yet.
+    FlushFrozen,
+    /// A flush finished one part and opened it; called once per part.
+    PartWritten,
+    /// All parts are written and open, before the manifest commit.
+    AllPartsWritten,
+    /// The manifest commit returned, before the parts are published to
+    /// queries.
+    Committed,
+    /// The parts are visible to queries and the frozen buffer is gone, before
+    /// the log is trimmed.
+    Published,
+    /// The log was trimmed (only in a flush that trims).
+    Trimmed,
+}
+
+/// Calls the hook, if there is one.
+pub(crate) fn run_hook(hook: &Option<StageHook>, stage: Stage) -> Result<()> {
+    hook.as_ref().map_or(Ok(()), |h| h(stage))
+}
+
+impl std::fmt::Debug for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineOptions")
+            .field("data_dir", &self.data_dir)
+            .field("create_if_missing", &self.create_if_missing)
+            .field("window_ns", &self.window_ns)
+            .field("buffer_bytes", &self.buffer_bytes)
+            .field("max_buffered_bytes", &self.max_buffered_bytes)
+            .field("flush_interval", &self.flush_interval)
+            .field("max_wal_pending_bytes", &self.max_wal_pending_bytes)
+            .field("wal", &self.wal)
+            .field("batch_limits", &self.batch_limits)
+            .field("accept_lost_log", &self.accept_lost_log)
+            .field("stage_hook", &self.stage_hook.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
 }
 
 impl EngineOptions {
@@ -78,6 +152,8 @@ impl EngineOptions {
             max_wal_pending_bytes: 256 * 1024 * 1024,
             wal: WalOptions::default(),
             batch_limits: BatchLimits::DEFAULT,
+            accept_lost_log: false,
+            stage_hook: None,
         }
     }
 }
@@ -184,7 +260,9 @@ pub(crate) struct Inner {
     pub flush_gate: Mutex<()>,
     lock_file: Mutex<Option<File>>,
     threads: Mutex<Threads>,
-    shut_down: AtomicBool,
+    /// Held for the whole of `shutdown`, so a second caller waits for the
+    /// first; true once shutdown has finished or is under way.
+    shut_down: Mutex<bool>,
 }
 
 /// The two engine threads, until shutdown takes them.
@@ -239,24 +317,42 @@ impl Engine {
     /// `decoders` maps the one-byte tag that precedes every log record to the
     /// decoder that turns such a record back into span batches.
     ///
-    /// Start-up order, each step before the next: lock the directory
-    /// (`Conflict` if another engine holds it), open the manifest (never
-    /// treating a missing manifest next to part directories as an empty
-    /// database), make part ids unreusable, delete unreferenced parts, open
-    /// every live part, open the log and check it reaches back to the
-    /// manifest's position, replay the log into the buffer, and only then
-    /// start the threads. A log record with an unknown tag or that does not
-    /// decode is [`Error::Corrupt`] and stops start-up.
+    /// Nothing under `manifest/` or `parts/` is created, committed, renamed
+    /// or deleted until every check that can refuse the start has passed.
+    /// Start-up order, each step before the next: validate the arguments;
+    /// create the data directory if allowed and lock it (`Conflict` if
+    /// another engine holds it); read the manifest without changing it
+    /// (never treating a missing manifest next to part directories as an
+    /// empty database) and open every live part; open the log and check it
+    /// reaches back to the manifest's position (`Corrupt` if it does not, or
+    /// if it ends below it, see [`EngineOptions::accept_lost_log`]); only
+    /// then create the first manifest version of a new database and make
+    /// part ids unreusable; replay the log into the buffer; delete the part
+    /// directories the manifest does not reference; and start the threads. A
+    /// log record with an unknown tag or that does not decode is
+    /// [`Error::Corrupt`] and stops start-up.
     pub fn open(
         options: EngineOptions,
         decoders: Vec<(u8, Arc<dyn RecordDecoder>)>,
     ) -> Result<Engine> {
+        // 0. Arguments, before the disk is touched.
         if options.window_ns <= 0 {
             return Err(Error::invalid_argument("window_ns must be positive"));
         }
         if options.buffer_bytes == 0 {
             return Err(Error::invalid_argument("buffer_bytes must be positive"));
         }
+        let mut decoder_map = HashMap::new();
+        for (tag, d) in decoders {
+            if decoder_map.insert(tag, d).is_some() {
+                return Err(Error::invalid_argument(format!(
+                    "two decoders registered for tag {tag}"
+                )));
+            }
+        }
+
+        // 1. The directory and its lock. The lock is on the directory itself,
+        // so deleting or replacing a file inside it cannot bypass it.
         let dir = options.data_dir.clone();
         if !dir.is_dir() {
             if !options.create_if_missing {
@@ -274,13 +370,7 @@ impl Engine {
                 });
             }
         }
-
-        // 1. The lock comes before anything else is opened or changed.
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join("LOCK"))?;
+        let lock_file = File::open(&dir)?;
         match lock_file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -292,58 +382,36 @@ impl Engine {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
 
-        // 2. The manifest. A first start creates it, and commits an empty
-        // first version at once: from then on, part directories without a
-        // manifest file can only mean a lost manifest, never a crash before
-        // the first commit.
+        // 2. Read what is on disk. A manifest that does not exist next to
+        // part directories is a lost manifest, never an empty database.
         let parts_dir = dir.join("parts");
-        let has_parts = highest_part_dir_id(&parts_dir)?.is_some();
-        let mode = if options.create_if_missing && !has_parts {
-            OpenMode::Create
-        } else {
-            OpenMode::MustExist
-        };
-        let manifest = match Manifest::open(dir.join("manifest"), mode, ManifestOptions::default())
-        {
-            Ok(m) => m,
-            Err(Error::NotFound(why)) if has_parts => {
-                return Err(Error::corrupt(format!(
-                    "{} holds part directories but no manifest ({why}); \
-                     refusing to start as if the database were empty",
-                    parts_dir.display()
-                )));
+        let manifest_dir = dir.join("manifest");
+        let existing = match Manifest::open(
+            &manifest_dir,
+            OpenMode::MustExist,
+            ManifestOptions::default(),
+        ) {
+            Ok(m) => Some(m),
+            Err(Error::NotFound(why)) => {
+                if has_part_dirs(&parts_dir)? {
+                    return Err(Error::corrupt(format!(
+                        "{} holds part directories but no manifest ({why}); \
+                         refusing to start as if the database were empty",
+                        parts_dir.display()
+                    )));
+                }
+                if !options.create_if_missing {
+                    return Err(Error::NotFound(why));
+                }
+                None
             }
             Err(e) => return Err(e),
         };
-        if manifest.current().version == 0 {
-            manifest.commit(Edit::default())?;
-        }
-
-        // 3. Part ids that exist on disk must never be handed out again.
-        let state = manifest.current();
-        if let Some(highest) = highest_part_dir_id(&parts_dir)?
-            && highest >= state.next_part_id
-        {
-            manifest.commit(Edit {
-                next_part_id: Some(highest + 1),
-                ..Edit::default()
-            })?;
-        }
-
-        // 4. Directories the manifest does not reference are leftovers of a
-        // flush that did not commit.
-        let state = manifest.current();
-        let leftovers = unreferenced_part_dirs(&parts_dir, &state)?;
-        for d in &leftovers {
-            std::fs::remove_dir_all(d)?;
-        }
-        if !leftovers.is_empty() {
-            sync_dir(&parts_dir);
-        }
-
-        // 5. Every live part must open.
-        let mut parts = Vec::with_capacity(state.parts.len());
-        for meta in &state.parts {
+        // A new database is at position 0.
+        let state = existing.as_ref().map(Manifest::current);
+        let flushed = state.as_ref().map_or(0, |s| s.wal_flushed_lsn);
+        let mut parts = Vec::new();
+        for meta in state.iter().flat_map(|s| s.parts.iter()) {
             let reader = PartReader::open(parts_dir.join(nwdb_core::part_dir_name(meta.part_id)))?;
             parts.push(Arc::new(LivePart {
                 meta: meta.clone(),
@@ -351,13 +419,21 @@ impl Engine {
             }));
         }
 
-        // 6. The log, numbered above everything already in parts.
-        let flushed = state.wal_flushed_lsn;
+        // 3. The log, which must reach back to the manifest's position and
+        // must not end below it: the records in between were acknowledged
+        // and are gone. The log may repair its own torn tail and remove
+        // files that lie wholly inside parts; it changes nothing else.
         let wal_options = WalOptions {
-            min_next_lsn: Some(flushed + 1),
+            min_next_lsn: Some(flushed.saturating_add(1)),
+            allow_lost_log: options.accept_lost_log,
             ..options.wal.clone()
         };
-        let (wal, recovery) = Wal::open(dir.join("wal"), wal_options)?;
+        let (wal, recovery) = Wal::open(dir.join("wal"), wal_options).map_err(|e| match e {
+            Error::Corrupt(m) if m.contains("allow_lost_log") => Error::corrupt(format!(
+                "{m}; in the engine the option is EngineOptions::accept_lost_log"
+            )),
+            e => e,
+        })?;
         if recovery.first_lsn > flushed + 1 {
             return Err(Error::corrupt(format!(
                 "the log starts at record {} but the manifest says records up to {flushed} are in \
@@ -367,15 +443,37 @@ impl Engine {
                 recovery.first_lsn
             )));
         }
+        run_hook(&options.stage_hook, Stage::OpenChecked)?;
 
-        let mut decoder_map = HashMap::new();
-        for (tag, d) in decoders {
-            if decoder_map.insert(tag, d).is_some() {
-                return Err(Error::invalid_argument(format!(
-                    "two decoders registered for tag {tag}"
-                )));
+        // 4. From here the disk changes. A new database gets its empty first
+        // manifest version at once, so part directories without a manifest
+        // can only mean a lost manifest, never a crash before the first
+        // commit.
+        let manifest = match existing {
+            Some(m) => m,
+            None => {
+                let m =
+                    Manifest::open(&manifest_dir, OpenMode::Create, ManifestOptions::default())?;
+                if m.current().version == 0 {
+                    m.commit(Edit::default())?;
+                }
+                m
             }
+        };
+        // Part ids that exist on disk must never be handed out again. Ids the
+        // manifest could never have handed out are ignored by
+        // `highest_part_dir_id`.
+        if let Some(highest) = highest_part_dir_id(&parts_dir)?
+            && let Some(next) = highest.checked_add(1)
+            && next > manifest.current().next_part_id
+        {
+            manifest.commit(Edit {
+                next_part_id: Some(next),
+                ..Edit::default()
+            })?;
         }
+        run_hook(&options.stage_hook, Stage::IdsRaised)?;
+
         let inner = Arc::new(Inner {
             decoders: decoder_map,
             core: Mutex::new(Core {
@@ -410,12 +508,12 @@ impl Engine {
             flush_gate: Mutex::new(()),
             lock_file: Mutex::new(Some(lock_file)),
             threads: Mutex::new(Threads::default()),
-            shut_down: AtomicBool::new(false),
+            shut_down: Mutex::new(false),
             opts: options,
         });
 
-        // Replay. The buffer is flushed whenever it fills, so a long log does
-        // not need more memory than a running engine.
+        // 5. Replay. The buffer is flushed whenever it fills, so a long log
+        // does not need more memory than a running engine.
         let replayed = wal.replay(flushed + 1, |lsn, payload| {
             inner.replay_record(lsn, payload)
         })?;
@@ -425,6 +523,19 @@ impl Engine {
                 "replayed {replayed} log records, expected {expected}"
             )));
         }
+        run_hook(&inner.opts.stage_hook, Stage::ReplayFinished)?;
+
+        // 6. Only now are the directories the manifest does not reference
+        // known to be garbage: before the replay one of them could have been
+        // the only decoded copy of a record that no longer decodes.
+        let leftovers = unreferenced_part_dirs(&inner.parts_dir, &inner.manifest.current())?;
+        for d in &leftovers {
+            std::fs::remove_dir_all(d)?;
+        }
+        if !leftovers.is_empty() {
+            sync_dir(&inner.parts_dir);
+        }
+        run_hook(&inner.opts.stage_hook, Stage::LeftoversDeleted)?;
         *inner.wal.write().unwrap_or_else(|e| e.into_inner()) = Some(wal);
 
         // 7. Accept requests.
@@ -626,7 +737,7 @@ impl Inner {
         Snapshot::new(c.vis.clone(), self.opts.batch_limits)
     }
 
-    fn set_fatal_locked(&self, c: &mut Core, msg: String) {
+    pub(crate) fn set_fatal_locked(&self, c: &mut Core, msg: String) {
         c.last_error = Some(msg.clone());
         c.fatal.get_or_insert(msg);
         self.flusher_cv.notify_all();
@@ -816,9 +927,12 @@ impl Inner {
     }
 
     pub(crate) fn shutdown_inner(&self, flush: bool) -> Result<()> {
-        if self.shut_down.swap(true, Ordering::SeqCst) {
+        // A second caller waits here until the first has finished.
+        let mut done = lock(&self.shut_down);
+        if *done {
             return Ok(());
         }
+        *done = true;
         // No new request is accepted from here on, so `outstanding` can only
         // fall.
         {
@@ -835,11 +949,16 @@ impl Inner {
             let _ = flusher.join();
         }
 
+        // The gate is held from the final flush until the log is shut down and
+        // the directory lock released, so a `flush` that raced with this
+        // shutdown either finished before it or finds the engine closed; none
+        // can write after the lock is gone.
+        let _gate = lock(&self.flush_gate);
         let mut first_error = None;
         let fatal = lock(&self.core).fatal.clone();
         if let Some(f) = fatal {
             first_error = Some(Error::fatal(f));
-        } else if flush && let Err(e) = self.do_flush(true) {
+        } else if flush && let Err(e) = self.flush_locked(true) {
             first_error = Some(e);
         }
 

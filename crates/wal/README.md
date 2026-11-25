@@ -64,6 +64,9 @@ a zero-filled header). A newly created log directory is synced into its parent
 `Wal::open` lists the files and checks them in order.
 
 - Leftover `.tmp` files are removed.
+- With `min_next_lsn` set, files wholly below it are removed first (see
+  "Keeping numbering above the engine's position"); the checks below apply to
+  the files that remain.
 - File numbers must be contiguous: each file's first number is the previous
   file's last plus one. A gap or overlap is `Error::Corrupt`.
 - In every file except the last, an invalid header, a short record or a
@@ -106,14 +109,32 @@ true, `open` cuts the log at the first bad record as for a torn tail.
 
 ### Keeping numbering above the engine's position
 
-`WalOptions::min_next_lsn` is the lowest number the next record may get. If the
-log's own next number is lower (the log lost its tail or was wiped while the
-engine had already written later records into data files), every record on
-disk is below the caller's position and is not needed. `open` removes all log
-files (oldest first, syncing the directory after each), starts a new file whose
-first number is `min_next_lsn`, and reports `Recovery::reset_to` and
-`Recovery::records_discarded`. If `min_next_lsn` is at or below the next number
-it has no effect.
+`WalOptions::min_next_lsn` is the lowest number the next record may get. The
+engine sets it to one past the highest position it has written into data
+files. When it is set, `open` does this, in order:
+
+1. Removes every file all of whose records are numbered below it (the
+   following file starts at or below it), oldest first, syncing the directory
+   after each, and never the newest file. It is the removal a trim would do, and
+   it happens before any file is validated: after a crash between a data-file
+   commit and the trim such files remain, and damage or gaps in them are not
+   errors.
+2. Validates the rest as usual.
+3. Compares the log's next number with `min_next_lsn`. In healthy operation the
+   log's next number is never below it: records reach data files only after
+   they are durable in the log, and `truncate_before` never removes the newest
+   file. A log that ends below it therefore proves that log files were lost,
+   and the records acknowledged after the last write into data files are gone.
+   By default `open` returns `Error::Corrupt`, names the missing range and
+   `WalOptions::allow_lost_log`, and changes nothing more (a missing log
+   directory is not even created). With `allow_lost_log` set, `open` removes
+   all log files (oldest first, syncing the directory after each), starts a new
+   file whose first number is `min_next_lsn`, and reports
+   `Recovery::reset_to` and `Recovery::records_discarded` (the records still on
+   disk that the reset removed; files removed in step 1 are not counted).
+
+If `min_next_lsn` is at or below the next number it has no further effect. A
+brand-new log with `min_next_lsn` of 1 is never refused.
 
 ### Replay
 

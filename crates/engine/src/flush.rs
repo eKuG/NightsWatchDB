@@ -3,6 +3,7 @@
 //! The order of the steps is what makes a crash at any point recoverable; the
 //! README walks through each one.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -12,7 +13,7 @@ use nwdb_core::{
 use nwdb_manifest::Edit;
 use nwdb_segment::{PartReader, PartWriter, WriterOptions};
 
-use crate::engine::{Inner, LivePart};
+use crate::engine::{Inner, LivePart, Stage, run_hook};
 use crate::lock;
 use crate::rows::group_traces;
 
@@ -33,11 +34,36 @@ impl Inner {
     /// front of the active one and nothing is lost.
     pub(crate) fn do_flush(&self, trim: bool) -> Result<()> {
         let _gate = lock(&self.flush_gate);
+        // Checked with the gate held: shutdown holds it from its final flush
+        // until the lock on the directory is released, so a flush that got
+        // here after shutdown began must not write anything.
+        {
+            let c = lock(&self.core);
+            if let Some(f) = &c.fatal {
+                return Err(Error::fatal(f.clone()));
+            }
+            if c.closing {
+                return Err(Error::unavailable("the engine is shut down"));
+            }
+        }
+        self.flush_locked(trim)
+    }
 
+    /// [`do_flush`](Self::do_flush) for a caller that already holds the flush
+    /// gate (shutdown, for its final flush).
+    pub(crate) fn flush_locked(&self, trim: bool) -> Result<()> {
         let (frozen, lsn) = {
             let mut c = lock(&self.core);
             if let Some(f) = &c.fatal {
                 return Err(Error::fatal(f.clone()));
+            }
+            if c.vis.frozen.is_some() {
+                // Freezing again would overwrite the buffer whose data may
+                // not be in a part, and the next commit would then cover
+                // records that are in neither a part nor the log.
+                let msg = "a frozen buffer is still present at the start of a flush".to_string();
+                self.set_fatal_locked(&mut c, msg.clone());
+                return Err(Error::fatal(msg));
             }
             if c.vis.active.is_empty() && c.applied_lsn == c.flushed_lsn {
                 drop(c);
@@ -55,7 +81,17 @@ impl Inner {
             (frozen, c.applied_lsn)
         };
 
-        match self.write_and_commit(&frozen, lsn) {
+        // A panic after the freeze must not unwind past this point with the
+        // frozen buffer in place: it is a fatal error, and a restart recovers
+        // from the log.
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.write_and_commit(&frozen, lsn)))
+            .unwrap_or_else(|panic| {
+                Err(Error::fatal(format!(
+                    "a flush panicked: {}",
+                    panic_message(panic.as_ref())
+                )))
+            });
+        match outcome {
             Ok(written) => {
                 {
                     let mut c = lock(&self.core);
@@ -76,8 +112,10 @@ impl Inner {
                     c.flushes += 1;
                     c.flushing = false;
                 }
+                self.stage_after_commit(Stage::Published);
                 if trim {
                     self.trim_log();
+                    self.stage_after_commit(Stage::Trimmed);
                 }
                 Ok(())
             }
@@ -106,6 +144,12 @@ impl Inner {
         }
     }
 
+    /// Calls the stage hook at a point after the manifest commit, where its
+    /// result no longer matters: the flush has happened.
+    fn stage_after_commit(&self, stage: Stage) {
+        let _ = catch_unwind(AssertUnwindSafe(|| run_hook(&self.opts.stage_hook, stage)));
+    }
+
     /// Removes log files that are entirely inside parts. A failure is only
     /// noted: the data is safe and the next flush tries again.
     fn trim_log(&self) {
@@ -119,6 +163,7 @@ impl Inner {
     }
 
     fn write_and_commit(&self, frozen: &[Arc<RecordBatch>], lsn: u64) -> Result<Written> {
+        run_hook(&self.opts.stage_hook, Stage::FlushFrozen)?;
         let cols = frozen
             .iter()
             .map(|b| SpanColumns::try_new(b))
@@ -167,12 +212,15 @@ impl Inner {
                 // Recorded before the open so a failure still cleans it up.
                 metas.push(meta);
                 readers.push(PartReader::open(self.parts_dir.join(part_dir_name(id)))?);
+                run_hook(&self.opts.stage_hook, Stage::PartWritten)?;
             }
+            run_hook(&self.opts.stage_hook, Stage::AllPartsWritten)?;
             self.manifest.commit(Edit {
                 add: metas.clone(),
                 wal_flushed_lsn: Some(lsn),
                 ..Edit::default()
             })?;
+            self.stage_after_commit(Stage::Committed);
             Ok(())
         })();
         match result {
@@ -190,4 +238,13 @@ impl Inner {
             }
         }
     }
+}
+
+/// The text of a panic payload, for the error message.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }

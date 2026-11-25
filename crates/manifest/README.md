@@ -159,7 +159,9 @@ Every restart:
 1. `open(.., OpenMode::MustExist, ..)`. `NotFound` or `Corrupt` stops the
    engine; nothing is deleted.
 2. `highest_part_dir_id(parts_dir)` gives the largest id among final and
-   temporary part directories. If it is `Some(h)` and `h >= next_part_id`,
+   temporary part directories, ignoring ids from `MAX_NEXT_PART_ID - 1` up
+   (strays that were never handed out; step 3 deletes them like any other
+   unreferenced directory). If it is `Some(h)` and `h >= next_part_id`,
    first commit `Edit { next_part_id: Some(h + 1), .. }`, so ids are never
    reused even if a later step fails.
 3. Only then delete every directory returned by

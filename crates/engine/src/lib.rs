@@ -22,7 +22,7 @@ mod flush;
 mod query;
 mod rows;
 
-pub use engine::{Engine, EngineOptions, EngineStats};
+pub use engine::{Engine, EngineOptions, EngineStats, Stage, StageHook};
 pub use query::{AggQuery, ListQuery, Snapshot, TokenAgg};
 
 use std::sync::{Mutex, MutexGuard};

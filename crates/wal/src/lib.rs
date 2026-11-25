@@ -100,12 +100,28 @@ pub struct WalOptions {
     pub discard_after_damage: bool,
     /// The lowest sequence number the next record may get. The engine sets it
     /// to one past the highest position it has already written into data
-    /// files. If the log would assign a lower number (it lost its tail, or was
-    /// wiped), every record on disk is by definition already below that
-    /// position: all log files are removed and a new one starts at this
-    /// number, and [`Recovery::reset_to`] says so. If it is at or below the
-    /// next number it has no effect. Must be below `u64::MAX`. Default `None`.
+    /// files.
+    ///
+    /// Before anything else is checked, every file all of whose records are
+    /// numbered below it (the following file starts at or below it) is
+    /// removed, oldest first, never the newest file: it is the removal a trim
+    /// would do, and damage in such a file is not an error.
+    ///
+    /// If the log then ends below it (the files that held the records between
+    /// were lost), `open` returns [`Error::Corrupt`] and changes nothing more,
+    /// unless [`allow_lost_log`](Self::allow_lost_log) is set: then every file
+    /// is removed and a new one starts at this number, and
+    /// [`Recovery::reset_to`] says so. If it is at or below the next number it
+    /// has no effect. Must be below `u64::MAX`. Default `None`.
     pub min_next_lsn: Option<Lsn>,
+    /// What to do when the log ends below `min_next_lsn`. In healthy
+    /// operation that cannot happen, because records are written into data
+    /// files only after they are durable in the log and trimming never
+    /// removes the newest file; so it proves that log files were lost, and
+    /// records acknowledged after the data files were last written are gone.
+    /// By default `open` refuses. When true, it starts a new log at
+    /// `min_next_lsn` and carries on, **accepting that loss**. Default false.
+    pub allow_lost_log: bool,
 }
 
 impl Default for WalOptions {
@@ -117,6 +133,7 @@ impl Default for WalOptions {
             sync_hook: None,
             discard_after_damage: false,
             min_next_lsn: None,
+            allow_lost_log: false,
         }
     }
 }
@@ -130,6 +147,7 @@ impl std::fmt::Debug for WalOptions {
             .field("sync_hook", &self.sync_hook.as_ref().map(|_| "<hook>"))
             .field("discard_after_damage", &self.discard_after_damage)
             .field("min_next_lsn", &self.min_next_lsn)
+            .field("allow_lost_log", &self.allow_lost_log)
             .finish()
     }
 }
@@ -242,6 +260,10 @@ impl Wal {
     /// unless [`WalOptions::discard_after_damage`] is set. Damage in any
     /// earlier file is [`Error::Corrupt`].
     ///
+    /// With [`WalOptions::min_next_lsn`] set, files wholly below it are removed
+    /// first, and a log that ends below it is [`Error::Corrupt`] unless
+    /// [`WalOptions::allow_lost_log`] is set; see there.
+    ///
     /// Nothing prevents two processes opening the same directory; the caller
     /// must make sure only one does.
     pub fn open(dir: impl AsRef<Path>, options: WalOptions) -> Result<(Wal, Recovery)> {
@@ -250,6 +272,14 @@ impl Wal {
             return Err(Error::invalid_argument(
                 "min_next_lsn must be below u64::MAX",
             ));
+        }
+        if !dir.is_dir()
+            && let Some(min) = options.min_next_lsn
+            && min > 1
+            && !options.allow_lost_log
+        {
+            // Refuse before creating anything: the whole directory is lost.
+            return Err(lost_log(dir, 1, min));
         }
         create_dir_durably(dir, options.sync)?;
 
@@ -277,6 +307,16 @@ impl Wal {
                 "{}: the file name's sequence number is out of range",
                 format::file_path(dir, bad).display()
             )));
+        }
+
+        // Files wholly below the caller's position are not needed, so they are
+        // removed before anything is validated: a crash between a data-file
+        // commit and the trim leaves them, and damage in them must not block
+        // start-up. The newest file is never among them.
+        if let Some(min) = options.min_next_lsn {
+            let obsolete = firsts.windows(2).take_while(|w| w[1] <= min).count();
+            remove_files_oldest_first(dir, &firsts[..obsolete])?;
+            firsts.drain(..obsolete);
         }
 
         // A last file that cannot hold a record yet was being created when the
@@ -351,6 +391,9 @@ impl Wal {
         if let Some(min) = options.min_next_lsn
             && min > next_lsn
         {
+            if !options.allow_lost_log {
+                return Err(lost_log(dir, next_lsn, min));
+            }
             // The caller has already written everything below `min` into data
             // files, so nothing on disk is needed and none of it may keep
             // numbers below `min` in use.
@@ -632,6 +675,21 @@ impl Drop for Wal {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+/// The refusal for a log that ends below the caller's position. `from` is the
+/// first record the log lacks, `below` the caller's `min_next_lsn`.
+fn lost_log(dir: &Path, from: Lsn, below: Lsn) -> Error {
+    Error::corrupt(format!(
+        "the log in {} ends at record {} but records up to {} are already in data files, \
+         so log files were lost: records {from}..={} are missing from the log (they are safe \
+         in data files), and records {below} and above that only the lost files held are gone \
+         (WalOptions::allow_lost_log starts a new log at {below} and accepts the loss)",
+        dir.display(),
+        from - 1,
+        below - 1,
+        below - 1,
+    ))
 }
 
 fn too_large(len: usize) -> Error {

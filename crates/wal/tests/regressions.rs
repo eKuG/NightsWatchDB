@@ -135,6 +135,7 @@ fn numbering_cannot_be_moved_above_a_flushed_position() {
     let flushed_in_manifest = 100;
     let mut o = opts();
     o.min_next_lsn = Some(flushed_in_manifest + 1);
+    o.allow_lost_log = true;
     let (wal, rec) = Wal::open(dir.path(), o).unwrap();
     assert_eq!(rec.last_lsn, flushed_in_manifest);
     assert_eq!(rec.reset_to, Some(flushed_in_manifest + 1));
@@ -245,9 +246,12 @@ fn min_next_lsn_above_the_log_discards_every_file_and_restarts_there() {
     assert_eq!(list(dir.path()).len(), 3);
 
     o.min_next_lsn = Some(50);
+    o.allow_lost_log = true;
     let (wal, rec) = Wal::open(dir.path(), o.clone()).unwrap();
     assert_eq!(rec.reset_to, Some(50));
-    assert_eq!(rec.records_discarded, 5);
+    // Files [1,2] and [3,4] are wholly below 50 and go as obsolete files; the
+    // reset discards what is left, record 5.
+    assert_eq!(rec.records_discarded, 1);
     assert_eq!((rec.first_lsn, rec.last_lsn, rec.files), (50, 49, 1));
     assert_eq!(list(dir.path()), vec![format!("wal-{:020}.log", 50)]);
     assert_eq!(wal.durable_lsn(), 49);

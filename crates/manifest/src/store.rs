@@ -457,9 +457,25 @@ fn part_dirs(parts_dir: &Path) -> Result<Vec<(PathBuf, u64, bool)>> {
 /// The largest part id among final and temporary part directories under
 /// `parts_dir`, or `None` if there are none (or no `parts_dir`).
 ///
+/// Ids from `MAX_NEXT_PART_ID - 1` up are ignored. Ids at or above the limit
+/// were never handed out, and the last one below it is out of reach in
+/// practice (2^62 ids), so such a directory is a stray; raising
+/// `next_part_id` to the limit for it would leave no id to hand out.
+/// [`unreferenced_part_dirs`] still lists the stray directories.
+///
 /// Used at startup so ids are never reused after a crash; see the README.
 pub fn highest_part_dir_id(parts_dir: &Path) -> Result<Option<u64>> {
-    Ok(part_dirs(parts_dir)?.into_iter().map(|(_, id, _)| id).max())
+    Ok(part_dirs(parts_dir)?
+        .into_iter()
+        .map(|(_, id, _)| id)
+        .filter(|&id| id < MAX_NEXT_PART_ID - 1)
+        .max())
+}
+
+/// Whether `parts_dir` holds any part directory, final or temporary,
+/// whatever its id.
+pub fn has_part_dirs(parts_dir: &Path) -> Result<bool> {
+    Ok(!part_dirs(parts_dir)?.is_empty())
 }
 
 /// Lists directories under `parts_dir` that `state` does not reference.

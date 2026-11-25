@@ -35,7 +35,7 @@ engine.shutdown()?;
 ## Directory layout
 
 ```
-<data_dir>/LOCK        exclusive flock, held for the life of the engine
+<data_dir>/            exclusively locked (flock on the directory itself) for the life of the engine
 <data_dir>/manifest/   numbered manifest files
 <data_dir>/parts/      one directory per part (and <id>.tmp while being written)
 <data_dir>/wal/        log files
@@ -43,31 +43,52 @@ engine.shutdown()?;
 
 ## Start-up
 
-In this order; each step finishes before the next.
+Nothing is created, committed, renamed or deleted under `manifest/` or `parts/`
+until every check that can refuse the start has passed. The only changes
+before that are: creating the data directory, the log's own repair of a torn
+tail, its removal of files that lie wholly inside parts (see step 3), and the
+manifest crate's removal of its temporary files. In this order; each step
+finishes before the next.
 
-1. Create the directory if allowed, then take `LOCK` (`File::try_lock`).
-   A second `open` is `Conflict`. The lock is released by `shutdown` or when the
-   last handle is dropped.
-2. Open `manifest/`: create it only if `create_if_missing` and `parts/` holds no
-   part directory, otherwise it must exist. Part directories with no manifest
-   are `Corrupt`: refusing is the only safe answer to a lost manifest. A new
-   database commits an empty first manifest version at once, so a crash during
-   the very first flush (parts on disk, no manifest file yet) is not mistaken
-   for a lost manifest.
-3. If the highest id of any part directory (final or `.tmp`) is at or above the
-   manifest's `next_part_id`, commit a higher `next_part_id` first, so an id that
-   ever reached the disk is never handed out again.
-4. Delete part directories the manifest does not reference.
-5. Open a `PartReader` for every live part. Any failure stops start-up.
-6. Open the log with `min_next_lsn = wal_flushed_lsn + 1`, so the log can never
-   number a new record at or below what is already in parts, even if its files
-   were deleted. If the log starts above `wal_flushed_lsn + 1` (empty or not) the
-   records in between were acknowledged and are gone: `Corrupt`. Replay from
-   `wal_flushed_lsn + 1`; each record is `[tag] + bytes`. An empty record, an
-   unknown tag, a decode failure, a decoded batch without the span schema, or a
-   gap in the numbers is `Corrupt`. While replaying, the buffer is flushed
-   whenever it reaches `buffer_bytes`, so a long log needs no more memory than a
-   running engine; the log is not trimmed until it has been read.
+0. Validate the arguments: the options and duplicate decoder tags.
+1. Create the directory if allowed, then lock it: the lock is `File::try_lock`
+   on the open directory itself, so no file in it can be deleted to get around
+   it, and no `LOCK` file exists. A second `open` is `Conflict`. The lock is
+   released by `shutdown` or when the last handle is dropped.
+2. Read, without changing: whether a manifest exists. If there is none and
+   `parts/` holds any part directory (final or `.tmp`, whatever its id), the
+   manifest is lost and the start is `Corrupt`: refusing is the only safe
+   answer. If there is none and the database may not be created, `NotFound`.
+   Otherwise load the manifest state, and open a `PartReader` for every live
+   part. Any failure stops start-up.
+3. Open the log with `min_next_lsn = wal_flushed_lsn + 1` (position 0 for a
+   database with no manifest yet). The log first removes files wholly below
+   that position, as a trim would, so damage in them cannot block the start.
+   Then, if the log ends below the position (its files were lost: in healthy
+   operation the next record number is never below `wal_flushed_lsn + 1`,
+   because records are applied only after they are durable and trimming never
+   removes the newest file), the start is `Corrupt` and the message names the
+   missing records and `accept_lost_log`. With `EngineOptions::accept_lost_log`
+   set, the log is instead renumbered above the position and the records
+   acknowledged after the last flush are gone. If the log starts above
+   `wal_flushed_lsn + 1` (empty or not) the records in between were
+   acknowledged and are gone: `Corrupt`. A new database has nothing to
+   refuse here.
+4. Only now: for a new database, create the manifest and commit an empty first
+   version (so a crash during the very first flush, parts on disk and no
+   manifest file, is not mistaken for a lost manifest). Then raise
+   `next_part_id` above the highest part directory id (final or `.tmp`), so an
+   id that ever reached the disk is never handed out again. Ids at or near
+   `MAX_NEXT_PART_ID` were never handed out and are ignored here (checked
+   arithmetic); such a directory is an ordinary unreferenced one.
+5. Replay from `wal_flushed_lsn + 1`; each record is `[tag] + bytes`. An empty
+   record, an unknown tag, a decode failure, a decoded batch without the span
+   schema, or a gap in the numbers is `Corrupt`. While replaying, the buffer is
+   flushed whenever it reaches `buffer_bytes`, so a long log needs no more
+   memory than a running engine; the log is not trimmed until it has been read.
+6. Only after the replay succeeded: delete the part directories the manifest
+   does not reference. One of them may be the only decoded copy of data whose
+   log record no longer decodes, so it must outlive a refused replay.
 7. Start the threads and accept requests.
 
 ## Threads
@@ -77,7 +98,7 @@ In this order; each step finishes before the next.
 | log thread (in `nwdb-wal`) | writes and syncs groups, runs callbacks in order; its callbacks only push to a queue |
 | applier (`nwdb-applier`) | pops results in log order, inserts into the buffer, calls `on_durable` outside every lock |
 | flusher (`nwdb-flusher`) | waits for the size or age trigger, then flushes; after a failed flush waits one second before retrying |
-| callers | `flush()` runs on the calling thread, serialised with the flusher by a gate |
+| callers | `flush()` runs on the calling thread, serialised with the flusher by a gate; it checks the closing state after taking the gate |
 
 One mutex (`Core`) holds the visible state and counters, and is held only to
 move pointers, never across I/O. A snapshot is three `Arc` clones taken under
@@ -85,9 +106,12 @@ it. The only blocking calls in the log's callback path are the queue's short
 lock; the log is never called from a callback.
 
 `Engine` is a cheap clone. `shutdown()` stops accepting, waits for every
-accepted request to be acknowledged, stops the flusher, flushes, shuts the log
-down, stops the applier and releases the lock. Dropping the last handle does
-the same without the flush (what is acknowledged is in the log), and if the
+accepted request to be acknowledged, stops the flusher, then takes the flush
+gate and holds it while it flushes, shuts the log down, stops the applier and
+releases the lock; a `flush()` that raced with it finishes before it or finds
+the engine closed, so nothing is written after the lock is gone. A second
+concurrent `shutdown()` waits for the first to finish. Dropping the last handle
+does the same without the flush (what is acknowledged is in the log), and if the
 last handle is dropped by a callback running on an engine thread, the cleanup
 runs on a separate thread rather than joining itself.
 
@@ -95,8 +119,8 @@ runs on a separate thread rather than joining itself.
 
 `do_flush` (one at a time):
 
-1. **Freeze.** Under the core lock, move the whole active buffer to the
-   frozen slot (it stays visible to queries) and record `applied_lsn`. Because
+1. **Freeze.** Under the core lock, refuse (fatal) if a frozen buffer is
+   already present, then move the whole active buffer to the frozen slot (it stays visible to queries) and record `applied_lsn`. Because
    requests enter the buffer in log order under the same lock, every log
    position up to `applied_lsn` is in the frozen buffer or in a part, and the
    position is always a contiguous prefix.
@@ -115,16 +139,19 @@ runs on a separate thread rather than joining itself.
    returned `Ok`. A failure is recorded in `stats().last_error` and retried by
    the next flush; the data is safe.
 
-What a crash leaves, and why recovery is right:
+What a crash leaves, and why recovery is right. The stage names are those of
+`EngineOptions::stage_hook` (below); the crash tests abort the process at each
+and check the column "On disk":
 
-| Crash during | On disk | Recovery |
+| Crash at / during | On disk | Recovery |
 |---|---|---|
-| freeze, group | nothing new | replay from the old `wal_flushed_lsn` rebuilds the buffer |
-| a part write | `<id>.tmp`, maybe finished parts, manifest unchanged | the leftovers are unreferenced and deleted; `next_part_id` is first moved above them; replay rebuilds the buffer |
-| between the last part and the commit | finished parts the manifest does not know | same: deleted, never reused, data replayed |
+| `FlushFrozen` (freeze, group) | nothing new | replay from the old `wal_flushed_lsn` rebuilds the buffer |
+| a part write, `PartWritten` | `<id>.tmp`, maybe finished parts, manifest unchanged | the leftovers are unreferenced; `next_part_id` is first moved above them; replay rebuilds the buffer; then they are deleted |
+| `AllPartsWritten` (before the commit) | finished parts the manifest does not know | same: never reused, data replayed, then deleted |
 | the commit | the new manifest file either exists or not (create-if-absent link, directory sync) | not there: as above. There: parts are referenced and `wal_flushed_lsn` covers them, so replay starts after them |
-| after the commit, before trimming | log files wholly inside parts | replay starts at `wal_flushed_lsn + 1` and skips them; the next trim removes them |
+| `Committed`, `Published` (before trimming) | parts referenced; log files wholly inside parts | replay starts at `wal_flushed_lsn + 1`; `Wal::open` removes the obsolete files first, damaged or not |
 | trimming | a prefix of the old files removed, oldest first | the log is still contiguous and covers `wal_flushed_lsn + 1` |
+| `Trimmed` | nothing obsolete | nothing to do |
 
 The two invariants behind the table: `wal_flushed_lsn` only moves in the same
 commit that makes the data live, and the log is only trimmed after that commit
@@ -137,6 +164,28 @@ the retry uses fresh ids. `Fatal` from the log, the manifest or a part writer
 puts the engine in the fatal state: ingest and flush return `Fatal`, pending
 callbacks get `Fatal`, reads keep working on what is visible, nothing is
 retried. A restart recovers from the log and the manifest.
+
+A panic while writing or committing (after the freeze) is caught and treated
+as `Fatal`: the frozen buffer stays visible, no later flush can freeze over it
+and commit a position that covers records not in a part, and a restart recovers
+from the log. A panic in the stage hook after the commit is ignored.
+
+## Stage hook
+
+`EngineOptions::stage_hook` is a test facility, in the manner of the log's
+`sync_hook`: the engine calls it with a `Stage` at each of these points.
+
+- Start-up: `OpenChecked` (every refusing check passed, nothing changed yet),
+  `IdsRaised`, `ReplayFinished`, `LeftoversDeleted`.
+- A flush: `FlushFrozen`, `PartWritten` (once per part), `AllPartsWritten`
+  (before the commit), `Committed` (before publishing), `Published`
+  (before the trim), `Trimmed`.
+
+An error returned at a stage before the manifest commit is handled exactly as
+if that step had failed with that error (`Fatal` puts the engine in the fatal
+state; anything else restores the buffer and removes the parts of that
+attempt). After the commit the return value is ignored, and so is a panic.
+
 
 ## Reads
 
@@ -192,10 +241,12 @@ root, not the earliest.
 - Memory accounting uses Arrow's own memory estimate, including spare capacity
   of the builders. Small batches therefore count for more than their values.
   The bound is on the buffer, not on in-flight query results.
-- Back-pressure is checked before a request is admitted; concurrent requests
-  can overshoot `max_buffered_bytes` by what is in flight between the check and
-  the insert, which is itself counted for later requests. One request larger
-  than the limit is admitted when nothing else is buffered.
+- Back-pressure is checked before a request is admitted, and the bytes of
+  requests already in flight (admitted, not yet in the buffer) are counted at
+  the check, so concurrent requests do not overshoot `max_buffered_bytes`. A
+  request is admitted if the total including it stays within the limit; one
+  request larger than the limit is admitted only when nothing else is
+  buffered.
 - Flush is one part per window per flush: many windows in one buffer make many
   small parts. Compaction is a later checkpoint.
 - No retention, no compaction, no object store.
@@ -205,10 +256,35 @@ root, not the earliest.
 
 ## The crash test
 
-`src/bin/nwdb-crashtest.rs` is a test tool, not part of the database. The test
-`tests/crash.rs` runs it as a child process on one directory 24 times, kills it
-with SIGKILL after a seeded random delay, reopens the directory, and checks
-that every record the child printed as acknowledged is present exactly once,
-that queries work, and that the engine accepts and flushes a new record. It
-reports how many kills found a flush in progress and how many left a temporary
-or an unreferenced finished part directory behind.
+`src/bin/nwdb-crashtest.rs` is a test tool, not part of the database. Its
+child process ingests records, prints each acknowledged id, and marks a flush
+from `FlushFrozen` to `Trimmed` through the stage hook. Two kinds of test run it.
+
+- `tests/crash.rs` runs it as a child process on one directory 24 times, kills
+  it with SIGKILL after a seeded random delay, reopens the directory (half the
+  recoveries with a small buffer, so the replay-time flush runs), and checks
+  that every record the child printed as acknowledged is present exactly once,
+  that queries work, and that the engine accepts and flushes a new record. It
+  reports how many kills found a flush in progress (the marker covers the
+  trim) and how many left a temporary or an unreferenced finished part
+  directory behind, looking at the directory without opening the manifest.
+- `tests/crash_stages.rs` makes the child abort itself (`std::process::abort`)
+  at a named stage on its n-th occurrence, so every flush stage and every
+  start-up stage is hit deterministically. For each it checks the on-disk state
+  that stage should leave (for example unreferenced finished parts after
+  `AllPartsWritten`; referenced parts and obsolete log files after
+  `Committed`), reopens, and checks every acknowledged record is present
+  exactly once, queries work, and a new record is accepted and flushed. The
+  start-up stages are run on a directory with leftovers and a log to replay,
+  with a buffer small enough that the replay flushes.
+
+`tests/startup_safety.rs` checks that every refusal leaves the directory byte
+for byte as it was and that restoring the lost files lets it open;
+`tests/injected.rs` injects errors and panics through the hook;
+`tests/shutdown_races.rs` runs `flush`, `ingest` and two `shutdown` calls at
+once.
+
+Known limit: killing a process does not drop the operating system's page
+cache, so a write that was never synced is still seen by the next start. The
+tests therefore prove the order of the steps and the recovery rules, not the
+order of the syncs; a power-loss test would be needed for that.

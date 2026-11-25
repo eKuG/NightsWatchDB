@@ -14,4 +14,6 @@ mod state;
 mod store;
 
 pub use state::{Edit, MAX_NEXT_PART_ID, ManifestState};
-pub use store::{Manifest, ManifestOptions, OpenMode, highest_part_dir_id, unreferenced_part_dirs};
+pub use store::{
+    Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id, unreferenced_part_dirs,
+};

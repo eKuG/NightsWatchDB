@@ -365,3 +365,18 @@ fn error_meanings_after_a_lost_race() {
         Error::InvalidArgument(_)
     ));
 }
+
+/// Directories with ids at or near the limit are strays: they do not count
+/// for the highest id, but they still count as part directories.
+#[test]
+fn huge_part_dir_ids_do_not_raise_the_highest_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parts = tmp.path().join("parts");
+    assert!(!nwdb_manifest::has_part_dirs(&parts).unwrap());
+    fs::create_dir_all(parts.join(part_dir_name(3))).unwrap();
+    fs::create_dir_all(parts.join(part_dir_name(MAX_NEXT_PART_ID - 1))).unwrap();
+    fs::create_dir_all(parts.join(part_dir_name(u64::MAX))).unwrap();
+    fs::create_dir_all(parts.join(format!("{}.tmp", part_dir_name(MAX_NEXT_PART_ID)))).unwrap();
+    assert_eq!(highest_part_dir_id(&parts).unwrap(), Some(3));
+    assert!(nwdb_manifest::has_part_dirs(&parts).unwrap());
+}

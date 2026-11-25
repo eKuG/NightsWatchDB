@@ -4,121 +4,28 @@
 //! exactly once.
 
 mod common;
+mod support;
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::*;
 use nwdb_core::TraceId;
-use nwdb_engine::{AggQuery, Engine, ListQuery};
-use nwdb_manifest::{Manifest, ManifestOptions, OpenMode};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use support::{disk_state, present_ids, run_child};
 
 const ITERATIONS: u64 = 24;
 const SEED: u64 = 0x4b49_4c4c;
 
-struct Run {
-    acked: Vec<u64>,
-    /// The last flush marker the child printed: a flush was running when
-    /// the process died.
-    flushing_at_kill: bool,
-}
-
-fn run_child(dir: &Path, first_id: u64, pause_us: u64, kill_after: Duration) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nwdb-crashtest"))
-        .arg(dir)
-        .arg(first_id.to_string())
-        .arg(pause_us.to_string())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start the child");
-    let out = BufReader::new(child.stdout.take().unwrap());
-    let (tx, rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut acked = Vec::new();
-        let mut flushing = false;
-        for line in out.lines() {
-            let Ok(line) = line else { break };
-            match line.split_once(' ') {
-                None if line == "READY" => tx.send(()).unwrap(),
-                Some(("A", id)) => acked.push(id.parse::<u64>().unwrap()),
-                Some(("F", f)) => flushing = f == "1",
-                _ => {}
-            }
-        }
-        (acked, flushing)
-    });
-    rx.recv_timeout(Duration::from_secs(120))
-        .expect("the child never became ready");
-    std::thread::sleep(kill_after);
-    child.kill().expect("SIGKILL");
-    child.wait().unwrap();
-    let (acked, flushing_at_kill) = reader.join().unwrap();
-    Run {
-        acked,
-        flushing_at_kill,
-    }
-}
-
 /// Describes what the dead process left on disk, before recovery touches it.
+/// The manifest is read from a copy: opening it in place would remove its
+/// temporary files and sync it, and so change what recovery then finds.
 fn leftovers(dir: &Path) -> (bool, bool) {
-    let parts = dir.join("parts");
-    let state = Manifest::open(
-        dir.join("manifest"),
-        OpenMode::MustExist,
-        ManifestOptions::default(),
-    )
-    .unwrap()
-    .current();
-    let (mut tmp, mut unreferenced) = (false, false);
-    for e in std::fs::read_dir(&parts).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".tmp") {
-            tmp = true;
-        } else if let Ok(id) = name.parse::<u64>()
-            && state.part(id).is_none()
-        {
-            unreferenced = true;
-        }
-    }
-    (tmp, unreferenced)
-}
-
-fn present_ids(e: &Engine) -> BTreeSet<u64> {
-    let all = e
-        .list_traces(&ListQuery {
-            from_ns: i64::MIN,
-            to_ns: i64::MAX,
-            service: None,
-            model: None,
-            error: None,
-            limit: usize::MAX,
-        })
-        .unwrap();
-    let mut ids = BTreeSet::new();
-    for s in &all {
-        // Each record is one span, so a trace with two was replayed twice.
-        assert_eq!(
-            s.span_count, 1,
-            "trace {} appears more than once",
-            s.trace_id
-        );
-        let id = u128::from_be_bytes(s.trace_id.0) as u64 - 1;
-        assert!(ids.insert(id));
-    }
-    let agg = e
-        .aggregate_tokens(&AggQuery {
-            from_ns: i64::MIN,
-            to_ns: i64::MAX,
-            operation: None,
-        })
-        .unwrap();
-    assert_eq!(agg.iter().map(|a| a.count).sum::<u64>(), ids.len() as u64);
-    ids
+    let (_, unreferenced) = disk_state(dir);
+    let tmp = unreferenced.iter().any(|n| n.ends_with(".tmp"));
+    (tmp, unreferenced.iter().any(|n| !n.ends_with(".tmp")))
 }
 
 #[test]
@@ -137,10 +44,16 @@ fn acknowledged_records_survive_sigkill() {
         } else {
             rng.random_range(1_000..8_000)
         };
-        let run = run_child(dir.path(), iteration * 1_000_000, pause_us, kill_after);
+        let run = run_child(
+            dir.path(),
+            iteration * 1_000_000,
+            pause_us,
+            &[],
+            Some(kill_after),
+        );
         total_acked += run.acked.len();
         acked.extend(&run.acked);
-        during_flush += usize::from(run.flushing_at_kill);
+        during_flush += usize::from(run.flushing_at_end);
 
         if dir.path().join("manifest").exists() {
             let (tmp, unreferenced) = leftovers(dir.path());
@@ -148,10 +61,14 @@ fn acknowledged_records_survive_sigkill() {
             unreferenced_dirs += usize::from(unreferenced);
         }
 
-        // Recover in this process. Alternate between a clean shutdown and
-        // simply dropping the engine.
+        // Recover in this process. Half the recoveries use a small buffer, so
+        // the flush that replay needs when the buffer fills runs too.
+        // Alternate between a clean shutdown and simply dropping the engine.
         let mut o = opts(dir.path());
         o.wal.sync = nwdb_wal::SyncMode::Data;
+        if iteration % 4 >= 2 {
+            o.buffer_bytes = 2048;
+        }
         let e = open(o);
         let present = present_ids(&e);
         for id in &acked {
