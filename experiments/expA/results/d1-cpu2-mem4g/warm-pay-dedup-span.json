@@ -1,0 +1,1 @@
+{"task":"span","variant":"dedup","wall_s":0.297,"user_cpu_s":0.27,"sys_cpu_s":0.02,"peak_rss_bytes":11624448,"cgroup_peak_bytes":11730944,"threads":2,"lookups":500,"rows":91419,"bytes_returned":39653913,"span_digest":10161253796817727229,"p50_ms":0.440,"p90_ms":0.999,"p99_ms":1.378,"max_ms":1.999,"threads_used":1}

@@ -1,0 +1,3 @@
+otelcol_exporter_sent{exporter="otelarrow",method="/opentelemetry.proto.experimental.arrow.v1.ArrowTracesService/ArrowTraces"} 3.641704552e+09
+otelcol_exporter_sent_spans{exporter="otelarrow"} 1.0000039e+07
+otelcol_exporter_sent_wire{exporter="otelarrow",method="/opentelemetry.proto.experimental.arrow.v1.ArrowTracesService/ArrowTraces"} 3.50395156e+08

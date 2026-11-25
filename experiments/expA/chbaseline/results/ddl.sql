@@ -1,0 +1,62 @@
+CREATE TABLE otel.otel_traces
+(
+    `Timestamp` DateTime64(9) CODEC(Delta(8), ZSTD(3)),
+    `TraceId` String CODEC(ZSTD(3)),
+    `SpanId` String CODEC(ZSTD(3)),
+    `ParentSpanId` String CODEC(ZSTD(3)),
+    `TraceState` String CODEC(ZSTD(3)),
+    `SpanName` LowCardinality(String) CODEC(ZSTD(3)),
+    `SpanKind` LowCardinality(String) CODEC(ZSTD(3)),
+    `ServiceName` LowCardinality(String) CODEC(ZSTD(3)),
+    `ResourceAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(3)),
+    `ScopeName` String CODEC(ZSTD(3)),
+    `ScopeVersion` String CODEC(ZSTD(3)),
+    `SpanAttributes` Map(LowCardinality(String), String) CODEC(ZSTD(3)),
+    `Duration` UInt64 CODEC(ZSTD(3)),
+    `StatusCode` LowCardinality(String) CODEC(ZSTD(3)),
+    `StatusMessage` String CODEC(ZSTD(3)),
+    `Events.Timestamp` Array(DateTime64(9)) CODEC(ZSTD(3)),
+    `Events.Name` Array(LowCardinality(String)) CODEC(ZSTD(3)),
+    `Events.Attributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(3)),
+    `Links.TraceId` Array(String) CODEC(ZSTD(3)),
+    `Links.SpanId` Array(String) CODEC(ZSTD(3)),
+    `Links.TraceState` Array(String) CODEC(ZSTD(3)),
+    `Links.Attributes` Array(Map(LowCardinality(String), String)) CODEC(ZSTD(3)),
+    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
+    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_span_attr_key mapKeys(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_span_attr_value mapValues(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
+    INDEX idx_duration Duration TYPE minmax GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY toDate(Timestamp)
+ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1
+
+CREATE TABLE otel.otel_traces_trace_id_ts
+(
+    `TraceId` String CODEC(ZSTD(3)),
+    `Start` DateTime CODEC(Delta(4), ZSTD(3)),
+    `End` DateTime CODEC(Delta(4), ZSTD(3)),
+    INDEX idx_trace_id TraceId TYPE bloom_filter(0.01) GRANULARITY 1
+)
+ENGINE = MergeTree
+PARTITION BY toDate(Start)
+ORDER BY (TraceId, Start)
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1
+
+CREATE MATERIALIZED VIEW otel.otel_traces_trace_id_ts_mv TO otel.otel_traces_trace_id_ts
+(
+    `TraceId` String,
+    `Start` DateTime64(9),
+    `End` DateTime64(9)
+)
+AS SELECT
+    TraceId,
+    min(Timestamp) AS Start,
+    max(Timestamp) AS End
+FROM otel.otel_traces
+WHERE TraceId != ''
+GROUP BY TraceId
+

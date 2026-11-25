@@ -1,0 +1,1 @@
+{"task":"build","variant":"traceid","wall_s":18.140,"user_cpu_s":24.36,"sys_cpu_s":0.83,"peak_rss_bytes":640667648,"threads":2,"rows":10000039,"traces":545063,"segments":1,"bytes_on_disk":{"spans.parquet":354242542},"input_bytes":3622025986,"input_mb_per_s":199.7,"sort_runs":13,"sort_buffer_mb":256}

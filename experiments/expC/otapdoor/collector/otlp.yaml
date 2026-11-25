@@ -1,0 +1,48 @@
+# otelcol-contrib 0.165.0: the same collector in front of the plain OTLP door (stream 1): same receiver, same
+# batching, same queue; only the exporter differs.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 64
+
+exporters:
+  otlp:
+    endpoint: ${env:DOOR_ENDPOINT}
+    tls:
+      insecure: true
+    timeout: 120s
+    # gRPC-level zstd, the same codec the OTel-Arrow exporter uses at that layer
+    compression: zstd
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 64
+      sizer: requests
+      block_on_overflow: true
+      batch:
+        sizer: bytes
+        min_size: 8388608
+        max_size: 33554432
+        flush_timeout: 5s
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 120s
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces: {receivers: [otlp], exporters: [otlp]}
+    logs: {receivers: [otlp], exporters: [otlp]}
+    metrics: {receivers: [otlp], exporters: [otlp]}

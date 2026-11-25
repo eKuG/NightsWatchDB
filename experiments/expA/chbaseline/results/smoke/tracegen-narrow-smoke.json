@@ -1,0 +1,195 @@
+{
+  "elapsed_seconds": 2.905,
+  "encoded_bytes": 181224316,
+  "mb_per_second": 62.4,
+  "overall": {
+    "bytes_by_class": {
+      "input_messages": 0,
+      "other": 179477744,
+      "output_messages": 0,
+      "system_instructions": 0,
+      "tool_arguments_results": 0,
+      "tool_definitions": 0
+    },
+    "bytes_per_trace": {
+      "max": 116294,
+      "p50": 1312,
+      "p90": 19968,
+      "p99": 62464
+    },
+    "chat_span_payload_bytes": {
+      "max": 118,
+      "p50": 86,
+      "p90": 94,
+      "p99": 106
+    },
+    "payload_bytes_per_span": {
+      "max": 133,
+      "p50": 66,
+      "p90": 94,
+      "p99": 132
+    },
+    "repeated_fraction": 0.9291,
+    "spans_per_trace": {
+      "max": 364,
+      "p50": 3,
+      "p90": 61,
+      "p99": 180
+    },
+    "traces": 27570
+  },
+  "profiles": {
+    "chat": {
+      "bytes_by_class": {
+        "input_messages": 0,
+        "other": 19844658,
+        "output_messages": 0,
+        "system_instructions": 0,
+        "tool_arguments_results": 0,
+        "tool_definitions": 0
+      },
+      "bytes_per_trace": {
+        "max": 4848,
+        "p50": 2880,
+        "p90": 4032,
+        "p99": 4224
+      },
+      "chat_span_payload_bytes": {
+        "max": 118,
+        "p50": 86,
+        "p90": 94,
+        "p99": 106
+      },
+      "payload_bytes_per_span": {
+        "max": 133,
+        "p50": 86,
+        "p90": 118,
+        "p99": 132
+      },
+      "repeated_fraction": 0.8139,
+      "spans_per_trace": {
+        "max": 12,
+        "p50": 7,
+        "p90": 9,
+        "p99": 10
+      },
+      "traces": 6884
+    },
+    "coding": {
+      "bytes_by_class": {
+        "input_messages": 0,
+        "other": 82975530,
+        "output_messages": 0,
+        "system_instructions": 0,
+        "tool_arguments_results": 0,
+        "tool_definitions": 0
+      },
+      "bytes_per_trace": {
+        "max": 107401,
+        "p50": 35840,
+        "p90": 62464,
+        "p99": 92160
+      },
+      "chat_span_payload_bytes": {
+        "max": 118,
+        "p50": 86,
+        "p90": 94,
+        "p99": 106
+      },
+      "payload_bytes_per_span": {
+        "max": 133,
+        "p50": 63,
+        "p90": 94,
+        "p99": 110
+      },
+      "repeated_fraction": 0.9739,
+      "spans_per_trace": {
+        "max": 300,
+        "p50": 102,
+        "p90": 180,
+        "p99": 264
+      },
+      "traces": 2157
+    },
+    "simple": {
+      "bytes_by_class": {
+        "input_messages": 0,
+        "other": 14447647,
+        "output_messages": 0,
+        "system_instructions": 0,
+        "tool_arguments_results": 0,
+        "tool_definitions": 0
+      },
+      "bytes_per_trace": {
+        "max": 1384,
+        "p50": 880,
+        "p90": 1312,
+        "p99": 1312
+      },
+      "chat_span_payload_bytes": {
+        "max": 118,
+        "p50": 86,
+        "p90": 94,
+        "p99": 106
+      },
+      "payload_bytes_per_span": {
+        "max": 133,
+        "p50": 90,
+        "p90": 132,
+        "p99": 132
+      },
+      "repeated_fraction": 0.3313,
+      "spans_per_trace": {
+        "max": 3,
+        "p50": 2,
+        "p90": 3,
+        "p99": 3
+      },
+      "traces": 13849
+    },
+    "task": {
+      "bytes_by_class": {
+        "input_messages": 0,
+        "other": 62209909,
+        "output_messages": 0,
+        "system_instructions": 0,
+        "tool_arguments_results": 0,
+        "tool_definitions": 0
+      },
+      "bytes_per_trace": {
+        "max": 116294,
+        "p50": 8448,
+        "p90": 29184,
+        "p99": 83968
+      },
+      "chat_span_payload_bytes": {
+        "max": 118,
+        "p50": 86,
+        "p90": 94,
+        "p99": 106
+      },
+      "payload_bytes_per_span": {
+        "max": 133,
+        "p50": 55,
+        "p90": 94,
+        "p99": 126
+      },
+      "repeated_fraction": 0.9475,
+      "spans_per_trace": {
+        "max": 364,
+        "p50": 25,
+        "p90": 86,
+        "p99": 244
+      },
+      "traces": 4680
+    }
+  },
+  "repeated_across_traces": {
+    "system_instructions": 0.9991,
+    "tool_definitions": 0.9989
+  },
+  "seed": 1,
+  "sessions": 9242,
+  "spans": 500006,
+  "traces": 27570
+}

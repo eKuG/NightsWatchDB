@@ -1,0 +1,7 @@
+3908	/data/d1-cotrace
+20	/data/d1-ids.txt
+60828	/data/d1-pay-dedup
+163056	/data/d1-pay-parquet
+71312	/data/d1-pay-parquet-tuned
+99996	/data/d1-pay-zstdlong
+7830212	/data/d1.bin

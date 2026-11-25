@@ -1,0 +1,17 @@
+[package]
+name = "otlpdoor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { version = "=60.2.0", default-features = false }
+prost = "=0.14.6"
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "logs", "metrics"] }
+tonic = { version = "=0.14.9", default-features = false, features = ["server", "router", "codegen", "transport", "gzip", "zstd"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+bytes = "=1.12.2"
+crc32c = "=0.6.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

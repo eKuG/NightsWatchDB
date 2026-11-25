@@ -1,0 +1,5 @@
+.data/
+target/
+.DS_Store
+/bench/tracegen/tracegen
+/bench/corpusprep/corpusprep

@@ -1,0 +1,1 @@
+{"task":"span","variant":"parquet","wall_s":0.875,"user_cpu_s":0.76,"sys_cpu_s":0.10,"peak_rss_bytes":19660800,"cgroup_peak_bytes":191545344,"threads":2,"lookups":500,"rows":91419,"bytes_returned":39653913,"span_digest":10161253796817727229,"p50_ms":1.750,"p90_ms":2.097,"p99_ms":3.158,"max_ms":4.267,"threads_used":1}

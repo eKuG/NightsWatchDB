@@ -1,0 +1,10 @@
+otapdoor: listening on 0.0.0.0:4317, decode=full, wal=/wal
+otapdoor: breaking the stream: batch 110: stream dictionaries hold 539579880 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 121: stream dictionaries hold 543388680 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 113: stream dictionaries hold 542474945 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 93: stream dictionaries hold 538753255 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 110: stream dictionaries hold 541988840 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 105: stream dictionaries hold 541506086 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 100: stream dictionaries hold 538982005 bytes, over the limit of 536870912
+otapdoor: breaking the stream: batch 99: stream dictionaries hold 539213035 bytes, over the limit of 536870912
+otapdoor: shutting down (idle)

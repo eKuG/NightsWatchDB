@@ -1,0 +1,1 @@
+{"task":"open","variant":"zstdlong","wall_s":0.306,"user_cpu_s":0.28,"sys_cpu_s":0.02,"peak_rss_bytes":79310848,"cgroup_peak_bytes":78585856,"threads":2,"lookups":500,"bytes_returned":668910678,"mismatches":0,"open_setup_ms":0.7,"p50_ms":0.102,"p90_ms":1.136,"p99_ms":7.612,"max_ms":29.031,"threads_used":1}

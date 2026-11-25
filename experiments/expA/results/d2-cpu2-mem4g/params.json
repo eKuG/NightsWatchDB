@@ -1,0 +1,1 @@
+{"task":"params","variant":"cotrace","wall_s":0.165,"user_cpu_s":0.28,"sys_cpu_s":0.01,"peak_rss_bytes":47583232,"threads":2,"params":{"service":"docs-qa","model":"gpt-4o","from_ns":1767247299921061642,"to_ns":1767290699608087018}}

@@ -1,0 +1,1 @@
+{"task":"open","variant":"svc","wall_s":3.514,"user_cpu_s":2.93,"sys_cpu_s":0.47,"peak_rss_bytes":28012544,"threads":2,"lookups":500,"rows_returned":8922,"not_found":0,"rows_digest":"48a6fff0b323bd86","p50_ms":5.009,"p90_ms":13.618,"p99_ms":16.403,"max_ms":38.427}

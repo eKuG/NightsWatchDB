@@ -1,0 +1,72 @@
+cotrace open cold
+cotrace open warm
+cotrace list1 cold
+cotrace list1 warm
+cotrace list2 cold
+cotrace list2 warm
+cotrace agg cold
+cotrace agg warm
+svc open cold
+svc open warm
+svc list1 cold
+svc list1 warm
+svc list2 cold
+svc list2 warm
+svc agg cold
+svc agg warm
+traceid open cold
+traceid open warm
+traceid list1 cold
+traceid list1 warm
+traceid list2 cold
+traceid list2 warm
+traceid agg cold
+traceid agg warm
+ClickHouse cold
+ClickHouse warm
+done
+generate 8GB of content data
+payload build parquet
+payload build parquet-tuned
+payload build zstdlong
+payload build dedup
+layout build cotrace
+load ClickHouse
+sampled ids identical on both sides
+done
+payload parquet open cold
+payload parquet open warm
+payload parquet span cold
+payload parquet span warm
+payload parquet scan cold
+payload parquet scan warm
+payload parquet-tuned open cold
+payload parquet-tuned open warm
+payload parquet-tuned span cold
+payload parquet-tuned span warm
+payload parquet-tuned scan cold
+payload parquet-tuned scan warm
+payload zstdlong open cold
+payload zstdlong open warm
+payload zstdlong span cold
+payload zstdlong span warm
+payload zstdlong scan cold
+payload zstdlong scan warm
+payload dedup open cold
+payload dedup open warm
+payload dedup span cold
+payload dedup span warm
+payload dedup scan cold
+payload dedup scan warm
+layout cotrace open cold
+layout cotrace open warm
+layout cotrace list1 cold
+layout cotrace list1 warm
+layout cotrace list2 cold
+layout cotrace list2 warm
+layout cotrace agg cold
+layout cotrace agg warm
+ClickHouse cold
+ClickHouse warm
+done
+exit=0

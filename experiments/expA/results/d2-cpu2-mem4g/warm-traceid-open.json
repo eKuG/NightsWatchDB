@@ -1,0 +1,1 @@
+{"task":"open","variant":"traceid","wall_s":0.956,"user_cpu_s":0.85,"sys_cpu_s":0.10,"peak_rss_bytes":15814656,"threads":2,"lookups":500,"rows_returned":8922,"not_found":0,"rows_digest":"48a6fff0b323bd86","p50_ms":1.890,"p90_ms":2.052,"p99_ms":2.229,"max_ms":2.805}

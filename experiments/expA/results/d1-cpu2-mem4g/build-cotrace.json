@@ -1,0 +1,1 @@
+{"task":"build","variant":"cotrace","wall_s":0.945,"user_cpu_s":0.94,"sys_cpu_s":0.97,"peak_rss_bytes":46141440,"threads":2,"rows":91419,"traces":5014,"segments":61,"bytes_on_disk":{"segments":3376363,"traces.idx":220616,"summary.parquet":279140},"input_bytes":8018129217,"input_mb_per_s":8489.5,"multi_root_traces":0,"rootless_traces":0,"root_not_earliest_traces":0}

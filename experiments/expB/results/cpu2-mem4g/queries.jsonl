@@ -1,0 +1,1 @@
+{"task":"queries","variant":"piece","wall_s":0.046,"user_cpu_s":0.03,"sys_cpu_s":0.01,"peak_rss_bytes":22102016,"cgroup_peak_bytes":21934080,"threads":1,"queries":90,"per_class":{"rare":10,"mid":10,"common":10,"and2":10,"and3":10,"or2":10,"not":10,"prefix":10,"phrase":10},"pieces":169843}

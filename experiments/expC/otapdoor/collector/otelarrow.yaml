@@ -1,0 +1,70 @@
+# otelcol-contrib 0.165.0: OTLP gRPC in (from tracegen / Blitz), otelarrow exporter out to the OTel-Arrow door.
+# Lines marked CHANGED differ from the exporter's defaults; each has a reason.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # CHANGED: default is 4 MiB per message; tracegen batches are up to 3 MiB plus the span that crosses the
+        # limit and single attribute values reach 1 MiB.
+        max_recv_msg_size_mib: 64
+
+exporters:
+  otelarrow:
+    endpoint: ${env:DOOR_ENDPOINT}
+    tls:
+      insecure: true
+    # CHANGED: default 5 s; a 32 MiB batch can take longer to convert and log.
+    timeout: 120s
+    # defaults, written out because they are what is being measured: gRPC-level zstd ("zstdarrow5" on the wire)
+    # plus Arrow IPC body compression zstd (GRPC_COMPRESSION and PAYLOAD_COMPRESSION override, for the ablation runs)
+    compression: ${env:GRPC_COMPRESSION:-zstd}
+    arrow:
+      # CHANGED: the exporter must never fall back to plain OTLP. run-collector.sh sets this to true (the default of the
+      # script); with it, an Arrow failure retries and fails visibly instead of silently sending OTLP to a receiver
+      # that does not serve Arrow. The fallback test (see README) sets it to false on purpose.
+      disable_downgrade: ${env:DISABLE_DOWNGRADE}
+      # default is max(1, NumCPU/2) = 7 on a 14-CPU host, which scales with the machine; fixed for repeatability
+      num_streams: 2
+      # default 30s; overridden per run through the MAX_STREAM_LIFETIME substitution in run-collector.sh
+      max_stream_lifetime: ${env:MAX_STREAM_LIFETIME}
+      payload_compression: ${env:PAYLOAD_COMPRESSION:-zstd}
+    sending_queue:
+      enabled: true
+      # CHANGED: with one consumer per queue slot the number of in-flight batches is bounded by memory, not by items
+      num_consumers: 10
+      # CHANGED: default queue_size 100000 items with the items sizer; this is in requests so that the queue holds
+      # at most 64 pending tracegen requests (a few hundred MB at worst)
+      queue_size: 64
+      sizer: requests
+      # blocking pushes back on the sender (tracegen is synchronous), so nothing is dropped
+      block_on_overflow: true
+      # CHANGED: batching by bytes (the OTLP size, as the exporter helper measures it), the same as the OTLP-door
+      # configuration. The Go producer cannot put more than 65,535 spans with attributes into one message, so
+      # byte-sized batches of very small spans must stay below that (see README notes).
+      batch:
+        sizer: bytes
+        min_size: ${env:BATCH_MIN_BYTES:-8388608}
+        max_size: ${env:BATCH_MAX_BYTES:-33554432}
+        flush_timeout: 5s
+    retry_on_failure:
+      enabled: true
+      # CHANGED: default 300 s. A receiver fault must show up as lost data within a run, not as an endless retry.
+      max_elapsed_time: 120s
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces: {receivers: [otlp], exporters: [otelarrow]}
+    logs: {receivers: [otlp], exporters: [otelarrow]}
+    metrics: {receivers: [otlp], exporters: [otelarrow]}

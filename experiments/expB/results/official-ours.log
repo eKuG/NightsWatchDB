@@ -1,0 +1,8 @@
+ti build --store /official/d1-pay-dedup --out /data/ix-piece --variant piece
+ti build --store /official/d1-pay-dedup --out /data/ix-span --variant span
+ti queries --index /data/ix-piece --store /official/d1-pay-dedup --out /data/queries.json
+ti scan --store /official/d1-pay-dedup --queries /data/queries.json
+ti search --index /data/ix-piece --store /official/d1-pay-dedup --variant piece --queries /data/queries.json --runs 5
+ti search --index /data/ix-span --store /official/d1-pay-dedup --variant span --queries /data/queries.json --runs 5
+done
+exit=0

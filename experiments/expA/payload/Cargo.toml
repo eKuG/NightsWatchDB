@@ -1,0 +1,17 @@
+[package]
+name = "payload"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { version = "=60.2.0", default-features = false }
+parquet = { version = "=60.2.0", default-features = false, features = ["arrow", "zstd"] }
+prost = "=0.14.6"
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+sha2 = "=0.11.1"
+zstd = { version = "=0.14.5", default-features = false }
+twox-hash = { version = "=2.1.5", default-features = false, features = ["std", "xxhash3_128"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,1 @@
+{"task":"span","variant":"zstdlong","wall_s":0.216,"user_cpu_s":0.17,"sys_cpu_s":0.04,"peak_rss_bytes":71114752,"cgroup_peak_bytes":70496256,"threads":2,"lookups":500,"rows":91419,"bytes_returned":39653913,"span_digest":10161253796817727229,"p50_ms":0.249,"p90_ms":0.985,"p99_ms":2.805,"max_ms":4.170,"threads_used":1}

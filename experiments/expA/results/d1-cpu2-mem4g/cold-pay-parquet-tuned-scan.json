@@ -1,0 +1,1 @@
+{"task":"scan","variant":"parquet-tuned","wall_s":3.500,"user_cpu_s":3.36,"sys_cpu_s":0.14,"peak_rss_bytes":128925696,"cgroup_peak_bytes":210567168,"threads":2,"bytes_returned":7975118018,"mb_per_s":2281.2,"traces":5014,"mismatches":0,"threads_used":1}

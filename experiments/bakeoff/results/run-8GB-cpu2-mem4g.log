@@ -1,0 +1,60 @@
+[go] decode-1
+[go] decode-2
+[go] convert-1
+[go] convert-2
+[go] agg
+[go] sample-ids
+[go] trace
+[go] index
+[go] mixed
+[rust] decode-1
+[rust] decode-2
+[rust] convert-1
+[rust] convert-2
+[rust] agg
+[rust] sample-ids
+[rust] trace
+[rust] index
+[rust] mixed
+SAME WORK CHECK: PROBLEMS
+  - rust: step mixed FAILED (exit 0)
+
+decode MB/s                            go=6214.733056574601 rust=None
+decode peak RSS MB                     go=2615.390208 rust=None
+convert MB/s                           go=     2132.21      rust=     6866.10      go/rust= 0.31  (higher is better)
+convert CPU s (user+sys)               go=        6.44      rust=        2.33      go/rust= 2.76  (lower is better)
+convert peak RSS MB                    go=     3782.91      rust=     1624.52      go/rust= 2.33  (lower is better)
+spans.parquet MB                       go=        3.45      rust=        0.00      go/rust=  nan  (lower is better)
+payloads.parquet MB                    go=       85.82      rust=        0.00      go/rust=  nan  (lower is better)
+agg median ms                          go=        7.59      rust=        2.15      go/rust= 3.54  (lower is better)
+trace p50 ms                           go=       18.14      rust=        3.57      go/rust= 5.08  (lower is better)
+trace p99 ms                           go=       29.19      rust=        5.59      go/rust= 5.22  (lower is better)
+trace peak RSS MB                      go=      442.23      rust=       51.44      go/rust= 8.60  (lower is better)
+index text MB/s                        go=      195.60      rust=      221.10      go/rust= 0.88  (higher is better)
+index peak RSS MB                      go=      133.39      rust=      125.23      go/rust= 1.07  (lower is better)
+mixed ingest MB/s                      go=1465.2668594396464 rust=None
+mixed agg p99 ms                       go=38.229 rust=None
+mixed trace p99 ms                     go=96.715 rust=None
+mixed trace max ms                     go=311.722 rust=None
+mixed peak RSS MB                      go=3824.3328 rust=None
+go GC during mixed: count=798 total_pause_ms=488.493067 max_pause_ms=61.690292
+
+eefd9706c0896fd54c2891bfcc72753f9236d976683c3c7df1b629830a7fbfbf  /data/go-8GB/ids.txt
+eefd9706c0896fd54c2891bfcc72753f9236d976683c3c7df1b629830a7fbfbf  /data/rust-8GB/ids.txt
+1497d79eeb05f61322028b5d8628e2c5c85b0c5adcf6076ed9700edfa9e909fd  /data/go-8GB/index.bin
+1497d79eeb05f61322028b5d8628e2c5c85b0c5adcf6076ed9700edfa9e909fd  /data/rust-8GB/index.bin
+/data/go-8GB:
+total 97356
+-rw-r--r--    1 root     root          6600 Nov 24 17:12 ids.txt
+-rw-r--r--    1 root     root      10404559 Nov 24 17:12 index.bin
+-rw-r--r--    1 root     root      85822635 Nov 24 17:12 payloads.parquet
+-rw-r--r--    1 root     root       3450693 Nov 24 17:12 spans.parquet
+
+/data/rust-8GB:
+total 156444
+-rw-r--r--    1 root     root          6600 Nov 24 17:13 ids.txt
+-rw-r--r--    1 root     root      10404559 Nov 24 17:13 index.bin
+-rw-r--r--    1 root     root     146760081 Nov 24 17:13 payloads.parquet
+-rw-r--r--    1 root     root       3018734 Nov 24 17:13 spans.parquet
+
+exit=0

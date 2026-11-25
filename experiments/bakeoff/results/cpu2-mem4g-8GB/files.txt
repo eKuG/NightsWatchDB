@@ -1,0 +1,17 @@
+eefd9706c0896fd54c2891bfcc72753f9236d976683c3c7df1b629830a7fbfbf  /data/go-8GB/ids.txt
+eefd9706c0896fd54c2891bfcc72753f9236d976683c3c7df1b629830a7fbfbf  /data/rust-8GB/ids.txt
+1497d79eeb05f61322028b5d8628e2c5c85b0c5adcf6076ed9700edfa9e909fd  /data/go-8GB/index.bin
+1497d79eeb05f61322028b5d8628e2c5c85b0c5adcf6076ed9700edfa9e909fd  /data/rust-8GB/index.bin
+/data/go-8GB:
+total 97356
+-rw-r--r--    1 root     root          6600 Nov 24 17:12 ids.txt
+-rw-r--r--    1 root     root      10404559 Nov 24 17:12 index.bin
+-rw-r--r--    1 root     root      85822635 Nov 24 17:12 payloads.parquet
+-rw-r--r--    1 root     root       3450693 Nov 24 17:12 spans.parquet
+
+/data/rust-8GB:
+total 156444
+-rw-r--r--    1 root     root          6600 Nov 24 17:13 ids.txt
+-rw-r--r--    1 root     root      10404559 Nov 24 17:13 index.bin
+-rw-r--r--    1 root     root     146760081 Nov 24 17:13 payloads.parquet
+-rw-r--r--    1 root     root       3018734 Nov 24 17:13 spans.parquet

@@ -1,0 +1,1 @@
+{"task":"open","variant":"dedup","wall_s":0.572,"user_cpu_s":0.56,"sys_cpu_s":0.01,"peak_rss_bytes":12369920,"cgroup_peak_bytes":14610432,"threads":2,"lookups":500,"bytes_returned":668910678,"mismatches":0,"open_setup_ms":2.1,"p50_ms":0.757,"p90_ms":1.696,"p99_ms":8.708,"max_ms":25.765,"threads_used":1}

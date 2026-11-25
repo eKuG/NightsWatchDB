@@ -1,0 +1,8 @@
+generate 10000000 narrow spans
+build cotrace
+build svc
+build traceid
+load ClickHouse
+sampled ids identical on both sides
+done
+exit=0

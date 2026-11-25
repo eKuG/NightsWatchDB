@@ -1,0 +1,1 @@
+otelcol_exporter_sent_spans{exporter="otlp",server_address="expC-official-door",server_port="4317"} 1.0000039e+07

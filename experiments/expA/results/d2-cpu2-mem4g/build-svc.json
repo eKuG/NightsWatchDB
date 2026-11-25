@@ -1,0 +1,1 @@
+{"task":"build","variant":"svc","wall_s":18.314,"user_cpu_s":24.50,"sys_cpu_s":0.78,"peak_rss_bytes":645476352,"threads":2,"rows":10000039,"traces":545063,"segments":1,"bytes_on_disk":{"spans.parquet":403019231},"input_bytes":3622025986,"input_mb_per_s":197.8,"sort_runs":13,"sort_buffer_mb":256}

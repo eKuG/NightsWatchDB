@@ -1,0 +1,18 @@
+# otelcol-contrib 0.165.0 used only as a dead end for the plain-OTLP baseline (wire-baseline.sh): accepts OTLP
+# and discards it, so the sending collector's bytes and CPU can be read without the other stream's door.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 64
+exporters:
+  nop:
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces: {receivers: [otlp], exporters: [nop]}
+    logs: {receivers: [otlp], exporters: [nop]}
+    metrics: {receivers: [otlp], exporters: [nop]}

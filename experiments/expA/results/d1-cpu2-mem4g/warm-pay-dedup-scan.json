@@ -1,0 +1,1 @@
+{"task":"scan","variant":"dedup","wall_s":2.931,"user_cpu_s":2.87,"sys_cpu_s":0.06,"peak_rss_bytes":278167552,"cgroup_peak_bytes":277721088,"threads":2,"bytes_returned":7975118018,"mb_per_s":2735.1,"traces":5014,"mismatches":0,"threads_used":1}

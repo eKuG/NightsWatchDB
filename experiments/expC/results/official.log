@@ -1,0 +1,12 @@
+unit tests in containers
+direct OTLP: d1-otlp-lazy
+direct OTLP: d1-otlp-full
+direct OTLP: d1-otlp-none
+direct OTLP: d2-otlp-lazy
+direct OTLP: d2-otlp-full
+via collector (otlp): d1-col-otlp
+via collector (otelarrow): d1-col-otelarrow
+via collector (otlp): d2-col-otlp
+via collector (otelarrow): d2-col-otelarrow
+done
+exit=0

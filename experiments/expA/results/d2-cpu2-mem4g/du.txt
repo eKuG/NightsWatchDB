@@ -1,0 +1,5 @@
+376156	/data/d2-cotrace
+20	/data/d2-ids.txt
+393584	/data/d2-svc
+345944	/data/d2-traceid
+3537140	/data/d2.bin

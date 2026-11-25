@@ -1,0 +1,1 @@
+{"task":"params","variant":"cotrace","wall_s":0.005,"user_cpu_s":0.00,"sys_cpu_s":0.00,"peak_rss_bytes":8876032,"threads":2,"params":{"service":"ops-agent","model":"gpt-4o","from_ns":1767239342227825964,"to_ns":1767266815912789714}}

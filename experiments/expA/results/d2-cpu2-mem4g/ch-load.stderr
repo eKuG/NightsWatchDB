@@ -1,0 +1,49 @@
+Unable to find image 'clickhouse/clickhouse-server:26.10.12.13' locally
+26.10.12.13: Pulling from clickhouse/clickhouse-server
+d10eace4f80b: Pulling fs layer
+85a938d4b3e8: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+f74d428f3a50: Pulling fs layer
+7022fd6167eb: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+4f4fb700ef54: Pulling fs layer
+14c4fc71bded: Pulling fs layer
+874f2e582f8b: Pulling fs layer
+ecca1b346ca7: Pulling fs layer
+a0cf535a3fec: Pulling fs layer
+4f4fb700ef54: Already exists
+85a938d4b3e8: Download complete
+d10eace4f80b: Download complete
+7022fd6167eb: Download complete
+a0cf535a3fec: Download complete
+14c4fc71bded: Download complete
+874f2e582f8b: Download complete
+44136fa355b3: Already exists
+f74d428f3a50: Download complete
+86edd5866418: Download complete
+f74d428f3a50: Pull complete
+d10eace4f80b: Pull complete
+4f4fb700ef54: Pull complete
+4f0d67877c95: Download complete
+ecca1b346ca7: Download complete
+85a938d4b3e8: Pull complete
+7022fd6167eb: Pull complete
+a0cf535a3fec: Pull complete
+14c4fc71bded: Pull complete
+874f2e582f8b: Pull complete
+ecca1b346ca7: Pull complete
+Digest: sha256:15365147d687bb5682ea3d5d02d6c62a625c55846bc907900d255e7f491e6816
+Status: Downloaded newer image for clickhouse/clickhouse-server:26.10.12.13
+Unable to find image 'otel/opentelemetry-collector-contrib:0.165.0' locally
+0.165.0: Pulling from otel/opentelemetry-collector-contrib
+5738ee488d2b: Pulling fs layer
+b88e87d8eb3e: Pulling fs layer
+68194fb96824: Pulling fs layer
+b88e87d8eb3e: Download complete
+68194fb96824: Download complete
+68194fb96824: Pull complete
+5738ee488d2b: Download complete
+b88e87d8eb3e: Pull complete
+5738ee488d2b: Pull complete
+Digest: sha256:e40d61f10c9a617cca1ffd1be4d7e2b3a4b0f0001798ff07e58cabe82e618cea
+Status: Downloaded newer image for otel/opentelemetry-collector-contrib:0.165.0

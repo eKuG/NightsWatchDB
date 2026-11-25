@@ -1,0 +1,1 @@
+{"task":"open","variant":"cotrace","wall_s":0.076,"user_cpu_s":0.06,"sys_cpu_s":0.01,"peak_rss_bytes":10911744,"threads":2,"lookups":500,"rows_returned":7448,"not_found":0,"rows_digest":"1eb28c1d06ffc3e9","p50_ms":0.140,"p90_ms":0.168,"p99_ms":0.211,"max_ms":0.445}

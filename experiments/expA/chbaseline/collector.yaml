@@ -1,0 +1,58 @@
+# otelcol-contrib 0.165.0: OTLP gRPC in, ClickHouse exporter out. Schema is created by the exporter
+# (create_schema defaults to true) and is not touched. Only the lines marked CHANGED differ from the
+# exporter's defaults; each exists because the default loses or refuses data for this workload.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        # CHANGED: default is 4 MiB per message. tracegen batches are up to 3 MiB of encoded spans plus
+        # the span that crosses the limit, and single attribute values reach 1 MiB.
+        max_recv_msg_size_mib: 64
+
+exporters:
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: otel
+    # ttl is left at its default (0 = no TTL), so the 2026-01-01 data is never expired.
+    # async_insert, compress (lz4), table names, table engine: defaults.
+    # CHANGED: default 5s. A multi-megabyte batch can take longer; a timed-out attempt that actually
+    # committed is retried and would insert duplicate rows.
+    timeout: 120s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      # CHANGED: default queue_size 1000 requests with block_on_overflow false drops data when full.
+      # Blocking pushes back on the sender (tracegen is synchronous), so nothing is dropped.
+      queue_size: 64
+      sizer: requests
+      block_on_overflow: true
+      # CHANGED: batching inside the queue (what the exporter README recommends instead of the batch
+      # processor). Sized in bytes because rows range from ~1 KB (narrow) to ~1 MB (content); 5000-row
+      # batches of content spans would be gigabytes.
+      batch:
+        sizer: bytes
+        min_size: 8388608
+        max_size: 33554432
+        flush_timeout: 5s
+    retry_on_failure:
+      enabled: true
+      # CHANGED: default 300s total; a long ClickHouse stall should not lose a batch.
+      max_elapsed_time: 3600s
+
+service:
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [clickhouse]

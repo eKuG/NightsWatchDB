@@ -1,0 +1,1 @@
+{"lang":"rust","task":"mixed","wall_s":60.359,"user_cpu_s":106.55,"sys_cpu_s":13.58,"peak_rss_bytes":5974863872,"cgroup_peak_bytes":6208864256,"threads":2,"ingest_passes":15,"ingest_mb_per_s":2005.5,"agg_p50_ms":2.531,"agg_p99_ms":43.301,"agg_max_ms":61.590,"agg_count":7542,"trace_p50_ms":3.792,"trace_p99_ms":46.093,"trace_max_ms":56.747}
