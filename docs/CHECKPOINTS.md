@@ -5,7 +5,7 @@ its tests pass in a Linux container, it has been through an independent
 review, and it is committed, tagged `checkpoint-NN` and pushed.
 
 ```
-Progress  [███░░░░░░░░░░░░░]  3 of 16 checkpoints
+Progress  [████░░░░░░░░░░░░]  4 of 16 checkpoints
 ```
 
 | # | Checkpoint | State |
@@ -13,8 +13,8 @@ Progress  [███░░░░░░░░░░░░░]  3 of 16 checkpoint
 | 0 | Repository set-up: licence, design, experiments and measured results | done |
 | 1 | Storage core as libraries: shared types, write-ahead log, span parts (segment files, trace index, summary), manifest | done |
 | 2 | Engine: memory buffer, flush, recovery from the log, snapshot reads; open a trace, list traces, aggregate | done |
-| 3 | Server: OTLP door for traces, HTTP query API, container image, end-to-end test with the generator | built, in review |
-| 4 | Large text out of line, each distinct piece stored once | |
+| 3 | Server: OTLP door for traces, HTTP query API, container image, end-to-end test with the generator | done |
+| 4 | Large text out of line, each distinct piece stored once | next |
 | 5 | Text index over distinct pieces; search | |
 | 6 | Compaction, retention, late spans | |
 | 7 | Scores and annotations | |
@@ -139,3 +139,79 @@ Known limits at this checkpoint:
 - No compaction: every flush adds parts, and a span retried across a flush is
   stored twice (reads of one trace remove the duplicate; counts do not).
 - A whole trace is held in memory to read it.
+
+## Checkpoint 3: server
+
+The database now runs as one process, `nightswatchdb`, with a container
+image. It accepts traces over OTLP gRPC and reads them back over a small HTTP
+API: open a trace as JSON or as OTLP, list traces with filters, token totals
+per model. How to run it is in the [server README](../crates/server/README.md).
+
+What was added, beyond the process itself:
+
+- **OTLP decoding without a protobuf library.** Requests are read with the
+  crate's own wire reader. A sender gets its reply only after the request is
+  in the log and synced.
+- **The OTLP door handles the gRPC call itself**, on the HTTP library, with
+  no gRPC library in the server. That is what lets it take memory budget for
+  a message from its 5-byte header, before any of the message is held, and
+  cap decompression at the size the message claims.
+- **Resource and scope are stored once per batch**, as dictionary columns,
+  instead of once per span.
+- **One bad span does not sink its request or its trace.** A span with an
+  invalid id is rejected alone and reported to the sender as OTLP partial
+  success. Stored bytes that are not valid (a string cut inside a character,
+  for instance) are shown with a replacement character in JSON and repaired
+  in the OTLP view, so the rest of the trace always reads.
+- **Reading streams.** A trace is written to the client as it is rendered,
+  with a few kilobytes of working memory whatever the size of the trace.
+- **A benchmark harness** (`scripts/bench.sh`, `bench/querybench`) that loads
+  a dataset into the container and records ingest cost, storage, restart
+  times and query latencies.
+
+How it was tested: unit and integration tests in each crate (395 in the
+workspace at this checkpoint); requests truncated at every length, with
+flipped bits and random bytes; comparison against the reference OTLP types;
+hand-written HTTP/2 clients that stall, trickle, reset streams and open more
+streams than allowed, with memory measured by a counting allocator; the real
+binary under signals; and an end-to-end run in containers, in CI on every
+push, that loads generated traces from a Go gRPC client, half of them
+compressed, and checks them after `kill -9` and after a clean stop.
+
+Two independent reviews. The first found fifteen defects, the second, of the
+fixes, ten more. Each proven one is kept as a regression test. The ones that
+mattered most:
+
+- A small request could make the decoder allocate without bound, because the
+  resource was copied onto every span. Decoded size is now bounded by the
+  request size, and the door charges for the measured worst case.
+- The door's memory budget did not bound its memory: the gRPC library
+  buffered whole messages before the budget was asked, a reset stream gave
+  its budget back while its work went on, a slow sender could hold the
+  budget for ever, and waiting streams held data outside it. All four are
+  closed, with limits on calls, connections, waits and receive time.
+- One stored span with a bad byte made its whole trace unreadable.
+- Shutdown hung while any sender held a stream open; clients that did not
+  read could freeze the API, health check included.
+- A web page could read traces from an instance on the user's own machine
+  (DNS rebinding). The API now checks the `Host` header.
+- The part format changed without its version changing. It is now version 3,
+  and an older part is refused with a message that says so.
+
+Known limits at this checkpoint:
+
+- No authentication and no TLS. Both listeners bind to loopback by default.
+  An unauthenticated door cannot be made proof against a sender that keeps
+  retrying; what is bounded is memory, waiting time and what a refused sender
+  is told (retry or do not).
+- The second round of server fixes has not itself had an independent review.
+- OTLP over HTTP, logs and metrics are not accepted yet.
+- No compaction and no large-text store: every flush adds small parts, and
+  message text is stored in the span rows. Both are the next checkpoints, and
+  the storage and query numbers will not resemble the experiments' until
+  they land.
+- Benchmarks: the harness has only been run on its smoke dataset. Measured
+  results for the two reference datasets are not in the repository yet.
+- A log file stays on disk until it reaches its size limit even when
+  everything in it has been flushed.
+- A whole trace is held in memory by the engine while it is read.

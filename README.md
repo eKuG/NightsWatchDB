@@ -5,9 +5,11 @@ traces. One binary, written in Rust, storing data on a local disk or an object
 store.
 
 > **Status: early development.** The design has been tested with throwaway
-> experiments and the engine is now being built in checkpoints. Nothing here is
-> ready to run in production. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md)
-> for what works today.
+> experiments and the engine is being built in checkpoints. Today it runs as a
+> single process that accepts traces over OTLP gRPC and reads them back over
+> HTTP. It is not ready for production: there is no authentication, no
+> compaction, and the large-text store that the design rests on is not built
+> yet. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md) for what works today.
 
 ## Why another database
 
@@ -63,7 +65,8 @@ caveats are in [docs/benchmarks](docs/benchmarks/README.md).
 
 | Path | What it is |
 |---|---|
-| `crates/` | The database engine (in progress) |
+| `crates/` | The database: storage crates, the engine, OTLP decoding, the server |
+| `scripts/` | Test, end-to-end and benchmark scripts |
 | `bench/tracegen` | Deterministic generator of agent-shaped OTLP traces |
 | `bench/corpusprep` | Fetches public agent-trajectory datasets used as text |
 | `experiments/` | The experiments that tested the design, with their specs and raw results |
@@ -71,11 +74,38 @@ caveats are in [docs/benchmarks](docs/benchmarks/README.md).
 | `docs/CHECKPOINTS.md` | The build plan and current state |
 | `docs/benchmarks/` | Measured results |
 
+## Running it
+
+```sh
+docker build -t nightswatchdb .
+docker run -d --name nwdb \
+  -v nwdb-data:/var/lib/nightswatchdb \
+  -p 127.0.0.1:4317:4317 -p 127.0.0.1:4320:4320 \
+  nightswatchdb
+```
+
+Send traces to `127.0.0.1:4317` with any OTLP gRPC exporter, then:
+
+```sh
+curl 'http://127.0.0.1:4320/api/v1/traces?limit=10'
+curl  http://127.0.0.1:4320/api/v1/traces/<trace id>
+curl  http://127.0.0.1:4320/api/v1/tokens
+```
+
+The ports are published on the loopback address on purpose: there is no
+authentication yet. Configuration, the API and the limits are described in
+the [server README](crates/server/README.md).
+
 ## Building and testing
 
 The engine is developed and tested in Docker so results match a Linux
-deployment. Instructions arrive with the first runnable checkpoint; until then
-the experiments can be reproduced from the scripts in `experiments/`.
+deployment. See [scripts](scripts/README.md):
+
+```sh
+scripts/test.sh    # format check, lints, every test, in a Linux container
+scripts/e2e.sh     # build the image, load traces, kill -9, check the data
+scripts/bench.sh   # measure a dataset on a fixed resource profile
+```
 
 ## Licence
 
