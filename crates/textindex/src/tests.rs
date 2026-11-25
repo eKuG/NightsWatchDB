@@ -74,6 +74,30 @@ fn tokeniser_length_limit() {
 }
 
 #[test]
+fn dictionary_keys_of_short_and_long_tokens() {
+    use crate::tokenizer::{LONG_MARK, MAX_KEY_LEN, long_aware_key};
+    let mut buf = [0u8; MAX_KEY_LEN];
+    // a token of up to 64 bytes is its own key, case folded
+    assert_eq!(long_aware_key(b"Hello", &mut buf), b"hello");
+    let t64 = [b'Q'; 64];
+    assert_eq!(long_aware_key(&t64, &mut buf), [b'q'; 64]);
+    // a longer one is a zero byte and its first 64 bytes, case folded
+    let mut t90 = vec![b'A'; 70];
+    t90.extend_from_slice(&[b'z'; 20]);
+    let key = long_aware_key(&t90, &mut buf).to_vec();
+    assert_eq!(key.len(), MAX_KEY_LEN);
+    assert_eq!(key[0], LONG_MARK);
+    assert_eq!(&key[1..], [b'a'; 64]);
+    let all: Vec<Token<'_>> = tokens(&t90).collect();
+    assert_eq!(all[0].key(&mut buf), key);
+    // 65 bytes is already long; bytes above 0x7f are kept as they are
+    let t65 = [0xc3u8; 65];
+    let key = long_aware_key(&t65, &mut buf);
+    assert_eq!((key[0], key.len()), (LONG_MARK, 65));
+    assert!(key[1..].iter().all(|&b| b == 0xc3));
+}
+
+#[test]
 fn varints_round_trip_and_reject_damage() {
     let vals = [
         0u64,
@@ -249,10 +273,10 @@ fn front_coding_round_trip() {
     let r = IndexReader::open(idx.as_slice()).unwrap();
     assert_eq!(r.meta().terms as usize, vocab.len());
     for (i, t) in vocab.iter().enumerate() {
-        assert_eq!(r.term(t).unwrap().as_slice(), &[i as u32][..], "{t}");
+        assert_eq!(r.term(t).unwrap().ids.as_slice(), &[i as u32][..], "{t}");
     }
     for missing in ["", "0", "aaaa", "aab", "bb", "k000y", "zz", "k99"] {
-        assert!(r.term(missing).unwrap().is_empty(), "{missing}");
+        assert!(r.term(missing).unwrap().ids.is_empty(), "{missing}");
     }
     let want: Vec<u32> = vocab
         .iter()
@@ -281,11 +305,12 @@ fn skip_data_is_used_by_intersection() {
         .collect();
     let idx = build(&docs, usize::MAX);
     let r = IndexReader::open(idx.as_slice()).unwrap();
-    let (ids, blocks) = r.intersect_counting(&["common", "rare"]).unwrap();
-    assert_eq!(ids.as_slice(), &rare);
+    let (found, blocks) = r.intersect_counting(&["common", "rare"]).unwrap();
+    assert!(found.exact);
+    assert_eq!(found.ids.as_slice(), &rare);
     // The common list has 1,563 blocks; one block per candidate is enough.
     assert!(blocks <= 2 * rare.len() as u64 + 2, "read {blocks} blocks");
-    assert_eq!(r.term("common").unwrap().len(), 200_000);
+    assert_eq!(r.term("common").unwrap().ids.len(), 200_000);
 }
 
 #[test]

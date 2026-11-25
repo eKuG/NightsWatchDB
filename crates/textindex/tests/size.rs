@@ -100,6 +100,6 @@ fn an_index_over_text_is_a_small_fraction_of_it() {
     let m = model(&docs);
     for rank in [1u64, 2, 10, 300, 5000, 29_999] {
         let w = word_of(rank);
-        assert_eq!(r.term(&w).unwrap().as_slice(), m.term(&w), "{w}");
+        assert_eq!(r.term(&w).unwrap().ids.as_slice(), m.term(&w), "{w}");
     }
 }

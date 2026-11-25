@@ -21,6 +21,33 @@ use support::*;
 #[global_allocator]
 static ALLOC: alloc::Counting = alloc::Counting;
 
+/// The allocator counts the whole process, so the tests take turns: the
+/// total heap held during a call is only meaningful when nothing else runs.
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The most heap any one call may hold at its peak on a damaged file, beyond
+/// what was live before it. The honest cost is the 64 KiB verification
+/// buffer, a few dictionary blocks, the answers (a few thousand ids), and
+/// about 1.6 KB for each posting list a prefix search has open, which for a
+/// prefix of all the terms of a segment (a thousand or two here) is up to
+/// 3 MB. Damage may not make it more than that.
+const HELD_LIMIT: usize = 4 << 20;
+
+/// Runs `f` and fails if the total heap it held at its peak, not only its
+/// largest single allocation, passes `HELD_LIMIT`.
+fn bounded<T>(what: &str, f: impl FnOnce() -> T) -> T {
+    let before = alloc::live();
+    alloc::reset_peak();
+    let out = f();
+    let held = alloc::peak().saturating_sub(before);
+    assert!(held <= HELD_LIMIT, "{what}: held {held} bytes at its peak");
+    out
+}
+
 /// Uses every part of an index: opens it, looks up every word, scans every
 /// posting list, intersects, and verifies all checksums.
 fn exercise(bytes: &[u8], words: &[String]) -> Result<()> {
@@ -33,6 +60,56 @@ fn exercise(bytes: &[u8], words: &[String]) -> Result<()> {
     r.intersect(&[&words[0], &words[1]])?;
     r.intersect(&[&words[0], &words[1], &words[2]])?;
     r.verify()
+}
+
+/// The lowest and highest document id the directory of an index claims.
+fn doc_range(b: &[u8]) -> Option<(u32, u32)> {
+    let f = b.len().checked_sub(64)?;
+    let segs = u32::from_le_bytes(b.get(f + 4..f + 8)?.try_into().ok()?) as usize;
+    let dir = usize::try_from(le64(b, f + 48)?).ok()?;
+    let first = b.get(dir + 44..dir + 48)?;
+    let last = dir.checked_add(segs.checked_sub(1)?.checked_mul(72)?)?;
+    let hi = b.get(last + 48..last + 52)?;
+    Some((
+        u32::from_le_bytes(first.try_into().ok()?),
+        u32::from_le_bytes(hi.try_into().ok()?),
+    ))
+}
+
+/// Ids a search returned from a damaged file must still be a list: strictly
+/// ascending, inside the document range the file itself claims.
+fn assert_consistent(ids: &[u32], range: (u32, u32), what: &str) {
+    assert!(
+        ids.windows(2).all(|w| w[0] < w[1]),
+        "{what}: ids are not ascending"
+    );
+    assert!(
+        ids.iter().all(|&i| range.0 <= i && i <= range.1),
+        "{what}: an id is outside {range:?}"
+    );
+}
+
+/// As `exercise`, but every answer that comes back is checked to be a list of
+/// ids inside the document range, and each call is held to `HELD_LIMIT`. Any
+/// error must be `Corrupt` (the caller checks).
+fn exercise_consistent(bytes: &[u8], words: &[String]) -> Result<()> {
+    let r = IndexReader::open(bytes)?;
+    let range = doc_range(bytes).expect("an index that opens has a directory");
+    for w in words {
+        let m = bounded("term", || r.term(w))?;
+        assert_consistent(&m.ids, range, "term");
+    }
+    let all = bounded("prefix", || r.prefix("", usize::MAX))?;
+    assert_consistent(&all, range, "prefix");
+    let some = bounded("prefix", || r.prefix(&words[0][..1], usize::MAX))?;
+    assert_consistent(&some, range, "prefix");
+    let two = bounded("intersect", || r.intersect(&[&words[0], &words[1]]))?;
+    assert_consistent(&two.ids, range, "intersect");
+    let three = bounded("intersect", || {
+        r.intersect(&[&words[0], &words[1], &words[2]])
+    })?;
+    assert_consistent(&three.ids, range, "intersect");
+    bounded("verify", || r.verify())
 }
 
 fn must_be_corrupt(r: Result<()>, what: &str) {
@@ -91,6 +168,7 @@ fn assert_small_allocations() {
 
 #[test]
 fn every_truncation_is_corrupt() {
+    let _turn = turn();
     for (idx, words) in [small_index(), large_index()] {
         for len in 0..idx.len() {
             must_be_corrupt(
@@ -105,6 +183,7 @@ fn every_truncation_is_corrupt() {
 
 #[test]
 fn every_bit_flip_in_a_small_index_is_corrupt() {
+    let _turn = turn();
     let (idx, words) = small_index();
     for bit in 0..idx.len() * 8 {
         must_be_corrupt(exercise(&flip(&idx, bit), &words), &format!("bit {bit}"));
@@ -114,6 +193,7 @@ fn every_bit_flip_in_a_small_index_is_corrupt() {
 
 #[test]
 fn sampled_bit_flips_in_a_large_index_are_corrupt() {
+    let _turn = turn();
     let (idx, words) = large_index();
     let mut rng = rng(3);
     let nbits = idx.len() * 8;
@@ -129,6 +209,7 @@ fn sampled_bit_flips_in_a_large_index_are_corrupt() {
 
 #[test]
 fn random_bytes_are_corrupt() {
+    let _turn = turn();
     let words: Vec<String> = (0..24).map(vocab_word).collect();
     let mut rng = rng(4);
     for _ in 0..3000 {
@@ -203,7 +284,7 @@ fn structural_only(
     for bit in bits {
         let mut v = flip(idx, bit);
         refix_index(&mut v);
-        match exercise(&v, words) {
+        match exercise_consistent(&v, words) {
             Ok(()) => ok += 1,
             Err(Error::Corrupt(_)) => corrupt += 1,
             other => panic!("bit {bit} with repaired checksums: {other:?}"),
@@ -214,6 +295,7 @@ fn structural_only(
 
 #[test]
 fn damage_with_repaired_checksums_is_ok_or_corrupt() {
+    let _turn = turn();
     let (idx, words) = small_index();
     let (ok, corrupt) = structural_only(&idx, &words, 0..idx.len() * 8);
     // many single-bit changes break a structural rule; some (an id changed to
@@ -236,6 +318,7 @@ fn damage_with_repaired_checksums_is_ok_or_corrupt() {
 
 #[test]
 fn byte_level_damage_with_repaired_checksums_is_ok_or_corrupt() {
+    let _turn = turn();
     let (idx, words) = small_index();
     let mut rng = rng(7);
     for _ in 0..6000 {
@@ -250,11 +333,43 @@ fn byte_level_damage_with_repaired_checksums_is_ok_or_corrupt() {
             };
         }
         refix_index(&mut v);
-        match exercise(&v, &words) {
+        match exercise_consistent(&v, &words) {
             Ok(()) | Err(Error::Corrupt(_)) => {}
             other => panic!("{other:?}"),
         }
     }
+    assert_small_allocations();
+}
+
+/// An index whose list for "common" has 235 blocks, four pages of the skip
+/// table, in one segment: the skip table is the first thing in the file.
+fn paged_index() -> (Vec<u8>, Vec<String>) {
+    let docs: Docs = (0..30_000u32)
+        .map(|i| (i, format!("common x{} y{}", i % 7, i % 61).into_bytes()))
+        .collect();
+    let (idx, meta) = build(&docs, usize::MAX);
+    assert_eq!(meta.segments, 1);
+    let words = ["common", "x1", "y2", "x0"].map(String::from).to_vec();
+    (idx, words)
+}
+
+/// With the checksums repaired, damage in a skip table of several pages (the
+/// table is read a page at a time, as a search needs it) is `Corrupt` or
+/// leaves answers that are still lists inside the document range.
+#[test]
+fn damage_to_a_paged_skip_table_with_repaired_checksums_is_ok_or_corrupt() {
+    let _turn = turn();
+    let (idx, words) = paged_index();
+    exercise_consistent(&idx, &words).unwrap();
+    let mut rng = rng(11);
+    // the skip table of "common" (235 entries of 8 bytes) and the blocks
+    // after it, then bits anywhere
+    let table = 235 * 8 + 235 * 2;
+    let nbits = idx.len() * 8;
+    let mut bits: Vec<usize> = (0..1200).map(|_| rng.random_range(0..table * 8)).collect();
+    bits.extend((0..300).map(|_| rng.random_range(0..nbits)));
+    let (ok, corrupt) = structural_only(&idx, &words, bits.into_iter());
+    assert!(corrupt > 300, "ok {ok}, corrupt {corrupt}");
     assert_small_allocations();
 }
 
@@ -346,6 +461,7 @@ fn refix_idlist(b: &mut [u8]) {
 
 #[test]
 fn id_list_truncation_and_bit_flips_are_corrupt() {
+    let _turn = turn();
     let all = lists();
     let big = idlist_file(&all);
     read_all(&big, &all).unwrap();
@@ -374,6 +490,7 @@ fn id_list_truncation_and_bit_flips_are_corrupt() {
 
 #[test]
 fn id_list_damage_with_repaired_checksums_is_ok_or_corrupt() {
+    let _turn = turn();
     let all = lists();
     let small_lists = &all[..70];
     let small = idlist_file(small_lists);

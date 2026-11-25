@@ -7,7 +7,10 @@
 //! the crate gives the caller the pieces: the leaves of a query, a way to find
 //! the documents a leaf can match ([`IndexReader::term`], [`IndexReader::prefix`],
 //! [`phrase_candidates`] followed by [`phrase_matches`]), and [`evaluate`],
-//! which combines the id lists the caller computes for each leaf.
+//! which combines the id lists the caller computes for each leaf. A leaf for
+//! which [`Leaf::needs_confirmation`] is true (a phrase, or a word longer than
+//! 64 bytes) returns candidates that the caller checks against each
+//! document's text first.
 //!
 //! # Grammar
 //!
@@ -45,7 +48,7 @@
 use nwdb_core::{Error, Result};
 
 use crate::ids::{difference, intersect, is_ascending, union};
-use crate::reader::IndexReader;
+use crate::reader::{IndexReader, Matches};
 use crate::source::ReadAt;
 use crate::tokenizer::{MAX_TOKEN_LEN, tokens};
 
@@ -72,6 +75,9 @@ pub enum Query {
 }
 
 /// A leaf of a query: something an index can be asked about.
+///
+/// Not every leaf is answered exactly by the index alone; see
+/// [`Leaf::needs_confirmation`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leaf<'a> {
     /// See [`Query::Term`].
@@ -80,6 +86,26 @@ pub enum Leaf<'a> {
     Prefix(&'a str),
     /// See [`Query::Phrase`].
     Phrase(&'a [String]),
+}
+
+impl Leaf<'_> {
+    /// True if the ids the index returns for this leaf are candidates that
+    /// the caller must check against each document's text:
+    ///
+    /// - a `Term` longer than 64 bytes: [`IndexReader::term`] returns the
+    ///   documents whose token shares its first 64 bytes; confirm with
+    ///   [`contains_token`];
+    /// - a `Phrase`: [`phrase_candidates`] returns the documents that hold the
+    ///   tokens, not necessarily in order; confirm with [`phrase_matches`].
+    ///
+    /// A `Prefix` and a `Term` of up to 64 bytes are exact.
+    pub fn needs_confirmation(&self) -> bool {
+        match self {
+            Leaf::Term(t) => t.len() > MAX_TOKEN_LEN,
+            Leaf::Prefix(_) => false,
+            Leaf::Phrase(_) => true,
+        }
+    }
 }
 
 /// The leaves of `query`, in the order they appear.
@@ -299,9 +325,14 @@ fn collapse(mut items: Vec<Query>, make: fn(Vec<Query>) -> Query) -> Option<Quer
 
 // ------------------------------------------------------------- evaluation
 
-/// The deepest query [`evaluate`] accepts. A parsed query nests at most 32
-/// levels of parentheses and `-`, each of which can add an `And`, an `Or` and
-/// a `Not`; a query built by hand that is deeper is `InvalidArgument`.
+/// The deepest query [`evaluate`] accepts: 128 levels of nodes, the top one
+/// being level 0. A `Not` that is a direct operand of an `And` adds no level
+/// of its own (the `And` evaluates what is inside it one level down), so an
+/// `And` and its `Not` count as one level; every other nesting counts one per
+/// node. A parsed query nests at most 32 levels of parentheses and `-`, each
+/// of which adds at most two nodes (an `And` and an `Or`, or a `Not`), so
+/// every parsed query is within the limit. A query built by hand that is
+/// deeper is `InvalidArgument`.
 pub const MAX_EVAL_DEPTH: usize = 128;
 
 /// Combines ascending id lists the caller supplies for each leaf.
@@ -388,26 +419,43 @@ fn eval(q: &Query, universe: &[u32], leaf: &mut LeafFn<'_>, depth: usize) -> Res
 
 // ----------------------------------------------------------------- phrases
 
-/// Documents that contain every indexable token of the phrase (a token longer
-/// than 64 bytes is not indexed and is skipped). These are the documents that
-/// can hold the phrase; check each with [`phrase_matches`].
+/// Documents that contain every token of the phrase, in any order: the
+/// documents that can hold the phrase. A token longer than 64 bytes
+/// contributes the documents whose token shares its first 64 bytes. Check each
+/// document with [`phrase_matches`].
 ///
-/// A phrase with no indexable token cannot be searched and is
-/// `InvalidArgument`.
+/// The answer is only exact (`exact: true`) for a phrase of a single token of
+/// up to 64 bytes; for any other it is candidates, and the caller must run
+/// [`phrase_matches`] whatever the flag was for the individual tokens. An
+/// empty phrase is `InvalidArgument`.
 pub fn phrase_candidates<S: ReadAt, T: AsRef<[u8]>>(
     reader: &IndexReader<S>,
     tokens: &[T],
-) -> Result<crate::DocIds> {
+) -> Result<Matches> {
+    if tokens.is_empty() {
+        return bad("a phrase needs at least one token");
+    }
     let wanted: Vec<Vec<u8>> = tokens
         .iter()
         .map(|t| t.as_ref())
-        .filter(|t| t.len() <= MAX_TOKEN_LEN)
-        .map(|t| t.to_ascii_lowercase())
+        .map(|t| {
+            if t.len() <= MAX_TOKEN_LEN {
+                t.to_ascii_lowercase()
+            } else {
+                t.to_vec()
+            }
+        })
         .collect();
-    if wanted.is_empty() {
-        return bad("a phrase needs at least one token short enough to be indexed");
-    }
-    reader.intersect(&wanted)
+    let mut m = reader.intersect(&wanted)?;
+    m.exact &= tokens.len() == 1;
+    Ok(m)
+}
+
+/// True if `token` occurs as a whole token of `text`, with ASCII case
+/// folded. This confirms a candidate that [`IndexReader::term`] returned for
+/// a token longer than 64 bytes.
+pub fn contains_token(text: &[u8], token: &[u8]) -> bool {
+    tokens(text).any(|t| t.eq_folded(token))
 }
 
 /// True if `tokens` occur one after another, in order, in the token stream

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use nwdb_core::Error;
 use nwdb_textindex::{
-    IndexReader, Leaf, Query, evaluate, ids, leaves, phrase_candidates, phrase_matches,
+    IndexReader, Leaf, Query, contains_token, evaluate, ids, leaves, phrase_candidates,
+    phrase_matches,
 };
 use rand::Rng;
 use rand::rngs::StdRng;
@@ -42,7 +43,8 @@ fn random_query(rng: &mut StdRng, m: &Model, terms: &[String], depth: usize) -> 
         0 => Query::Term(pick(rng)),
         1 => {
             let t = pick(rng);
-            let mut n = rng.random_range(2..=t.len().max(2)).min(t.len());
+            // a prefix is at most 64 bytes
+            let mut n = rng.random_range(2..=t.len().max(2)).min(t.len()).min(64);
             while !t.is_char_boundary(n) {
                 n -= 1;
             }
@@ -71,9 +73,10 @@ fn leaf_ids(
     leaf: &Leaf<'_>,
 ) -> nwdb_core::Result<Vec<u32>> {
     Ok(match leaf {
-        Leaf::Term(t) => r.term(t)?.into_vec(),
+        Leaf::Term(t) => term_ids(r, texts, t)?,
         Leaf::Prefix(p) => r.prefix(p, usize::MAX)?.into_vec(),
         Leaf::Phrase(ph) => phrase_candidates(r, ph)?
+            .ids
             .into_iter()
             .filter(|id| phrase_matches(texts[id], ph))
             .collect(),
@@ -87,6 +90,7 @@ fn check_all(docs: &Docs, budget: usize, seed: u64, words: &[String], queries: u
     assert_eq!(r.meta(), &meta);
     assert_eq!(r.doc_count(), docs.len() as u64);
     let terms = m.distinct_terms();
+    let texts: HashMap<u32, &[u8]> = docs.iter().map(|(i, t)| (*i, t.as_slice())).collect();
     if budget == usize::MAX {
         assert_eq!(meta.segments, 1);
     } else if budget <= 2_000 {
@@ -95,12 +99,15 @@ fn check_all(docs: &Docs, budget: usize, seed: u64, words: &[String], queries: u
 
     // every term, and some that are absent or in the wrong form
     for t in terms.iter().take(2000) {
-        assert_eq!(r.term(t).unwrap().as_slice(), m.term(t), "term {t}");
+        assert_eq!(term_ids(&r, &texts, t).unwrap(), m.term(t), "term {t}");
     }
+    // a long word the documents do not hold, one that shares its first 64
+    // bytes with a word they do hold, and short ones in the wrong form
     let long = "q".repeat(80);
-    for absent in ["zzzzz", "", "w", "W1", long.as_str()] {
+    let near = format!("{}{}", "x".repeat(64), "y".repeat(6));
+    for absent in ["zzzzz", "", "w", "W1", long.as_str(), near.as_str()] {
         assert_eq!(
-            r.term(absent).unwrap().as_slice(),
+            term_ids(&r, &texts, absent).unwrap(),
             m.term(absent),
             "{absent}"
         );
@@ -138,16 +145,25 @@ fn check_all(docs: &Docs, budget: usize, seed: u64, words: &[String], queries: u
         let pick: Vec<&String> = (0..k).map(|_| tl[rng.random_range(0..tl.len())]).collect();
         let want: Vec<u32> =
             m.docs_where(|t| pick.iter().all(|w| t.iter().any(|x| x.1 && &x.0 == *w)));
-        assert_eq!(r.intersect(&pick).unwrap().as_slice(), want, "{pick:?}");
+        let got = r.intersect(&pick).unwrap();
+        assert_eq!(got.exact, pick.iter().all(|w| w.len() <= 64));
+        // a long token only gives candidates; confirm them
+        let got: Vec<u32> = got
+            .ids
+            .into_iter()
+            .filter(|id| pick.iter().all(|w| contains_token(texts[id], w.as_bytes())))
+            .collect();
+        assert_eq!(got, want, "{pick:?}");
     }
 
     // phrases: candidates contain every match, and verification is exact
-    let texts: HashMap<u32, &[u8]> = docs.iter().map(|(i, t)| (*i, t.as_slice())).collect();
     for _ in 0..40 {
         let Query::Phrase(ph) = phrase_from(&mut rng, &m) else {
             continue;
         };
         let cand = phrase_candidates(&r, &ph).unwrap();
+        assert!(!cand.exact);
+        let cand = cand.ids;
         let want = m.phrase(&ph);
         assert!(want.iter().all(|id| cand.contains(*id)), "{ph:?}");
         let got: Vec<u32> = cand
@@ -240,7 +256,7 @@ fn long_lists_cross_block_boundaries() {
         let (idx, _) = build(&docs, budget);
         let r = IndexReader::open(idx.as_slice()).unwrap();
         for t in ["common", "half", "third", "rare"] {
-            assert_eq!(r.term(t).unwrap().as_slice(), m.term(t), "{t}");
+            assert_eq!(r.term(t).unwrap().ids.as_slice(), m.term(t), "{t}");
         }
         let want = m.docs_where(|t| {
             ["common", "half", "third"]
@@ -250,11 +266,15 @@ fn long_lists_cross_block_boundaries() {
         assert_eq!(
             r.intersect(&["common", "half", "third"])
                 .unwrap()
+                .ids
                 .as_slice(),
             want
         );
         assert_eq!(
-            r.intersect(&["rare", "third", "half"]).unwrap().as_slice(),
+            r.intersect(&["rare", "third", "half"])
+                .unwrap()
+                .ids
+                .as_slice(),
             {
                 m.docs_where(|t| {
                     ["rare", "third", "half"]
@@ -296,11 +316,14 @@ fn builder_ordering_and_degenerate_indexes() {
     assert_eq!((meta.docs, meta.segments), (3, 1));
     let r = IndexReader::open(out.as_slice()).unwrap();
     assert_eq!(r.doc_count(), 3);
-    assert_eq!(r.term("hello").unwrap().as_slice(), [5, u32::MAX]);
-    assert_eq!(r.term("world").unwrap().as_slice(), [5]);
-    assert_eq!(r.intersect(&["hello", "world"]).unwrap().as_slice(), [5]);
+    assert_eq!(r.term("hello").unwrap().ids.as_slice(), [5, u32::MAX]);
+    assert_eq!(r.term("world").unwrap().ids.as_slice(), [5]);
+    assert_eq!(
+        r.intersect(&["hello", "world"]).unwrap().ids.as_slice(),
+        [5]
+    );
     assert!(matches!(
-        r.intersect::<&str>(&[]),
+        r.intersect::<&str>(&[]).map(|m| m.ids),
         Err(Error::InvalidArgument(_))
     ));
 
@@ -308,11 +331,11 @@ fn builder_ordering_and_degenerate_indexes() {
     let (empty, meta) = build(&Vec::new(), usize::MAX);
     assert_eq!(meta.segments, 0);
     let r = IndexReader::open(empty.as_slice()).unwrap();
-    assert!(r.term("a").unwrap().is_empty() && r.prefix("ab", 1).unwrap().is_empty());
+    assert!(r.term("a").unwrap().ids.is_empty() && r.prefix("ab", 1).unwrap().is_empty());
     let (blank, _) = build(&vec![(0, b"...".to_vec()), (1, b"".to_vec())], usize::MAX);
     let r = IndexReader::open(blank.as_slice()).unwrap();
     assert_eq!(r.doc_count(), 2);
-    assert!(r.term("a").unwrap().is_empty());
+    assert!(r.term("a").unwrap().ids.is_empty());
     r.verify().unwrap();
 }
 
@@ -337,7 +360,7 @@ fn a_file_reader_matches_memory_and_serves_many_threads() {
             s.spawn(move || {
                 for i in 0..40 {
                     let w = vocab_word((i * 7 + t) % 40);
-                    assert_eq!(r.term(&w).unwrap().as_slice(), m.term(&w));
+                    assert_eq!(r.term(&w).unwrap().ids.as_slice(), m.term(&w));
                     assert_eq!(r.prefix("w0", 1000).unwrap().as_slice(), m.prefix("w0"));
                 }
             });
@@ -345,7 +368,10 @@ fn a_file_reader_matches_memory_and_serves_many_threads() {
     });
     for i in 0..40 {
         let w = vocab_word(i);
-        assert_eq!(from_file.term(&w).unwrap(), from_vec.term(&w).unwrap());
+        assert_eq!(
+            from_file.term(&w).unwrap().ids,
+            from_vec.term(&w).unwrap().ids
+        );
     }
     std::fs::remove_file(&path).unwrap();
 }

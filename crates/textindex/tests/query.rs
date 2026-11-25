@@ -59,10 +59,16 @@ fn words_phrases_and_prefixes() {
     assert_eq!(parse("foo**").unwrap(), pre("foo"));
     // only ASCII is folded
     assert_eq!(parse("\u{dc}n\u{ef}CODE").unwrap(), t("\u{dc}n\u{ef}code"));
-    // a long token is kept as it is: it matches nothing in an index
+    // a long token is kept as it is; the index finds it as candidates
     let long = "z".repeat(70);
     assert_eq!(parse(&long).unwrap(), t(&long));
     assert_eq!(parse(&format!("a-{long}")).unwrap(), ph(&["a", &long]));
+    let (q, ph70) = (parse(&long).unwrap(), parse(&format!("a-{long}")).unwrap());
+    assert!(leaves(&q)[0].needs_confirmation());
+    assert!(leaves(&ph70)[0].needs_confirmation());
+    assert!(!leaves(&parse("foo").unwrap())[0].needs_confirmation());
+    assert!(!leaves(&parse("fo*").unwrap())[0].needs_confirmation());
+    assert!(leaves(&parse("foo-bar").unwrap())[0].needs_confirmation());
     assert_eq!(
         parse("foo\"bar baz\"").unwrap(),
         and(vec![t("foo"), ph(&["bar", "baz"])])
@@ -426,9 +432,10 @@ fn parsed_queries_through_the_index_match_brute_force() {
                 parsed += 1;
                 let got = evaluate(&q, &universe, |l| {
                     Ok(match l {
-                        Leaf::Term(w) => r.term(w)?.into_vec(),
+                        Leaf::Term(w) => term_ids(&r, &texts, w)?,
                         Leaf::Prefix(p) => r.prefix(p, usize::MAX)?.into_vec(),
                         Leaf::Phrase(p) => phrase_candidates(&r, p)?
+                            .ids
                             .into_iter()
                             .filter(|id| phrase_matches(texts[id], p))
                             .collect(),
@@ -466,28 +473,44 @@ fn phrase_matching() {
 }
 
 #[test]
-fn phrase_candidates_skip_unindexable_tokens() {
+fn phrase_candidates_include_long_tokens() {
     let long = "z".repeat(70);
+    // shares the first 64 bytes with `long`, so it is a candidate that the
+    // text must rule out
+    let near = format!("{}{}", "z".repeat(64), "y".repeat(6));
     let docs: Docs = vec![
         (0, format!("foo {long} bar").into_bytes()),
         (1, b"foo bar".to_vec()),
         (2, b"bar foo".to_vec()),
         (3, b"foo".to_vec()),
+        (4, format!("foo {near} bar").into_bytes()),
+        (5, format!("{long} only").into_bytes()),
     ];
     let (idx, _) = build(&docs, usize::MAX);
     let r = IndexReader::open(idx.as_slice()).unwrap();
-    let cand = phrase_candidates(&r, &["foo", long.as_str(), "bar"]).unwrap();
-    assert_eq!(cand.as_slice(), [0, 1, 2]);
+    let phrase = ["foo", long.as_str(), "bar"];
+    let cand = phrase_candidates(&r, &phrase).unwrap();
+    assert!(!cand.exact);
+    assert_eq!(cand.ids.as_slice(), [0, 4]);
     let hits: Vec<u32> = cand
+        .ids
         .into_iter()
-        .filter(|&i| phrase_matches(&docs[i as usize].1, &["foo", long.as_str(), "bar"]))
+        .filter(|&i| phrase_matches(&docs[i as usize].1, &phrase))
         .collect();
     assert_eq!(hits, [0]);
+    // a phrase of only long tokens can be searched
+    let only = phrase_candidates(&r, &[long.as_str(), long.as_str()]).unwrap();
+    assert!(!only.exact);
+    assert_eq!(only.ids.as_slice(), [0, 4, 5]);
+    assert_eq!(
+        phrase_candidates(&r, &[long.as_str()]).unwrap().ids.len(),
+        3
+    );
+    // a single short token is exact; any phrase of several is not
+    let one = phrase_candidates(&r, &["foo"]).unwrap();
+    assert!(one.exact && one.ids.as_slice() == [0, 1, 2, 3, 4]);
+    assert!(!phrase_candidates(&r, &["foo", "bar"]).unwrap().exact);
     // nothing to look up
-    assert!(matches!(
-        phrase_candidates(&r, &[long.as_str()]),
-        Err(Error::InvalidArgument(_))
-    ));
     assert!(matches!(
         phrase_candidates::<_, &str>(&r, &[]),
         Err(Error::InvalidArgument(_))

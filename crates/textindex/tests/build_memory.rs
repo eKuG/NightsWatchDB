@@ -88,10 +88,11 @@ fn run(budget: usize, docs: u32, words: usize) -> (usize, u32, u64) {
 #[test]
 fn memory_follows_the_budget_not_the_input() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    // 20,000 documents of 100 words: about 13 MB of text
+    // 40,000 documents of 100 words: about 30 MB of text. The smallest budget
+    // the builder accepts is 1 MiB, so the budgets are 1, 2 and 4 MiB.
     let mut results = Vec::new();
-    for budget in [128 * 1024, 512 * 1024, 2 * 1024 * 1024] {
-        let (peak, segments, text) = run(budget, 20_000, 100);
+    for budget in [1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024] {
+        let (peak, segments, text) = run(budget, 40_000, 100);
         println!(
             "budget {budget:>8}: peak {peak:>9} bytes ({:.2} x budget), {segments} segments, {text} bytes of text",
             peak as f64 / budget as f64
@@ -100,9 +101,9 @@ fn memory_follows_the_budget_not_the_input() {
         assert!(segments >= 5, "{segments} segments");
         // the open segment, plus growth of the table before a close, plus the
         // sorted order and dictionary built while closing, plus about 100 KB
-        // of fixed buffers
+        // of fixed buffers, plus 144 bytes for each closed segment
         assert!(
-            peak <= budget * 3 / 2 + 256 * 1024,
+            peak <= budget * 3 / 2 + 256 * 1024 + 144 * segments as usize,
             "peak {peak} for budget {budget}"
         );
         results.push((budget, peak));
@@ -118,7 +119,7 @@ fn memory_follows_the_budget_not_the_input() {
 #[test]
 fn an_open_reader_holds_only_sparse_indexes() {
     let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-    for budget in [usize::MAX, 600 * 1024] {
+    for budget in [usize::MAX, 1024 * 1024] {
         let mut rng = StdRng::seed_from_u64(9);
         let mut out = Vec::new();
         let mut text = Vec::new();

@@ -5,11 +5,23 @@
 //! Bytes at or above `0x80` are token bytes so that UTF-8 text in any script
 //! stays together without the index needing to know about Unicode.
 //!
-//! A token longer than [`MAX_TOKEN_LEN`] bytes is not indexed, but it still
-//! counts as a token, so that it breaks or extends adjacency in a phrase.
+//! A token longer than [`MAX_TOKEN_LEN`] bytes is not a term of its own. The
+//! index lists it under a key made of a zero byte and its first
+//! [`MAX_TOKEN_LEN`] bytes, so a search for it finds candidates that the caller
+//! confirms against the text. It also counts as a token, so that it breaks or
+//! extends adjacency in a phrase.
 
-/// The longest token that is indexed, in bytes.
+/// The longest token that is a term of its own, in bytes.
 pub const MAX_TOKEN_LEN: usize = 64;
+
+/// The longest key in the index: the zero byte that marks a key for a token
+/// longer than [`MAX_TOKEN_LEN`], then its first [`MAX_TOKEN_LEN`] bytes.
+pub const MAX_KEY_LEN: usize = MAX_TOKEN_LEN + 1;
+
+/// The byte that starts the key of a token longer than [`MAX_TOKEN_LEN`]. It
+/// is never a token byte, so these keys cannot collide with ordinary terms,
+/// and they sort before all of them.
+pub const LONG_MARK: u8 = 0;
 
 const IS_TOKEN_BYTE: [bool; 256] = {
     let mut t = [false; 256];
@@ -61,6 +73,13 @@ impl<'a> Token<'a> {
         Some(&*out)
     }
 
+    /// The key the index lists this token under, written into `buf`: the
+    /// lowercased token if it is at most [`MAX_TOKEN_LEN`] bytes, otherwise
+    /// [`LONG_MARK`] and its first [`MAX_TOKEN_LEN`] bytes, lowercased.
+    pub(crate) fn key<'b>(&self, buf: &'b mut [u8; MAX_KEY_LEN]) -> &'b [u8] {
+        long_aware_key(self.raw, buf)
+    }
+
     /// True if this token equals `other` once ASCII case is folded.
     pub fn eq_folded(&self, other: &[u8]) -> bool {
         self.raw.eq_ignore_ascii_case(other)
@@ -92,4 +111,14 @@ impl<'a> Iterator for Tokens<'a> {
         self.rest = &rest[end..];
         Some(Token { raw: &rest[..end] })
     }
+}
+
+/// The key for a token of any length, as [`Token::key`] builds it.
+pub(crate) fn long_aware_key<'b>(raw: &[u8], buf: &'b mut [u8; MAX_KEY_LEN]) -> &'b [u8] {
+    let kept = raw.len().min(MAX_TOKEN_LEN);
+    let start = usize::from(raw.len() > MAX_TOKEN_LEN);
+    buf[0] = LONG_MARK;
+    buf[start..start + kept].copy_from_slice(&raw[..kept]);
+    buf[start..start + kept].make_ascii_lowercase();
+    &buf[..start + kept]
 }

@@ -28,6 +28,13 @@
 //! in two steps: [`phrase_candidates`] finds the documents that contain every
 //! token, and the caller checks each with [`phrase_matches`] against the text.
 //!
+//! # Words longer than 64 bytes
+//!
+//! A token of more than 64 bytes is listed under its first 64 bytes. Searching
+//! for one returns [`Matches`] with `exact: false`: candidates, to be
+//! confirmed with [`contains_token`]. Prefix searches see these tokens too and
+//! stay exact.
+//!
 //! # Damaged files
 //!
 //! Every length, count and offset read from a file is checked before it is
@@ -47,14 +54,15 @@ mod tokenizer;
 
 pub mod ids;
 
-pub use builder::{DEFAULT_SEGMENT_BUDGET, IndexBuilder, IndexOptions};
+pub use builder::{DEFAULT_SEGMENT_BUDGET, IndexBuilder, IndexOptions, MIN_SEGMENT_BUDGET};
 pub use idlist::{IdListMeta, IdListReader, IdListWriter};
 pub use ids::DocIds;
 pub use meta::IndexMeta;
 pub use query::{
-    Leaf, MAX_EVAL_DEPTH, Query, evaluate, leaves, parse, phrase_candidates, phrase_matches,
+    Leaf, MAX_EVAL_DEPTH, Query, contains_token, evaluate, leaves, parse, phrase_candidates,
+    phrase_matches,
 };
-pub use reader::IndexReader;
+pub use reader::{IndexReader, Matches};
 pub use source::ReadAt;
 pub use tokenizer::{MAX_TOKEN_LEN, Token, Tokens, tokens};
 

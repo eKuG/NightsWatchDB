@@ -6,9 +6,11 @@
 //! list (possibly empty) of ascending `u32`.
 //!
 //! The lists use the same gap, bit-packing and block code as the index
-//! postings. Keys are grouped (up to 128 keys or about 32 KiB of lists, whichever
-//! comes first); a group is one read and carries its own checksum, which is
-//! verified whenever one of its keys is read. The README gives the layout.
+//! postings. Keys are grouped (up to 128 keys or 32 KiB of lists, whichever
+//! comes first; a list that does not fit the group being filled starts the
+//! next one, and a list over 32 KiB is a group of its own); a group is one
+//! read and carries its own checksum, which is verified whenever one of its
+//! keys is read. The README gives the layout.
 
 use std::io::Write;
 
@@ -66,7 +68,9 @@ impl<W: Write> IdListWriter<W> {
     }
 
     /// Appends the list of the next key. `ids` must be strictly ascending.
-    /// Memory is bounded by one group: about 32 KiB plus one encoded list.
+    /// Memory is bounded by one group (up to about 32 KiB, or one encoded
+    /// list if that is larger) plus one encoded list, and 16 bytes per group
+    /// already written.
     pub fn push(&mut self, ids: &[u32]) -> Result<()> {
         if self.failed {
             return Err(Error::fatal("id-list writer failed earlier"));
@@ -90,7 +94,17 @@ impl<W: Write> IdListWriter<W> {
         } else {
             encode_blocks(ids, &mut self.lists, |_, _| {});
         }
-        self.lens.push(self.lists.len() - before);
+        let len = self.lists.len() - before;
+        if before > 0 && self.lists.len() > GROUP_BYTES {
+            // This list would take the group past the limit: close the group
+            // without it, so that a reader of a small neighbour never pays
+            // for a large list. The list then starts the next group, and if
+            // it alone is over the limit it is a group of its own.
+            let list = self.lists.split_off(before);
+            self.close_group().inspect_err(|_| self.failed = true)?;
+            self.lists = list;
+        }
+        self.lens.push(len);
         self.keys += 1;
         self.ids += ids.len() as u64;
         if self.lens.len() >= MAX_GROUP_KEYS || self.lists.len() >= GROUP_BYTES {
@@ -104,6 +118,7 @@ impl<W: Write> IdListWriter<W> {
             return Ok(());
         }
         let mut header = Vec::with_capacity(self.lens.len() * 2);
+        debug_assert!(self.lists.len() <= GROUP_BYTES || self.lens.len() == 1);
         for &l in &self.lens {
             put_varint(&mut header, l as u64);
         }

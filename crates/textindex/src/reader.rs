@@ -2,8 +2,9 @@
 //!
 //! The reader keeps only the directory and the sparse index of each segment
 //! in memory. Every search is positioned reads: one block of the dictionary,
-//! then the posting list blocks it needs. Nothing is shared between calls, so
-//! one reader serves any number of threads.
+//! then the posting list blocks it needs. Apart from the verdict of each
+//! segment's checksum, nothing is shared between calls, so one reader serves
+//! any number of threads.
 //!
 //! Every number read from the file is checked before it is used: lengths
 //! against the file's length, offsets against the area they point into, counts
@@ -13,6 +14,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nwdb_core::{Error, Result};
@@ -25,10 +27,41 @@ use crate::format::{
 use crate::ids::DocIds;
 use crate::meta::IndexMeta;
 use crate::source::{ReadAt, read_checked};
-use crate::tokenizer::MAX_TOKEN_LEN;
+use crate::tokenizer::{LONG_MARK, MAX_KEY_LEN, MAX_TOKEN_LEN, long_aware_key};
 
-/// Bytes a cursor reads ahead when it walks a posting list block by block.
+/// Bytes a cursor reads ahead when it walks a posting list block by block,
+/// but only when it is the only list the search has open. A search with
+/// several lists open reads exactly the block it needs, so what a search
+/// holds does not multiply by this.
 const READ_AHEAD: u64 = 8 * 1024;
+
+/// Skip entries a cursor holds at a time (one page). A cursor reads the
+/// skip table of a long list one page at a time, so its memory does not
+/// depend on the length of the list.
+const PAGE: usize = 64;
+
+/// What a search for a token or a set of tokens found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Matches {
+    /// The documents, ascending.
+    pub ids: DocIds,
+    /// True if `ids` are exactly the documents that hold the token (or every
+    /// token). False if a token was longer than 64 bytes, which is listed
+    /// under its first 64 bytes only: `ids` are then candidates, and the
+    /// caller confirms each against its text with
+    /// [`contains_token`](crate::contains_token).
+    pub exact: bool,
+}
+
+/// Whether `key` can be a key of the dictionary: an ordinary token of 1 to 64
+/// bytes, or a zero byte and 64 more.
+fn valid_key(key: &[u8]) -> bool {
+    match key.first() {
+        Some(&LONG_MARK) => key.len() == MAX_KEY_LEN,
+        Some(_) => key.len() <= MAX_TOKEN_LEN,
+        None => false,
+    }
+}
 
 /// First terms of the dictionary blocks of one segment, and where each block
 /// starts. This is what stays in memory.
@@ -80,7 +113,19 @@ struct Segment {
     postings_at: u64,
     dict_at: u64,
     sparse: Sparse,
+    /// Set once the checksum matched, so later searches skip the lock.
     verified: AtomicBool,
+    /// The outcome of the first verification. A mismatch is kept, so a
+    /// damaged segment is read whole once, not by every search; a thread that
+    /// arrives during the first verification waits on the lock for it.
+    outcome: Mutex<Outcome>,
+}
+
+enum Outcome {
+    Unknown,
+    Good,
+    /// The message of the checksum failure.
+    Damaged(String),
 }
 
 fn corrupt<T>(what: &str) -> Result<T> {
@@ -101,11 +146,35 @@ impl Segment {
         }
     }
 
-    /// Checks the checksum of postings and dictionary, once per reader.
+    /// Checks the checksum of postings and dictionary, once per reader. The
+    /// verdict (good or damaged) is remembered. A failed read is not a
+    /// verdict about the file, so it is reported and the next call tries
+    /// again.
     fn verify<S: ReadAt>(&self, src: &S) -> Result<()> {
-        if self.verified.load(Ordering::Relaxed) {
+        if self.verified.load(Ordering::Acquire) {
             return Ok(());
         }
+        let mut outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        match &*outcome {
+            Outcome::Good => return Ok(()),
+            Outcome::Damaged(m) => return Err(Error::corrupt(m)),
+            Outcome::Unknown => {}
+        }
+        match self.checksum(src) {
+            Ok(()) => {
+                *outcome = Outcome::Good;
+                self.verified.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(Error::Corrupt(m)) => {
+                *outcome = Outcome::Damaged(m.clone());
+                Err(Error::Corrupt(m))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn checksum<S: ReadAt>(&self, src: &S) -> Result<()> {
         let total = self.e.postings_len + self.e.dict_len;
         let mut buf = vec![0u8; total.min(64 * 1024) as usize];
         let (mut crc, mut done) = (0u32, 0u64);
@@ -118,7 +187,6 @@ impl Segment {
         if crc != self.e.body_crc {
             return corrupt("segment checksum mismatch");
         }
-        self.verified.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -141,15 +209,23 @@ impl Segment {
 
     /// Decodes dictionary block `i`, calling `f(term, entry)` for each term
     /// until it returns false. Returns false if `f` stopped the walk.
+    ///
+    /// `prev_end` is the least offset the next posting list may have: the
+    /// builder writes lists one after another in term order, so a list that
+    /// starts before the end of the previous one (counting only the bytes it
+    /// cannot do without) is damage. This is what stops many entries from
+    /// pointing at the same list. Pass the same variable for consecutive
+    /// blocks of one walk.
     fn walk_block<S: ReadAt>(
         &self,
         src: &S,
         i: usize,
+        prev_end: &mut u64,
         f: &mut dyn FnMut(&[u8], Entry) -> bool,
     ) -> Result<bool> {
         let bytes = self.read_block(src, i)?;
         let e = &self.e;
-        let mut cur: Vec<u8> = Vec::with_capacity(MAX_TOKEN_LEN);
+        let mut cur: Vec<u8> = Vec::with_capacity(MAX_KEY_LEN);
         let mut p = 0usize;
         for k in 0..self.terms_in_block(i) {
             let shared = get_varint(&bytes, &mut p)?;
@@ -157,7 +233,7 @@ impl Segment {
             if shared > cur.len() as u64 {
                 return corrupt("front-coded term shares more than the previous term has");
             }
-            if suffix == 0 || shared + suffix > MAX_TOKEN_LEN as u64 {
+            if suffix == 0 || shared + suffix > MAX_KEY_LEN as u64 {
                 return corrupt("term has an impossible length");
             }
             let (shared, suffix) = (shared as usize, suffix as usize);
@@ -170,6 +246,9 @@ impl Segment {
             }
             cur.truncate(shared);
             cur.extend_from_slice(sb);
+            if !valid_key(&cur) {
+                return corrupt("term has an impossible length");
+            }
             if k == 0 && cur != self.sparse.term(i) {
                 return corrupt("first term of a block differs from the sparse index");
             }
@@ -202,6 +281,10 @@ impl Segment {
                 {
                     return corrupt("posting list lies outside the postings area");
                 }
+                if entry.off < *prev_end {
+                    return corrupt("posting lists overlap or are out of order");
+                }
+                *prev_end = entry.off + need;
             }
             if !f(&cur, entry) {
                 return Ok(false);
@@ -219,7 +302,7 @@ impl Segment {
             return Ok(None);
         }
         let mut found = None;
-        self.walk_block(src, at - 1, &mut |t, e| {
+        self.walk_block(src, at - 1, &mut 0, &mut |t, e| {
             if t == term {
                 found = Some(e);
             }
@@ -237,12 +320,13 @@ impl Segment {
         f: &mut dyn FnMut(&[u8], Entry) -> bool,
     ) -> Result<()> {
         let first = self.sparse.count(|t| t < prefix).saturating_sub(1);
+        let mut prev_end = 0;
         for i in first..self.sparse.len() {
             let head = self.sparse.term(i);
             if i > first && head > prefix && !head.starts_with(prefix) {
                 break;
             }
-            let more = self.walk_block(src, i, &mut |t, e| {
+            let more = self.walk_block(src, i, &mut prev_end, &mut |t, e| {
                 if t.starts_with(prefix) {
                     f(t, e)
                 } else {
@@ -258,6 +342,11 @@ impl Segment {
 }
 
 /// Forward reader of one posting list that can jump with the skip table.
+///
+/// What it holds does not depend on the length of the list: one page of the
+/// skip table (at most `PAGE + 2` entries, 528 bytes), the decoded block
+/// (512 bytes) and the bytes of the block (at most 513), plus, when it is
+/// the only open list of a search, a read-ahead buffer.
 pub(crate) struct Cursor<'a, S: ReadAt> {
     src: &'a S,
     seg: &'a Segment,
@@ -272,10 +361,24 @@ enum Kind {
     Disk(Box<Disk>),
 }
 
+/// The skip table is read in pages of `PAGE` entries, each with the entry
+/// before it and the one after it, because decoding a block needs the last id
+/// of the block before and the start of the block after.
 struct Disk {
-    /// (last id, start relative to the end of the skip table) per block.
-    skip: Vec<(u32, u32)>,
+    /// Blocks in the list.
+    nb: usize,
+    /// Where the skip table starts in the file.
+    table_at: u64,
+    /// Bytes of the blocks that follow the table, up to the end of the area.
+    data_len: u64,
     data_at: u64,
+    /// Bytes to read at once when the next block is the one after the last.
+    ahead: u64,
+    /// The page held, and the index of the first entry of `win`.
+    page: Option<usize>,
+    base: usize,
+    /// (last id, start relative to the end of the skip table) per block.
+    win: [(u32, u32); PAGE + 2],
     block: Option<usize>,
     buf: Vec<u32>,
     pos: usize,
@@ -283,8 +386,105 @@ struct Disk {
     raw_at: u64,
 }
 
+impl Disk {
+    /// Reads and checks the entries of `page`: the same checks as for a whole
+    /// table (ids ascend inside the segment's range, starts ascend by no more
+    /// than a full block and stay inside the list), applied to what is read.
+    fn load_page<S: ReadAt>(&mut self, src: &S, seg: &Segment, page: usize) -> Result<()> {
+        if self.page == Some(page) {
+            return Ok(());
+        }
+        let start = (page * PAGE).saturating_sub(1);
+        let end = ((page + 1) * PAGE + 1).min(self.nb);
+        let n = end - start;
+        let mut raw = [0u8; (PAGE + 2) * SKIP_ENTRY];
+        let raw = &mut raw[..n * SKIP_ENTRY];
+        src.read_exact_at(raw, self.table_at + (start * SKIP_ENTRY) as u64)?;
+        for (j, c) in raw.as_chunks::<SKIP_ENTRY>().0.iter().enumerate() {
+            let last = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let st = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+            let ok_last = last >= seg.e.doc_lo
+                && last <= seg.e.doc_hi
+                && (j == 0 || self.win[j - 1].0 < last);
+            let ok_start = u64::from(st) < self.data_len
+                && if start + j == 0 {
+                    st == 0
+                } else if j == 0 {
+                    true
+                } else {
+                    let prev = self.win[j - 1].1;
+                    st > prev && u64::from(st - prev) <= block_max(BLOCK) as u64
+                };
+            if !ok_last || !ok_start {
+                self.page = None;
+                return corrupt("skip table is not ascending or points outside the list");
+            }
+            self.win[j] = (last, st);
+        }
+        self.page = Some(page);
+        self.base = start;
+        Ok(())
+    }
+
+    /// The last id of the final block of `page`, without loading the page
+    /// unless it is the one held.
+    fn page_last<S: ReadAt>(&self, src: &S, page: usize) -> Result<u32> {
+        let idx = ((page + 1) * PAGE).min(self.nb) - 1;
+        if self.page == Some(page) {
+            return Ok(self.win[idx - self.base].0);
+        }
+        let mut b = [0u8; 4];
+        src.read_exact_at(&mut b, self.table_at + (idx * SKIP_ENTRY) as u64)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    /// The first block at or after `from` whose last id is at least
+    /// `target`, found by binary search over pages and then inside one page.
+    fn find_block<S: ReadAt>(
+        &mut self,
+        src: &S,
+        seg: &Segment,
+        from: usize,
+        target: u64,
+    ) -> Result<Option<usize>> {
+        if from >= self.nb {
+            return Ok(None);
+        }
+        let pages = self.nb.div_ceil(PAGE);
+        let first = from / PAGE;
+        let page = if u64::from(self.page_last(src, first)?) >= target {
+            first
+        } else {
+            let (mut lo, mut hi) = (first + 1, pages);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if u64::from(self.page_last(src, mid)?) < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo >= pages {
+                return Ok(None);
+            }
+            lo
+        };
+        self.load_page(src, seg, page)?;
+        let from = from.max(page * PAGE);
+        let to = ((page + 1) * PAGE).min(self.nb);
+        let entries = &self.win[from - self.base..to - self.base];
+        let k = entries.partition_point(|s| u64::from(s.0) < target);
+        if k == entries.len() {
+            return corrupt("skip table changed while it was searched");
+        }
+        Ok(Some(from + k))
+    }
+}
+
 impl<'a, S: ReadAt> Cursor<'a, S> {
-    fn open(src: &'a S, seg: &'a Segment, e: &Entry) -> Result<Self> {
+    /// Opens the list of `e`. `read_ahead` is the bytes to read at once when
+    /// the cursor walks blocks in order; pass 0 when other cursors are open.
+    fn open(src: &'a S, seg: &'a Segment, e: &Entry, read_ahead: u64) -> Result<Self> {
         let df = e.df;
         if df as usize <= INLINE_MAX {
             return Ok(Self {
@@ -301,41 +501,23 @@ impl<'a, S: ReadAt> Cursor<'a, S> {
         let nb = (df as usize).div_ceil(BLOCK);
         let table_len = (nb * SKIP_ENTRY) as u64;
         // The entry parser already checked that the table and one byte per
-        // block fit in the postings area.
+        // block fit in the postings area. Nothing of the table is read yet.
         let table_at = seg.postings_at + e.off;
-        let mut raw = vec![0u8; nb * SKIP_ENTRY];
-        src.read_exact_at(&mut raw, table_at)?;
-        let data_len = seg.e.postings_len - e.off - table_len;
-        let mut skip = Vec::with_capacity(nb);
-        for c in raw.as_chunks::<SKIP_ENTRY>().0 {
-            skip.push((
-                u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-                u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
-            ));
-        }
-        for (i, &(last, start)) in skip.iter().enumerate() {
-            let ok_last =
-                last >= seg.e.doc_lo && last <= seg.e.doc_hi && (i == 0 || skip[i - 1].0 < last);
-            let ok_start = u64::from(start) < data_len
-                && if i == 0 {
-                    start == 0
-                } else {
-                    let gap = u64::from(start).wrapping_sub(u64::from(skip[i - 1].1));
-                    start > skip[i - 1].1 && gap <= block_max(BLOCK) as u64
-                };
-            if !ok_last || !ok_start {
-                return corrupt("skip table is not ascending or points outside the list");
-            }
-        }
         Ok(Self {
             src,
             seg,
             df,
             kind: Kind::Disk(Box::new(Disk {
-                skip,
+                nb,
+                table_at,
+                data_len: seg.e.postings_len - e.off - table_len,
                 data_at: table_at + table_len,
+                ahead: read_ahead,
+                page: None,
+                base: 0,
+                win: [(0, 0); PAGE + 2],
                 block: None,
-                buf: Vec::new(),
+                buf: Vec::with_capacity(BLOCK),
                 pos: 0,
                 raw: Vec::new(),
                 raw_at: 0,
@@ -348,28 +530,31 @@ impl<'a, S: ReadAt> Cursor<'a, S> {
         let Kind::Disk(d) = &mut self.kind else {
             return Ok(());
         };
-        let nb = d.skip.len();
+        d.load_page(self.src, self.seg, i / PAGE)?;
+        let nb = d.nb;
+        let (this, next, before) = (
+            d.win[i - d.base],
+            d.win.get(i + 1 - d.base).copied().unwrap_or_default(),
+            d.win[i.saturating_sub(1) - d.base],
+        );
         let n = if i + 1 == nb {
             self.df as usize - BLOCK * (nb - 1)
         } else {
             BLOCK
         };
-        let at = d.data_at + u64::from(d.skip[i].1);
+        let at = d.data_at + u64::from(this.1);
         let avail = self.seg.postings_end() - at;
         let want = if i + 1 < nb {
-            u64::from(d.skip[i + 1].1 - d.skip[i].1)
+            u64::from(next.1 - this.1)
         } else {
             (block_max(n) as u64).min(avail)
         };
+        let next_min = if i == 0 { 0 } else { u64::from(before.0) + 1 };
+        let want_last = this.0;
         let covered = d.raw_at <= at && at + want <= d.raw_at + d.raw.len() as u64;
         if !covered {
             let sequential = d.block.is_some_and(|b| b + 1 == i);
-            let window = if sequential {
-                want.max(READ_AHEAD)
-            } else {
-                want
-            }
-            .min(avail);
+            let window = if sequential { want.max(d.ahead) } else { want }.min(avail);
             d.raw.resize(window as usize, 0);
             self.src.read_exact_at(&mut d.raw, at)?;
             d.raw_at = at;
@@ -378,18 +563,13 @@ impl<'a, S: ReadAt> Cursor<'a, S> {
         let Some(bytes) = d.raw.get(from..from + want as usize) else {
             return corrupt("posting block lies outside the postings area");
         };
-        let next_min = if i == 0 {
-            0
-        } else {
-            u64::from(d.skip[i - 1].0) + 1
-        };
         d.buf.clear();
         let used = decode_block(bytes, n, next_min, &mut d.buf)?;
         if i + 1 < nb && used as u64 != want {
             return corrupt("posting block does not end where the next one starts");
         }
         let (first, last) = (d.buf[0], d.buf[d.buf.len() - 1]);
-        if last != d.skip[i].0 || first < self.seg.e.doc_lo {
+        if last != want_last || first < self.seg.e.doc_lo {
             return corrupt("posting block disagrees with its skip entry");
         }
         d.block = Some(i);
@@ -416,11 +596,10 @@ impl<'a, S: ReadAt> Cursor<'a, S> {
                         }
                     }
                     let from = d.block.map_or(0, |b| b + 1);
-                    let next = from + d.skip[from..].partition_point(|s| u64::from(s.0) < target);
-                    if next >= d.skip.len() {
-                        return Ok(None);
+                    match d.find_block(self.src, self.seg, from, target)? {
+                        Some(next) => next,
+                        None => return Ok(None),
                     }
-                    next
                 }
             };
             self.load(next)?;
@@ -435,7 +614,7 @@ impl<'a, S: ReadAt> Cursor<'a, S> {
                 out.extend_from_slice(&ids[..self.df as usize]);
                 0
             }
-            Kind::Disk(d) => d.skip.len(),
+            Kind::Disk(d) => d.nb,
         };
         for i in 0..blocks {
             self.load(i)?;
@@ -533,6 +712,7 @@ impl<S: ReadAt> IndexReader<S> {
                 dict_at: e.offset + e.postings_len,
                 sparse: Self::parse_sparse(&raw_sparse, &e)?,
                 verified: AtomicBool::new(false),
+                outcome: Mutex::new(Outcome::Unknown),
             });
             meta.postings_bytes += e.postings_len;
             meta.dictionary_bytes += e.dict_len;
@@ -597,13 +777,16 @@ impl<S: ReadAt> IndexReader<S> {
         let mut p = 0usize;
         for i in 0..n {
             let l = get_varint(b, &mut p)?;
-            if l == 0 || l > MAX_TOKEN_LEN as u64 {
+            if l == 0 || l > MAX_KEY_LEN as u64 {
                 return corrupt("sparse index term has an impossible length");
             }
             let l = l as usize;
             let (Some(term), Some(off)) = (b.get(p..p + l), b.get(p + l..p + l + 8)) else {
                 return corrupt("sparse index entry runs past the end");
             };
+            if !valid_key(term) {
+                return corrupt("sparse index term has an impossible length");
+            }
             let mut off8 = [0u8; 8];
             off8.copy_from_slice(off);
             let off = u64::from_le_bytes(off8);
@@ -645,57 +828,97 @@ impl<S: ReadAt> IndexReader<S> {
         self.segments.iter().try_for_each(|s| s.verify(&self.src))
     }
 
-    /// Documents that contain `token`, ascending. The token must be in the
-    /// form the tokeniser produces (lowercase, at most 64 bytes); anything
-    /// else matches nothing.
-    pub fn term(&self, token: impl AsRef<[u8]>) -> Result<DocIds> {
+    /// Documents that contain `token`, ascending.
+    ///
+    /// A token of 1 to 64 bytes must be in the form the tokeniser produces
+    /// (lowercase); the answer is then exact. A token of more than 64 bytes is
+    /// looked up under its first 64 bytes (case folded), and the answer is a
+    /// list of candidates, flagged `exact: false`: another token that shares
+    /// those 64 bytes is listed too, so the caller confirms each candidate
+    /// with [`contains_token`](crate::contains_token). An empty token, or one
+    /// that starts with a byte that no token can start with, matches nothing.
+    pub fn term(&self, token: impl AsRef<[u8]>) -> Result<Matches> {
         let token = token.as_ref();
+        let exact = token.len() <= MAX_TOKEN_LEN;
         let mut out = Vec::new();
-        if token.is_empty() || token.len() > MAX_TOKEN_LEN {
-            return Ok(DocIds::default());
+        if token.is_empty() || (exact && token[0] == LONG_MARK) {
+            return Ok(Matches {
+                ids: DocIds::default(),
+                exact,
+            });
         }
+        let mut buf = [0u8; MAX_KEY_LEN];
+        let key: &[u8] = if exact {
+            token
+        } else {
+            long_aware_key(token, &mut buf)
+        };
         for seg in &self.segments {
             seg.verify(&self.src)?;
-            if let Some(e) = seg.lookup(&self.src, token)? {
-                out.extend(Cursor::open(&self.src, seg, &e)?.drain()?);
+            if let Some(e) = seg.lookup(&self.src, key)? {
+                // one list is open, so it may read ahead
+                out.extend(Cursor::open(&self.src, seg, &e, READ_AHEAD)?.drain()?);
             }
         }
-        Ok(DocIds::from_ascending(out))
+        Ok(Matches {
+            ids: DocIds::from_ascending(out),
+            exact,
+        })
     }
 
-    /// Documents that contain any term starting with `prefix`, ascending.
+    /// Documents that contain any token starting with `prefix`, ascending,
+    /// tokens longer than 64 bytes included. The answer is exact. A prefix of
+    /// more than 64 bytes is `InvalidArgument`; one that starts with a byte
+    /// that no token can start with matches nothing.
     ///
     /// If more than `limit_terms` distinct terms match, nothing is read and
     /// the call fails with `InvalidArgument`: a prefix that broad is the
     /// caller's mistake, and the limit is what keeps the memory of this call
-    /// bounded. Memory is the output, the matching dictionary entries and one
-    /// posting block and skip table per matching term in one segment.
+    /// bounded. (A token longer than 64 bytes counts as a term here, once per
+    /// distinct first 64 bytes.) Memory is the output, the matching dictionary
+    /// entries and, per matching term in one segment, what an open list holds
+    /// (see the README): the length of the lists does not matter.
     pub fn prefix(&self, prefix: impl AsRef<[u8]>, limit_terms: usize) -> Result<DocIds> {
         let prefix = prefix.as_ref();
         if prefix.len() > MAX_TOKEN_LEN {
+            return Err(Error::invalid_argument("a prefix is at most 64 bytes long"));
+        }
+        if prefix.first() == Some(&LONG_MARK) {
             return Ok(DocIds::default());
         }
+        // The keys of tokens longer than 64 bytes live behind a zero byte, so
+        // they are found by walking that namespace with the same prefix.
+        let mut long_prefix = Vec::with_capacity(prefix.len() + 1);
+        long_prefix.push(LONG_MARK);
+        long_prefix.extend_from_slice(prefix);
         let mut seen: BTreeSet<Box<[u8]>> = BTreeSet::new();
         let mut per_segment: Vec<Vec<Entry>> = Vec::with_capacity(self.segments.len());
         for seg in &self.segments {
             seg.verify(&self.src)?;
             let mut found = Vec::new();
             let mut over = false;
-            seg.walk_prefix(&self.src, prefix, &mut |t, e| {
-                if !seen.contains(t) {
-                    if seen.len() >= limit_terms {
-                        over = true;
-                        return false;
+            for (walk, long) in [(&long_prefix[..], true), (prefix, false)] {
+                seg.walk_prefix(&self.src, walk, &mut |t, e| {
+                    // an empty prefix also matches the zero-byte keys; they
+                    // were taken by the first walk
+                    if !long && t[0] == LONG_MARK {
+                        return true;
                     }
-                    seen.insert(t.into());
+                    if !seen.contains(t) {
+                        if seen.len() >= limit_terms {
+                            over = true;
+                            return false;
+                        }
+                        seen.insert(t.into());
+                    }
+                    found.push(e);
+                    true
+                })?;
+                if over {
+                    return Err(Error::invalid_argument(format!(
+                        "prefix matches more than {limit_terms} terms"
+                    )));
                 }
-                found.push(e);
-                true
-            })?;
-            if over {
-                return Err(Error::invalid_argument(format!(
-                    "prefix matches more than {limit_terms} terms"
-                )));
             }
             per_segment.push(found);
         }
@@ -704,9 +927,11 @@ impl<S: ReadAt> IndexReader<S> {
             if entries.is_empty() {
                 continue;
             }
+            // Several lists are open at once: none may read ahead.
+            let ahead = if entries.len() == 1 { READ_AHEAD } else { 0 };
             let cursors = entries
                 .iter()
-                .map(|e| Cursor::open(&self.src, seg, e))
+                .map(|e| Cursor::open(&self.src, seg, e, ahead))
                 .collect::<Result<Vec<_>>>()?;
             out.extend(merge_union(cursors)?);
         }
@@ -715,40 +940,65 @@ impl<S: ReadAt> IndexReader<S> {
 
     /// Documents that contain every one of `tokens`, ascending. The lists
     /// are intersected with the skip data of their posting lists, so a rare
-    /// token next to a common one reads only the blocks it needs.
-    pub fn intersect<T: AsRef<[u8]>>(&self, tokens: &[T]) -> Result<DocIds> {
-        self.intersect_counting(tokens).map(|(ids, _)| ids)
+    /// token next to a common one reads only the blocks it needs. The answer
+    /// is exact unless a token is longer than 64 bytes (see
+    /// [`IndexReader::term`]); then it is the candidates, flagged
+    /// `exact: false`. An empty token matches nothing.
+    pub fn intersect<T: AsRef<[u8]>>(&self, tokens: &[T]) -> Result<Matches> {
+        self.intersect_counting(tokens).map(|(m, _)| m)
     }
 
     /// As [`IndexReader::intersect`], also returning the posting blocks read.
-    pub(crate) fn intersect_counting<T: AsRef<[u8]>>(&self, tokens: &[T]) -> Result<(DocIds, u64)> {
+    pub(crate) fn intersect_counting<T: AsRef<[u8]>>(
+        &self,
+        tokens: &[T],
+    ) -> Result<(Matches, u64)> {
         if tokens.is_empty() {
             return Err(Error::invalid_argument("no tokens to intersect"));
         }
-        let mut sorted: Vec<&[u8]> = tokens.iter().map(AsRef::as_ref).collect();
-        sorted.sort_unstable();
-        sorted.dedup();
+        let exact = tokens.iter().all(|t| t.as_ref().len() <= MAX_TOKEN_LEN);
+        let none = || {
+            (
+                Matches {
+                    ids: DocIds::default(),
+                    exact,
+                },
+                0,
+            )
+        };
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(tokens.len());
+        for t in tokens.iter().map(AsRef::as_ref) {
+            if t.is_empty() || (t.len() <= MAX_TOKEN_LEN && t[0] == LONG_MARK) {
+                return Ok(none());
+            }
+            let mut buf = [0u8; MAX_KEY_LEN];
+            keys.push(long_aware_key(t, &mut buf).to_vec());
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        // One list is open only when there is one key; else none reads ahead.
+        let ahead = if keys.len() == 1 { READ_AHEAD } else { 0 };
         let mut out = Vec::new();
         let mut blocks = 0;
-        if sorted
-            .iter()
-            .any(|t| t.is_empty() || t.len() > MAX_TOKEN_LEN)
-        {
-            return Ok((DocIds::default(), 0));
-        }
         'segments: for seg in &self.segments {
             seg.verify(&self.src)?;
-            let mut cursors = Vec::with_capacity(sorted.len());
-            for t in &sorted {
-                match seg.lookup(&self.src, t)? {
-                    Some(e) => cursors.push(Cursor::open(&self.src, seg, &e)?),
+            let mut cursors = Vec::with_capacity(keys.len());
+            for k in &keys {
+                match seg.lookup(&self.src, k)? {
+                    Some(e) => cursors.push(Cursor::open(&self.src, seg, &e, ahead)?),
                     None => continue 'segments,
                 }
             }
             out.extend(leapfrog(&mut cursors)?);
             blocks += cursors.iter().map(|c| c.blocks_read).sum::<u64>();
         }
-        Ok((DocIds::from_ascending(out), blocks))
+        Ok((
+            Matches {
+                ids: DocIds::from_ascending(out),
+                exact,
+            },
+            blocks,
+        ))
     }
 }
 

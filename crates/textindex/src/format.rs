@@ -4,7 +4,10 @@
 use nwdb_core::{Error, Result};
 
 pub const MAGIC: &[u8; 4] = b"NWTX";
-pub const VERSION: u32 = 1;
+/// Version 2 adds the keys for tokens longer than 64 bytes to the dictionary.
+/// A version 1 file lacks them, so a search in it would silently miss long
+/// tokens; it is refused instead.
+pub const VERSION: u32 = 2;
 
 /// Terms per dictionary block.
 pub const TERMS_PER_BLOCK: u32 = 32;
@@ -18,11 +21,11 @@ pub const DIR_ENTRY: usize = 72;
 /// Bytes of the footer.
 pub const FOOTER: usize = 64;
 
-/// The most a dictionary block can occupy: 32 entries of at most 64 suffix
+/// The most a dictionary block can occupy: 32 entries of at most 65 suffix
 /// bytes, two length varints, a count varint and eight 5-byte gaps or a
 /// 10-byte offset. Larger than this is corrupt, so a damaged sparse index can
 /// never make the reader allocate more.
-pub const MAX_DICT_BLOCK: u64 = 32 * (64 + 10 + 10 + 10 + 40);
+pub const MAX_DICT_BLOCK: u64 = 32 * (65 + 10 + 10 + 10 + 40);
 
 /// What the footer says about the whole file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

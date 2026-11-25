@@ -18,23 +18,31 @@ use crate::format::{
 };
 use crate::meta::IndexMeta;
 use crate::source::Sink;
-use crate::tokenizer::{MAX_TOKEN_LEN, tokens};
+use crate::tokenizer::{MAX_KEY_LEN, tokens};
 
 /// The default byte budget of an open segment: 256 MiB.
 pub const DEFAULT_SEGMENT_BUDGET: usize = 256 * 1024 * 1024;
+
+/// The smallest segment budget: 1 MiB. Every closed segment leaves a
+/// directory entry in memory until `finish`, so a tiny budget would make memory
+/// grow with the number of documents. A smaller value is raised to this.
+pub const MIN_SEGMENT_BUDGET: usize = 1024 * 1024;
 
 /// Options for [`IndexBuilder`].
 #[derive(Clone, Debug)]
 pub struct IndexOptions {
     /// An index segment is closed when the memory held for its postings
-    /// passes this many bytes.
+    /// passes this many bytes. Values below [`MIN_SEGMENT_BUDGET`] (1 MiB)
+    /// are raised to it.
     ///
     /// The count is an estimate of heap bytes (term bytes, hash table slots,
     /// list headers and the ids of every list, with allocator rounding) and is
     /// checked after each document, so one large document can overshoot it.
-    /// Closing a segment needs a further 40 bytes per term for the sorted
-    /// order plus the segment's dictionary. The README states the resulting
-    /// bound on peak memory.
+    /// Closing a segment needs a further 32 bytes per term for the sorted
+    /// order plus the segment's dictionary and sparse index, and each closed
+    /// segment keeps a 72 byte directory entry (at most 144 bytes with the
+    /// vector's spare room) in memory until `finish`. The README states the
+    /// resulting bound on peak memory.
     pub segment_budget_bytes: usize,
 }
 
@@ -63,6 +71,8 @@ struct OpenSegment {
     lists: Vec<Vec<u32>>,
     /// Estimated heap bytes held.
     mem: usize,
+    /// Documents added. A segment holds at most `u32::MAX`; the builder closes
+    /// it before that count could wrap.
     docs: u32,
     doc_lo: u32,
     doc_hi: u32,
@@ -78,11 +88,9 @@ impl OpenSegment {
         self.docs += 1;
         let table_before = self.terms.capacity();
         let lists_before = self.lists.capacity();
-        let mut buf = [0u8; MAX_TOKEN_LEN];
+        let mut buf = [0u8; MAX_KEY_LEN];
         for tok in tokens(text) {
-            let Some(term) = tok.lowercase(&mut buf) else {
-                continue;
-            };
+            let term = tok.key(&mut buf);
             if let Some(&i) = self.terms.get(term) {
                 let list = &mut self.lists[i as usize];
                 if list.last() != Some(&doc) {
@@ -121,11 +129,15 @@ pub struct IndexBuilder<W: Write> {
     text_bytes: u64,
     meta: IndexMeta,
     failed: bool,
+    /// Documents after which a segment is closed; `u32::MAX` except in tests.
+    max_segment_docs: u32,
 }
 
 impl<W: Write> IndexBuilder<W> {
-    /// Starts an index that will be written to `out`.
-    pub fn new(options: IndexOptions, out: W) -> Self {
+    /// Starts an index that will be written to `out`. A segment budget below
+    /// [`MIN_SEGMENT_BUDGET`] is raised to it.
+    pub fn new(mut options: IndexOptions, out: W) -> Self {
+        options.segment_budget_bytes = options.segment_budget_bytes.max(MIN_SEGMENT_BUDGET);
         Self {
             options,
             out: Sink::new(out),
@@ -136,7 +148,19 @@ impl<W: Write> IndexBuilder<W> {
             text_bytes: 0,
             meta: IndexMeta::default(),
             failed: false,
+            max_segment_docs: u32::MAX,
         }
+    }
+
+    /// Closes a segment after `n` documents (at least 1), as well as when the
+    /// budget is passed. The minimum budget of 1 MiB makes many segments
+    /// costly to reach with test data; this makes them cheap. Not part of the
+    /// supported interface.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_max_segment_docs(mut self, n: u32) -> Self {
+        self.max_segment_docs = n.max(1);
+        self
     }
 
     /// Adds a document. Ids must be strictly ascending; they need not be
@@ -153,6 +177,9 @@ impl<W: Write> IndexBuilder<W> {
             return Err(Error::invalid_argument(
                 "document ids must be strictly ascending",
             ));
+        }
+        if self.open.docs == self.max_segment_docs {
+            self.close_segment()?;
         }
         self.last_doc = Some(doc_id);
         self.docs += 1;
@@ -286,5 +313,27 @@ impl<W: Write> IndexBuilder<W> {
         self.meta.sparse_bytes += entry.sparse_len;
         self.directory.push(entry);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IndexReader;
+
+    /// The segment's document counter is a `u32`: a full segment is closed,
+    /// never wrapped. The limit is lowered so the boundary is cheap to reach.
+    #[test]
+    fn a_full_segment_is_closed_instead_of_wrapping() {
+        let mut out = Vec::new();
+        let mut b = IndexBuilder::new(IndexOptions::default(), &mut out).with_max_segment_docs(3);
+        for id in 0..10u32 {
+            b.add(id * 2, b"alpha beta").unwrap();
+        }
+        let meta = b.finish().unwrap();
+        assert_eq!((meta.segments, meta.docs), (4, 10));
+        let r = IndexReader::open(out.as_slice()).unwrap();
+        let want: Vec<u32> = (0..10).map(|i| i * 2).collect();
+        assert_eq!(r.term("alpha").unwrap().ids.as_slice(), want);
     }
 }
