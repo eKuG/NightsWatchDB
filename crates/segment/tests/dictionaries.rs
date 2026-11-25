@@ -2,6 +2,7 @@
 //! batches have different dictionaries and check what the reader gives back:
 //! the same values, in batches that have exactly the span schema.
 
+use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{LargeBinaryArray, RecordBatch};
@@ -322,4 +323,163 @@ fn a_large_shared_resource_is_stored_once() {
         "{held} bytes for {} batches",
         got.len()
     );
+}
+
+/// Every dictionary column of every batch holds exactly the values that its
+/// rows use, each once, and nothing else.
+fn assert_compact(batches: &[RecordBatch]) {
+    for b in batches {
+        for (field, column) in b.schema().fields().iter().zip(b.columns()) {
+            let Some(any) = column.as_any_dictionary_opt() else {
+                continue;
+            };
+            let used: std::collections::HashSet<i32> = column
+                .as_dictionary::<Int32Type>()
+                .keys()
+                .iter()
+                .flatten()
+                .collect();
+            assert_eq!(
+                any.values().len(),
+                used.len(),
+                "column {} holds values its rows do not use",
+                field.name()
+            );
+        }
+    }
+}
+
+/// A part of `many` origins, one trace of `rows` rows each, in one row group
+/// unless `options` says otherwise.
+fn many_origin_part(dir: &Path, many: u8, options: WriterOptions) -> Vec<Row> {
+    let rows: Vec<Row> = (0..many)
+        .flat_map(|n| {
+            (0..3u32).map(move |i| {
+                let org = if n % 5 == 4 { Org::none() } else { Org::new(n) };
+                (span(n + 1, u32::from(n) * 3 + i), org)
+            })
+        })
+        .collect();
+    let all: Vec<&Org> = rows.iter().map(|(_, o)| o).collect();
+    let mut w = PartWriter::create(dir, 1, 0, WINDOW_NS, options).unwrap();
+    w.write(&batch(&rows, &all)).unwrap();
+    w.finish().unwrap();
+    rows
+}
+
+#[test]
+fn a_trace_carries_only_the_values_its_rows_use() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rows = many_origin_part(tmp.path(), 40, WriterOptions::default());
+    let reader = open(tmp.path(), 1);
+    assert_eq!(reader.row_group_count(), 1);
+    for trace in 1..=40u8 {
+        let got = reader
+            .read_trace(TraceId([trace; 16]), None)
+            .unwrap()
+            .unwrap();
+        assert_schema(&got, None);
+        assert_compact(&got);
+        let want: Vec<&Row> = rows
+            .iter()
+            .filter(|(s, _)| s.trace_id == TraceId([trace; 16]))
+            .collect();
+        check(&got, &want);
+    }
+    // A row range inside one trace, and one that covers several.
+    for (first, count) in [(1, 1), (4, 7)] {
+        let got = reader.read_rows(first, count, None).unwrap();
+        assert_compact(&got);
+        let want: Vec<&Row> = rows[first as usize..(first + count) as usize]
+            .iter()
+            .collect();
+        check(&got, &want);
+    }
+    // One value used by several rows of a trace is held once: the first
+    // trace's three rows all use the same origin.
+    let got = reader.read_trace(TraceId([1; 16]), None).unwrap().unwrap();
+    let held = got[0].column_by_name("resource").unwrap();
+    assert_eq!(held.as_any_dictionary().values().len(), 1);
+}
+
+#[test]
+fn rows_without_a_value_hold_no_dictionary_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rows = many_origin_part(tmp.path(), 40, WriterOptions::default());
+    let reader = open(tmp.path(), 1);
+    // Trace 5 is the one with no origin at all (n = 4).
+    let got = reader.read_trace(TraceId([5; 16]), None).unwrap().unwrap();
+    assert_compact(&got);
+    for name in ORIGIN_COLUMNS {
+        let c = got[0].column_by_name(name).unwrap();
+        assert_eq!(c.null_count(), c.len(), "{name}");
+        assert_eq!(c.as_any_dictionary().values().len(), 0, "{name}");
+    }
+    let want: Vec<&Row> = rows
+        .iter()
+        .filter(|(s, _)| s.trace_id == TraceId([5; 16]))
+        .collect();
+    check(&got, &want);
+}
+
+#[test]
+fn projections_with_some_or_no_dictionary_columns_are_compact_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    many_origin_part(tmp.path(), 40, WriterOptions::default());
+    let reader = open(tmp.path(), 1);
+    for columns in [
+        &["trace_id", "name", "start_ns"][..],
+        &["name", "scope", "trace_id", "service_name"][..],
+        &["resource"][..],
+    ] {
+        let got = reader
+            .read_trace(TraceId([3; 16]), Some(columns))
+            .unwrap()
+            .unwrap();
+        assert_schema(&got, Some(columns));
+        assert_compact(&got);
+        assert_eq!(got.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    }
+}
+
+/// A trace that spans row groups, whose values also recur in the next group:
+/// each batch holds each of its values once, and the values are those of an
+/// uncompacted read.
+#[test]
+fn a_trace_across_row_groups_matches_the_uncompacted_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rows = many_origin_part(tmp.path(), 12, small_groups());
+    let reader = open(tmp.path(), 1);
+    assert!(reader.row_group_count() > 3);
+
+    let scanned: Vec<RecordBatch> = reader
+        .scan(ScanOptions::default())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // The scan keeps whole dictionaries.
+    let uncompacted = rows_of(&scanned);
+    assert_eq!(uncompacted.len(), rows.len());
+
+    let mut first = 0;
+    for trace in 1..=12u8 {
+        let count = rows
+            .iter()
+            .filter(|(s, _)| s.trace_id == TraceId([trace; 16]))
+            .count();
+        let got = reader
+            .read_trace(TraceId([trace; 16]), None)
+            .unwrap()
+            .unwrap();
+        assert_schema(&got, None);
+        assert_compact(&got);
+        assert_eq!(rows_of(&got), uncompacted[first..first + count], "{trace}");
+        first += count;
+    }
+    // One trace of three rows starting at row 2 crosses a group boundary of
+    // four rows; read all rows at once too.
+    let got = reader.read_rows(0, rows.len() as u64, None).unwrap();
+    assert!(got.len() > 3);
+    assert_compact(&got);
+    assert_eq!(rows_of(&got), uncompacted);
 }

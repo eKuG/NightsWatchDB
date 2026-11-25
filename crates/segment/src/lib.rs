@@ -20,7 +20,7 @@ mod writer;
 
 pub use index::{FileChecksum, INDEX_FILE, TraceEntry};
 pub use reader::{PartReader, Scan, ScanOptions};
-pub use writer::{FORMAT_VERSION, PartWriter, WriterOptions};
+pub use writer::{FORMAT_VERSION, PartWriter, WriterOptions, check_format_version};
 
 /// File name of the span rows inside a part directory.
 pub const SPANS_FILE: &str = "spans.parquet";

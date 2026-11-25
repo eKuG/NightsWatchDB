@@ -15,7 +15,9 @@
 use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
 use crate::{SPANS_FILE, SUMMARY_FILE};
 use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
 use arrow_schema::SchemaRef;
+use arrow_select::dictionary::garbage_collect_any_dictionary;
 use bytes::Bytes;
 use nwdb_core::{BatchLimits, Error, Result, TraceId, col, span_schema, summary_schema};
 use parquet::arrow::ProjectionMask;
@@ -128,6 +130,29 @@ impl ChunkReader for PosFile {
     }
 }
 
+/// Keeps only the dictionary values that the rows of `batch` use. The
+/// Parquet reader hands back the dictionary of the whole page it decoded, so
+/// without this a one-row read would hold every value of its row group's
+/// page. The schema and the values of every row are unchanged.
+fn compact_dictionaries(batch: RecordBatch) -> Result<RecordBatch> {
+    if !batch
+        .columns()
+        .iter()
+        .any(|c| c.as_any_dictionary_opt().is_some())
+    {
+        return Ok(batch);
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| match c.as_any_dictionary_opt() {
+            Some(d) => garbage_collect_any_dictionary(d),
+            None => Ok(Arc::clone(c)),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
 /// The columns a read returns and the order the caller asked for them in.
 struct Projection {
     mask: ProjectionMask,
@@ -164,19 +189,17 @@ impl Table {
         dir: &Path,
         name: &'static str,
         expected: &SchemaRef,
-        recorded_len: Option<u64>,
+        recorded_len: u64,
     ) -> Result<Self> {
         let file = File::open(dir.join(name)).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => corrupt(name, "file is missing from the part"),
             _ => Error::Io(e),
         })?;
         let len = file.metadata()?.len();
-        if let Some(want) = recorded_len
-            && want != len
-        {
+        if recorded_len != len {
             return Err(corrupt(
                 name,
-                format!("file has {len} bytes but {INDEX_FILE} recorded {want}"),
+                format!("file has {len} bytes but {INDEX_FILE} recorded {recorded_len}"),
             ));
         }
         let file = PosFile {
@@ -192,6 +215,8 @@ impl Table {
             ArrowReaderMetadata::load(&file, options).map_err(|e| corrupt(name, e))
         })?;
 
+        // The version was checked from the index before this, so a schema
+        // that differs here is damage, not an older format.
         let have = meta.schema();
         let same = have.fields().len() == expected.fields().len()
             && have
@@ -363,7 +388,9 @@ impl Table {
             let start = self.group_starts[group];
             let lo = first.max(start) - start;
             let hi = end.min(self.group_starts[group + 1]) - start;
-            out.extend(self.read_group(group, lo as usize..hi as usize, projection)?);
+            for batch in self.read_group(group, lo as usize..hi as usize, projection)? {
+                out.push(compact_dictionaries(batch)?);
+            }
             group += 1;
         }
         Ok(out)
@@ -551,7 +578,7 @@ impl Iterator for Scan {
 /// working (on Unix) after the part directory has been deleted.
 pub struct PartReader {
     entries: Vec<TraceEntry>,
-    checksums: Option<FileChecksums>,
+    checksums: FileChecksums,
     spans: Arc<Table>,
     summary: Arc<Table>,
 }
@@ -560,8 +587,9 @@ impl PartReader {
     /// Opens the part in `part_dir`.
     ///
     /// Returns [`Error::Corrupt`], naming the file, if a file is missing, the
-    /// index fails its magic, version, length or checksum check, a Parquet
-    /// file's length differs from the one recorded in the index (version 2),
+    /// index fails its magic, version (an older or newer part format is refused
+    /// with a message saying which version the part has), length or checksum check, a Parquet
+    /// file's length differs from the one recorded in the index,
     /// a file's columns are not the expected ones, the Parquet library panics
     /// on the file, or the index's row ranges do not tile exactly the rows of
     /// `spans.parquet`. The contents of the Parquet files are not checksummed
@@ -574,18 +602,8 @@ impl PartReader {
         })?;
         let decoded = index::decode(&index_bytes)?;
         let (entries, checksums) = (decoded.entries, decoded.checksums);
-        let spans = Table::open(
-            dir,
-            SPANS_FILE,
-            &span_schema(),
-            checksums.map(|c| c.spans.len),
-        )?;
-        let summary = Table::open(
-            dir,
-            SUMMARY_FILE,
-            &summary_schema(),
-            checksums.map(|c| c.summary.len),
-        )?;
+        let spans = Table::open(dir, SPANS_FILE, &span_schema(), checksums.spans.len)?;
+        let summary = Table::open(dir, SUMMARY_FILE, &summary_schema(), checksums.summary.len)?;
 
         check_ranges(&entries, spans.rows())?;
         if summary.rows() != entries.len() as u64 {
@@ -607,15 +625,15 @@ impl PartReader {
     }
 
     /// Length and CRC-32C of `spans.parquet` recorded when the part was
-    /// written; `None` for a version 1 part.
-    pub fn spans_checksum(&self) -> Option<FileChecksum> {
-        self.checksums.map(|c| c.spans)
+    /// written.
+    pub fn spans_checksum(&self) -> FileChecksum {
+        self.checksums.spans
     }
 
     /// Length and CRC-32C of `summary.parquet` recorded when the part was
-    /// written; `None` for a version 1 part.
-    pub fn summary_checksum(&self) -> Option<FileChecksum> {
-        self.checksums.map(|c| c.summary)
+    /// written.
+    pub fn summary_checksum(&self) -> FileChecksum {
+        self.checksums.summary
     }
 
     /// Re-reads both Parquet files in full and compares their length and
@@ -623,16 +641,10 @@ impl PartReader {
     /// [`Error::Corrupt`] naming the file on a mismatch.
     ///
     /// This costs a sequential read of the part, so [`open`](Self::open)
-    /// does not do it; compaction and a scrubber should. A version 1 part
-    /// has no recorded checksums, so there is nothing to compare and this
-    /// returns `Ok`; [`spans_checksum`](Self::spans_checksum) tells the two
-    /// cases apart.
+    /// does not do it; compaction and a scrubber should.
     pub fn verify(&self) -> Result<()> {
-        let Some(sums) = self.checksums else {
-            return Ok(());
-        };
-        self.spans.verify(sums.spans)?;
-        self.summary.verify(sums.summary)
+        self.spans.verify(self.checksums.spans)?;
+        self.summary.verify(self.checksums.summary)
     }
 
     /// Number of span rows.

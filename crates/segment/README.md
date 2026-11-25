@@ -67,12 +67,15 @@ library and measured:
   every batch has exactly `span_schema()` (or the projection of it), so no
   conversion is done. Keys are numbered per batch and mean nothing outside it;
   use `SpanColumns`, which resolves them.
-- The dictionary of a batch read from a file holds the values of the page
-  being decoded (up to 4,096 rows), not only the values of the rows returned.
-  Reading one row therefore returns a batch whose dictionary can be as large as
-  the dictionary of a page: at most about 1 MiB per column, because the
-  writer's dictionary page limit is 1 MiB and a column that outgrows it
-  continues without a dictionary.
+- The Parquet reader gives a batch the dictionary of the page being decoded
+  (up to 4,096 rows), not only the values of the rows returned: at most about
+  1 MiB per column, since the writer's dictionary page limit is 1 MiB. The
+  point reads (`read_trace`, `read_rows`) therefore compact every batch with
+  Arrow's dictionary garbage collection (`arrow-select`), for any projection:
+  each dictionary column of a returned batch holds only the values its rows
+  use. A trace that spans parts or row groups holds at most those values once
+  per batch. `scan` reads whole row groups and keeps whole dictionaries, as
+  compacting them would cost a pass over data the caller reads anyway.
 
 The writer hands rows to Parquet in pieces that end exactly where a row group
 ends, and closes the group itself. What the Parquet writer buffers is therefore
@@ -86,7 +89,7 @@ them; a test pins this for 1 MiB values.
 ```
 offset  size   field
 0       4      magic "NWTI"
-4       4      version, u32 = 2
+4       4      version, u32 = 3, the part format version
 8       8      trace count N, u64
 16      8      length of spans.parquet in bytes, u64
 24      4      CRC-32C of every byte of spans.parquet, u32
@@ -96,8 +99,12 @@ offset  size   field
 40+44N  4      CRC-32C (Castagnoli) of every byte before it
 ```
 
-Version 1 files, which have no fields at offsets 16 to 39 (the records start
-at 16), are still read; such a part has no Parquet checksums.
+The version is the first thing checked when a part is opened, before the
+lengths, the checksum or the Parquet schema. An index with any other version
+is refused with an error that gives the version the part has and the one this
+build reads, and says that parts from development versions cannot be read.
+Version 2 had the same header with the origin columns stored plain; there is
+no migration, since the project has had no release.
 
 Parquet 60.2.0 writes no page checksums and zstd's frame checksum is off, so
 damage that leaves the file structure intact would otherwise be returned as
@@ -139,10 +146,9 @@ row count differs from the trace count. It does not read the data pages.
 - `PartReader::verify` re-reads both Parquet files and compares their length
   and CRC-32C with the recorded values (`Corrupt` naming the file on a
   mismatch). It is meant for compaction and a future scrubber and is not
-  called on open. For a version 1 part there is nothing to compare and it
-  returns `Ok`; `spans_checksum()` and `summary_checksum()` return the recorded
-  values, or `None` for version 1. Without `verify`, a damaged data page can
-  still be returned as data.
+  called on open. `spans_checksum()` and `summary_checksum()` return the
+  recorded values. Without `verify`, a damaged data page can still be returned
+  as data.
 - Every call into the Parquet library, at open and on every read including
   each `Scan::next`, runs inside `std::panic::catch_unwind`. A panic (the
   library asserts and unwraps on damaged files) becomes `Error::Corrupt`
@@ -150,7 +156,8 @@ row count differs from the trace count. It does not read the data pages.
   not using `panic = "abort"`. The reader holds no mutable state, so a caught
   panic leaves nothing half-updated.
 - `read_trace` and `read_rows` read a row range with a Parquet row selection,
-  so pages holding none of the rows are not fetched.
+  so pages holding none of the rows are not fetched, and return batches whose
+  dictionary columns hold only the values their rows use.
 - Reads go one row group at a time, so a returned batch never spans row
   groups. A batch is also bounded by bytes: its row count for a group is
   `BatchLimits::DEFAULT.max_bytes` (32 MiB) divided by the group's average
@@ -190,4 +197,15 @@ Failure rules for the caller:
   `finish` returns `Error::Fatal`: the part may or may not be durable. Do not
   reuse the id; restart.
 
-`PartMeta.format_version` is 2 (`FORMAT_VERSION`).
+## Format version
+
+`FORMAT_VERSION` (3) is recorded in `PartMeta.format_version`, which the
+manifest stores for every part, and in the header of `traces.idx`. The engine
+checks the manifest's value and `PartReader::open` the index's, both before
+looking at any Parquet file. It covers the columns of `spans.parquet` and
+`summary.parquet`, their types and order, the meaning of the raw encodings
+inside them (`attrs`, `events`, `links`, `resource`, `scope`), and the layout of
+`traces.idx`. It must be raised on any change to those. A part with another
+version is refused; there is no migration. History: 2 added the file lengths
+and checksums to the index; 3 made the seven origin columns dictionary
+columns.

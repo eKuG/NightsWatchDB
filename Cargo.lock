@@ -841,6 +841,7 @@ version = "0.0.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
  "bytes",
  "crc32c",
  "nwdb-core",

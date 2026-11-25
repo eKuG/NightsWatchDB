@@ -549,7 +549,7 @@ fn index_file_known_answer() {
 
     let mut want: Vec<u8> = Vec::new();
     want.extend_from_slice(b"NWTI");
-    want.extend_from_slice(&[2, 0, 0, 0]);
+    want.extend_from_slice(&[3, 0, 0, 0]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
     // Length (u64) and CRC-32C (u32) of spans.parquet, then summary.parquet.
     for file in [SPANS_FILE, SUMMARY_FILE] {
@@ -581,10 +581,10 @@ fn index_file_known_answer() {
     // The reader exposes the same values.
     let reader = PartReader::open(&dir).unwrap();
     let spans_bytes = std::fs::read(dir.join(SPANS_FILE)).unwrap();
-    let sum = reader.spans_checksum().unwrap();
+    let sum = reader.spans_checksum();
     assert_eq!(sum.len, spans_bytes.len() as u64);
     assert_eq!(sum.crc32c, crc32c::crc32c(&spans_bytes));
-    assert!(reader.summary_checksum().is_some());
+    assert!(reader.summary_checksum().len > 0);
 }
 
 /// Copies a valid part and returns the copy's directory.
@@ -628,7 +628,7 @@ fn corrupt_parts_are_rejected_at_open() {
     expect_corrupt(&|b| b[0] = b'X', "bad magic");
     expect_corrupt(
         &|b| {
-            b[4] = 3;
+            b[4] = 9;
             reseal(b);
         },
         "bad version",
@@ -1035,7 +1035,7 @@ fn part_meta_describes_the_part() {
 
     assert_eq!(meta.part_id, 42);
     assert_eq!(meta.level, 0);
-    assert_eq!(meta.format_version, 2);
+    assert_eq!(meta.format_version, 3);
     assert_eq!(meta.window_start_ns, window_start);
     assert_eq!(meta.window_ns, WINDOW_NS);
     assert_eq!(meta.rows, spans.len() as u64);

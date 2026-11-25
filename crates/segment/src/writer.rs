@@ -22,9 +22,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Version of the part's file formats, recorded in [`PartMeta`].
-/// Version 2 added the length and CRC-32C of both Parquet files to `traces.idx`.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version of the part's file formats, recorded in [`PartMeta`] and in the
+/// header of `traces.idx`. It must be raised on any change to the columns of
+/// the Parquet files, their types or order, or the meaning of the raw
+/// encodings in them. Version 2 added the length and CRC-32C of both Parquet
+/// files to `traces.idx`; version 3 made the origin columns dictionary
+/// columns.
+pub const FORMAT_VERSION: u32 = 3;
+
+/// Refuses a part written with another format version, saying so plainly.
+/// There is no migration: the project has had no release, so parts written by
+/// development versions cannot be read.
+pub fn check_format_version(found: u32) -> nwdb_core::Result<()> {
+    if found == FORMAT_VERSION {
+        return Ok(());
+    }
+    Err(nwdb_core::Error::corrupt(format!(
+        "the part has format version {found} but this build reads version {FORMAT_VERSION}; \
+         parts written by development versions before this one cannot be read, and there is \
+         no migration"
+    )))
+}
 
 const ZSTD_LEVEL: i32 = 3;
 /// Size at which a data page is closed. Parquet's default, stated here

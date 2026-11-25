@@ -201,7 +201,7 @@ fn every_single_byte_flip_is_detected_by_open_or_verify() {
     let good = write_simple(tmp.path(), 1, 3, 4, WriterOptions::default());
     let reader = PartReader::open(&good).unwrap();
     reader.verify().unwrap();
-    assert!(reader.spans_checksum().is_some() && reader.summary_checksum().is_some());
+    assert!(reader.spans_checksum().len > 0 && reader.summary_checksum().len > 0);
 
     for file in [SPANS_FILE, SUMMARY_FILE] {
         let original = std::fs::read(good.join(file)).unwrap();
@@ -247,32 +247,35 @@ fn open_checks_the_recorded_file_lengths() {
     }
 }
 
-/// A version 1 index has no checksums: it still opens and reads, and
-/// `verify` has nothing to compare.
+/// A part recorded with an older format version is refused, whatever else
+/// is wrong with it, and the message says what the operator needs to know.
 #[test]
-fn version_1_index_still_opens() {
+fn a_part_with_an_older_format_version_is_refused_plainly() {
     let tmp = tempfile::tempdir().unwrap();
     let good = write_simple(tmp.path(), 1, 3, 4, WriterOptions::default());
-    let v2 = std::fs::read(good.join(INDEX_FILE)).unwrap();
-    assert_eq!(&v2[4..8], &[2, 0, 0, 0]);
-    // Version 1: a 16 byte header, the same records, a fresh trailing CRC.
-    let records = &v2[40..v2.len() - 4];
-    let mut v1 = Vec::new();
-    v1.extend_from_slice(b"NWTI");
-    v1.extend_from_slice(&1u32.to_le_bytes());
-    v1.extend_from_slice(&v2[8..16]);
-    v1.extend_from_slice(records);
-    let crc = crc32c::crc32c(&v1);
-    v1.extend_from_slice(&crc.to_le_bytes());
-
-    let dir = tmp.path().join("v1");
-    copy_dir(&good, &dir);
-    std::fs::write(dir.join(INDEX_FILE), &v1).unwrap();
-    let reader = PartReader::open(&dir).unwrap();
-    assert_eq!(reader.trace_count(), 3);
-    assert!(reader.spans_checksum().is_none() && reader.summary_checksum().is_none());
-    reader.verify().unwrap();
-    read_everything(&dir).unwrap();
+    let index = std::fs::read(good.join(INDEX_FILE)).unwrap();
+    assert_eq!(index[4..8], nwdb_segment::FORMAT_VERSION.to_le_bytes());
+    for old in [1u32, nwdb_segment::FORMAT_VERSION - 1] {
+        let dir = tmp.path().join(format!("old{old}"));
+        copy_dir(&good, &dir);
+        let mut bytes = index.clone();
+        bytes[4..8].copy_from_slice(&old.to_le_bytes());
+        std::fs::write(dir.join(INDEX_FILE), &bytes).unwrap();
+        // The columns of the old part would not match either; the version
+        // must be what is reported.
+        std::fs::write(dir.join(SPANS_FILE), b"not parquet").unwrap();
+        match PartReader::open(&dir) {
+            Err(Error::Corrupt(msg)) => assert!(
+                msg.contains(&format!(
+                    "format version {old} but this build reads version {}",
+                    nwdb_segment::FORMAT_VERSION
+                )) && msg.contains("development versions")
+                    && msg.contains("no migration"),
+                "{msg}"
+            ),
+            other => panic!("expected a version error, got {:?}", other.err()),
+        }
+    }
 }
 
 /// A batch is also bounded by bytes: 16 rows of 4 MiB make one row group of

@@ -447,6 +447,10 @@ impl Engine {
         let flushed = state.as_ref().map_or(0, |s| s.wal_flushed_lsn);
         let mut parts = Vec::new();
         for meta in state.iter().flat_map(|s| s.parts.iter()) {
+            // The version the manifest recorded is checked first, so an old
+            // database is refused by version and not by what differs in its
+            // files.
+            nwdb_segment::check_format_version(meta.format_version)?;
             let reader = PartReader::open(parts_dir.join(nwdb_core::part_dir_name(meta.part_id)))?;
             parts.push(Arc::new(LivePart {
                 meta: meta.clone(),

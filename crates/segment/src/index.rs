@@ -7,11 +7,11 @@ use nwdb_core::{Error, Result, TraceId};
 pub const INDEX_FILE: &str = "traces.idx";
 
 const MAGIC: &[u8; 4] = b"NWTI";
-/// The version written. Version 1 had no file lengths or checksums and is
-/// still read.
-const VERSION: u32 = 2;
-const HEADER_LEN_V1: usize = 4 + 4 + 8;
-const HEADER_LEN_V2: usize = HEADER_LEN_V1 + 2 * (8 + 4);
+/// The version written, always the part format version: the index is the one
+/// file of a part that is read before any other, so it is where an older part
+/// is recognised.
+const VERSION: u32 = crate::FORMAT_VERSION;
+const HEADER_LEN: usize = 4 + 4 + 8 + 2 * (8 + 4);
 const RECORD_LEN: usize = 44;
 const CRC_LEN: usize = 4;
 
@@ -51,13 +51,12 @@ pub(crate) struct FileChecksums {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Decoded {
     pub entries: Vec<TraceEntry>,
-    /// `None` for a version 1 file.
-    pub checksums: Option<FileChecksums>,
+    pub checksums: FileChecksums,
 }
 
-/// Encodes entries, which must already be sorted by trace id, as version 2.
+/// Encodes entries, which must already be sorted by trace id.
 pub(crate) fn encode(entries: &[TraceEntry], checksums: FileChecksums) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN_V2 + entries.len() * RECORD_LEN + CRC_LEN);
+    let mut out = Vec::with_capacity(HEADER_LEN + entries.len() * RECORD_LEN + CRC_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
@@ -88,18 +87,23 @@ fn corrupt(msg: impl std::fmt::Display) -> Error {
 /// Decodes and checks the whole file: magic, version, length, checksum and
 /// strictly increasing trace ids.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
-    if bytes.len() < HEADER_LEN_V1 + CRC_LEN {
+    // The version comes before any length or checksum check: an older part
+    // has a different header, and the operator must be told that, not that
+    // the file is damaged.
+    if bytes.len() < 8 {
         return Err(corrupt(format!("{} bytes is too short", bytes.len())));
     }
     if &bytes[..4] != MAGIC {
         return Err(corrupt("bad magic"));
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
-    let header_len = match version {
-        1 => HEADER_LEN_V1,
-        2 => HEADER_LEN_V2,
-        _ => return Err(corrupt(format!("unsupported version {version}"))),
-    };
+    if let Err(Error::Corrupt(msg)) = crate::check_format_version(version) {
+        return Err(corrupt(msg));
+    }
+    let header_len = HEADER_LEN;
+    if bytes.len() < header_len + CRC_LEN {
+        return Err(corrupt(format!("{} bytes is too short", bytes.len())));
+    }
     let count = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let expected = count
         .checked_mul(RECORD_LEN as u64)
@@ -119,7 +123,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
     let le_u64 = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
     let le_i64 = |b: &[u8]| i64::from_le_bytes(b.try_into().expect("8 bytes"));
     let le_u32 = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes"));
-    let checksums = (version == 2).then(|| FileChecksums {
+    let checksums = FileChecksums {
         spans: FileChecksum {
             len: le_u64(&body[16..24]),
             crc32c: le_u32(&body[24..28]),
@@ -128,7 +132,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
             len: le_u64(&body[28..36]),
             crc32c: le_u32(&body[36..40]),
         },
-    });
+    };
     let mut entries: Vec<TraceEntry> = Vec::with_capacity(count as usize);
     for r in body[header_len..].as_chunks::<RECORD_LEN>().0 {
         let entry = TraceEntry {
@@ -171,18 +175,6 @@ mod tests {
         },
     };
 
-    /// Version 1 layout, which no longer has a writer.
-    fn encode_v1(entries: &[TraceEntry]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-        push_records(&mut out, entries);
-        let crc = crc32c::crc32c(&out);
-        out.extend_from_slice(&crc.to_le_bytes());
-        out
-    }
-
     #[test]
     fn round_trip() {
         let all: Vec<_> = (1..50).map(entry).collect();
@@ -190,15 +182,25 @@ mod tests {
         assert_eq!(bytes.len(), 40 + 49 * 44 + 4);
         let got = decode(&bytes).unwrap();
         assert_eq!(got.entries, all);
-        assert_eq!(got.checksums, Some(SUMS));
+        assert_eq!(got.checksums, SUMS);
     }
 
     #[test]
-    fn version_1_has_no_checksums() {
-        let all: Vec<_> = (1..5).map(entry).collect();
-        let got = decode(&encode_v1(&all)).unwrap();
-        assert_eq!(got.entries, all);
-        assert_eq!(got.checksums, None);
+    fn an_older_version_is_refused_before_anything_else_is_checked() {
+        let mut bytes = encode(&[entry(1)], SUMS);
+        for old in [1u32, 2] {
+            bytes[4..8].copy_from_slice(&old.to_le_bytes());
+            // Truncated and with a wrong checksum: the version still wins.
+            for b in [&bytes[..], &bytes[..12]] {
+                let msg = decode(b).unwrap_err().to_string();
+                assert!(
+                    msg.contains(&format!(
+                        "format version {old} but this build reads version {VERSION}"
+                    )) && msg.contains("cannot be read"),
+                    "{msg}"
+                );
+            }
+        }
     }
 
     #[test]
