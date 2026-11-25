@@ -19,6 +19,11 @@ pub enum Error {
     /// re-read and retry.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The component is temporarily unable to accept the request, for
+    /// example because its buffers are full. Nothing was changed; the caller
+    /// may retry later.
+    #[error("unavailable: {0}")]
+    Unavailable(String),
     /// The component can no longer be used and the outcome of the operation
     /// is unknown, for example after a failed sync. The process must stop,
     /// restart and recover; the operation must not be retried on the same
@@ -54,6 +59,11 @@ impl Error {
         Self::Conflict(msg.to_string())
     }
 
+    /// Builds [`Error::Unavailable`].
+    pub fn unavailable(msg: impl Display) -> Self {
+        Self::Unavailable(msg.to_string())
+    }
+
     /// Builds [`Error::Fatal`].
     pub fn fatal(msg: impl Display) -> Self {
         Self::Fatal(msg.to_string())
@@ -85,6 +95,7 @@ mod tests {
         assert!(matches!(Error::not_found("x"), Error::NotFound(_)));
         assert!(matches!(Error::conflict("x"), Error::Conflict(_)));
         assert_eq!(Error::fatal("x").to_string(), "fatal: x");
+        assert_eq!(Error::unavailable("x").to_string(), "unavailable: x");
         assert_eq!(Error::other("boom").to_string(), "boom");
         let io = std::io::Error::other("disk");
         assert!(matches!(Error::from(io), Error::Io(_)));

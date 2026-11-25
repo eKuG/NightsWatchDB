@@ -16,6 +16,8 @@
 //!   [`summary_schema`]) and its batch form ([`SummaryBatchBuilder`],
 //!   [`SummaryColumns`]).
 //! - The metadata record that describes one immutable part ([`PartMeta`]).
+//! - The interface between ingest doors and the engine for replaying the
+//!   write-ahead log ([`RecordDecoder`]).
 //!
 //! # What does not belong here
 //!
@@ -30,6 +32,7 @@
 
 mod builder;
 mod columns;
+mod decoder;
 mod error;
 mod hex;
 mod id;
@@ -43,6 +46,7 @@ mod window;
 
 pub use builder::SpanBatchBuilder;
 pub use columns::SpanColumns;
+pub use decoder::RecordDecoder;
 pub use error::{Error, Result};
 pub use id::{SpanId, TraceId};
 pub use limits::BatchLimits;
