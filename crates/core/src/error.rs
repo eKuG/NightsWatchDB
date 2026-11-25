@@ -19,6 +19,12 @@ pub enum Error {
     /// re-read and retry.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// The component can no longer be used and the outcome of the operation
+    /// is unknown, for example after a failed sync. The process must stop,
+    /// restart and recover; the operation must not be retried on the same
+    /// handle.
+    #[error("fatal: {0}")]
+    Fatal(String),
     /// Any other failure, such as an error from a library.
     #[error("{0}")]
     Other(Box<dyn std::error::Error + Send + Sync>),
@@ -48,6 +54,11 @@ impl Error {
         Self::Conflict(msg.to_string())
     }
 
+    /// Builds [`Error::Fatal`].
+    pub fn fatal(msg: impl Display) -> Self {
+        Self::Fatal(msg.to_string())
+    }
+
     /// Wraps any error as [`Error::Other`].
     pub fn other(err: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self::Other(err.into())
@@ -73,6 +84,7 @@ mod tests {
         ));
         assert!(matches!(Error::not_found("x"), Error::NotFound(_)));
         assert!(matches!(Error::conflict("x"), Error::Conflict(_)));
+        assert_eq!(Error::fatal("x").to_string(), "fatal: x");
         assert_eq!(Error::other("boom").to_string(), "boom");
         let io = std::io::Error::other("disk");
         assert!(matches!(Error::from(io), Error::Io(_)));
