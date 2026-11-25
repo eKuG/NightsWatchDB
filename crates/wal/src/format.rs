@@ -2,7 +2,7 @@
 //! shared by recovery and replay. See the crate README for the layout.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use nwdb_core::{Error, Result};
@@ -20,6 +20,19 @@ pub(crate) fn file_name(first: Lsn) -> String {
 
 pub(crate) fn file_path(dir: &Path, first: Lsn) -> PathBuf {
     dir.join(file_name(first))
+}
+
+/// The name a log file has while it is being created: it is renamed to
+/// [`file_name`] once its header is durable.
+pub(crate) fn tmp_file_path(dir: &Path, first: Lsn) -> PathBuf {
+    dir.join(format!("{}.tmp", file_name(first)))
+}
+
+/// True for `wal-<20 digits>.log.tmp`, a file whose creation never finished.
+pub(crate) fn is_tmp_name(name: &str) -> bool {
+    name.strip_suffix(".tmp")
+        .and_then(parse_file_name)
+        .is_some()
 }
 
 /// Parses `wal-<20 digits>.log`; any other name is not a log file.
@@ -42,7 +55,24 @@ pub(crate) fn encode_header(first: Lsn) -> [u8; HEADER_LEN as usize] {
 }
 
 /// Checks a complete header and returns the first sequence number in it.
-fn decode_header(h: &[u8; HEADER_LEN as usize]) -> std::result::Result<Lsn, String> {
+/// Sequence numbers start at 1, and `u64::MAX` is excluded so that "the number
+/// after the last record" can always be computed.
+pub(crate) fn decode_header(h: &[u8; HEADER_LEN as usize]) -> std::result::Result<Lsn, String> {
+    let first = decode_header_unranged(h)?;
+    check_first(first)?;
+    Ok(first)
+}
+
+/// Sequence numbers start at 1 and `u64::MAX` is excluded.
+pub(crate) fn check_first(first: Lsn) -> std::result::Result<(), String> {
+    if first == 0 || first == Lsn::MAX {
+        return Err(format!("first sequence number {first} is out of range"));
+    }
+    Ok(())
+}
+
+/// Like [`decode_header`] but accepts any first sequence number.
+fn decode_header_unranged(h: &[u8; HEADER_LEN as usize]) -> std::result::Result<Lsn, String> {
     if &h[0..4] != MAGIC {
         return Err("bad magic".into());
     }
@@ -57,12 +87,31 @@ fn decode_header(h: &[u8; HEADER_LEN as usize]) -> std::result::Result<Lsn, Stri
     Ok(u64::from_le_bytes(h[8..16].try_into().unwrap()))
 }
 
-/// Appends one framed record to `out`.
-pub(crate) fn encode_record(payload: &[u8], out: &mut Vec<u8>) {
+/// Reads the first `HEADER_LEN` bytes of a file and decodes them; `None` when
+/// the file is shorter or the header fails its magic, checksum or version
+/// check. The sequence number is not range-checked.
+pub(crate) fn read_header(path: &Path) -> Result<Option<Lsn>> {
+    let mut h = [0u8; HEADER_LEN as usize];
+    let mut f = File::open(path)?;
+    if f.read_exact(&mut h).is_err() {
+        return Ok(None);
+    }
+    Ok(decode_header_unranged(&h).ok())
+}
+
+/// Appends the 8-byte frame (length and checksum) of a record to `out`; the
+/// payload follows it on disk.
+pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
     let len = (payload.len() as u32).to_le_bytes();
     let crc = crc32c::crc32c_append(crc32c::crc32c(&len), payload);
     out.extend_from_slice(&len);
     out.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// Appends one framed record to `out`.
+#[cfg(test)]
+pub(crate) fn encode_record(payload: &[u8], out: &mut Vec<u8>) {
+    encode_frame(payload, out);
     out.extend_from_slice(payload);
 }
 
@@ -72,6 +121,8 @@ pub(crate) struct Scan {
     /// Offset just past the last good record (or the header).
     pub good_end: u64,
     pub file_len: u64,
+    /// Why the scan stopped before the end of the file (lenient mode only).
+    pub damage: Option<String>,
 }
 
 /// How the scanner treats a bad record.
@@ -117,31 +168,74 @@ pub(crate) fn scan_file(
         records: 0,
         good_end: HEADER_LEN,
         file_len,
+        damage: None,
     };
-    while first + scan.records <= limit {
+    loop {
+        // The header guarantees first < u64::MAX; a file with so many records
+        // that numbers run out is damage, not something to wrap around.
+        let lsn = first
+            .checked_add(scan.records)
+            .filter(|&n| n < Lsn::MAX)
+            .ok_or_else(|| Error::corrupt(format!("{name}: sequence numbers overflow")))?;
+        if lsn > limit {
+            break;
+        }
         let remaining = file_len - scan.good_end;
         if remaining == 0 {
             break;
         }
         match read_record(&mut r, remaining)? {
             Ok(payload) => {
-                visit(first + scan.records, &payload)?;
+                visit(lsn, &payload)?;
                 scan.records += 1;
                 scan.good_end += FRAME_LEN + payload.len() as u64;
             }
             Err(damage) => {
                 if mode == Mode::Strict {
                     return Err(Error::corrupt(format!(
-                        "{name}: record {} at offset {}: {damage}",
-                        first + scan.records,
+                        "{name}: record {lsn} at offset {}: {damage}",
                         scan.good_end
                     )));
                 }
+                scan.damage = Some(damage);
                 break;
             }
         }
     }
     Ok(scan)
+}
+
+/// Looks for a complete record with a valid checksum starting anywhere after
+/// `bad` in the file, and returns its offset. Used to tell a torn tail (nothing
+/// valid follows) from damage in the middle of the file.
+///
+/// Cost: the tail is read into memory once (at most the file size). Each
+/// candidate offset whose length field exceeds the remaining bytes is skipped
+/// without hashing, so on ordinary data this is linear in the tail. The worst
+/// case, an adversarial tail where every length field just fits, hashes up to
+/// the remaining bytes per offset: quadratic in the tail size. Recovery of a
+/// 256 MiB file with garbage that is not adversarial costs one pass.
+pub(crate) fn find_valid_record_after(path: &Path, bad: u64) -> Result<Option<u64>> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(bad + 1))?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail)?;
+    let frame = FRAME_LEN as usize;
+    if tail.len() < frame {
+        return Ok(None);
+    }
+    for i in 0..=tail.len() - frame {
+        let len = u32::from_le_bytes(tail[i..i + 4].try_into().unwrap()) as usize;
+        if len > MAX_RECORD_BYTES || frame + len > tail.len() - i {
+            continue;
+        }
+        let stored = u32::from_le_bytes(tail[i + 4..i + 8].try_into().unwrap());
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&tail[i..i + 4]), &tail[i + 8..i + 8 + len]);
+        if crc == stored {
+            return Ok(Some(bad + 1 + i as u64));
+        }
+    }
+    Ok(None)
 }
 
 /// Reads one record. The outer `Result` is for I/O failures; the inner one

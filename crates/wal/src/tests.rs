@@ -12,7 +12,7 @@ fn opts(max_file_bytes: u64) -> WalOptions {
         max_file_bytes,
         sync_interval: Duration::from_millis(1),
         sync: SyncMode::None,
-        sync_hook: None,
+        ..WalOptions::default()
     }
 }
 
@@ -210,7 +210,7 @@ fn truncate_before_removes_only_whole_old_files() {
     let (wal, rec) = Wal::open(dir.path(), opts(100)).unwrap();
     assert_eq!(rec.first_lsn, 9);
     assert_eq!(rec.last_lsn, 11);
-    let all = replay_all(&wal, 0);
+    let all = replay_all(&wal, rec.first_lsn);
     assert_eq!(all.len(), 3);
     assert_eq!(all[0], (9, thirty(10)[8].clone()));
     assert_eq!(all[2], (11, b"more".to_vec()));
@@ -283,15 +283,63 @@ fn flipped_byte_in_the_last_record_drops_it() {
 }
 
 #[test]
-fn damage_in_the_middle_of_the_last_file_hides_what_follows() {
+fn damage_in_the_middle_of_the_last_file_is_corrupt_and_left_alone() {
     let dir = tempfile::tempdir().unwrap();
     let files = build(dir.path(), opts(1 << 20), &thirty(4));
     let mut bytes = std::fs::read(&files[0]).unwrap();
     bytes[20 + 38 + 8] ^= 0x01; // payload of record 2
     std::fs::write(&files[0], &bytes).unwrap();
-    let (_wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    let err = Wal::open(dir.path(), opts(1 << 20)).err().unwrap();
+    match &err {
+        Error::Corrupt(m) => {
+            assert!(m.contains("wal-00000000000000000001.log"), "{m}");
+            assert!(m.contains("offset 58"), "{m}"); // 20 + 38
+            assert!(m.contains("offset 96"), "{m}"); // record 3
+        }
+        e => panic!("{e}"),
+    }
+    assert_eq!(std::fs::read(&files[0]).unwrap(), bytes);
+}
+
+#[test]
+fn damage_in_the_middle_is_cut_when_the_operator_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = build(dir.path(), opts(1 << 20), &thirty(4));
+    let mut bytes = std::fs::read(&files[0]).unwrap();
+    bytes[20 + 38 + 8] ^= 0x01;
+    std::fs::write(&files[0], &bytes).unwrap();
+    let mut o = opts(1 << 20);
+    o.discard_after_damage = true;
+    let (wal, rec) = Wal::open(dir.path(), o).unwrap();
     assert_eq!(rec.last_lsn, 1);
     assert_eq!(rec.torn_bytes_discarded, 38 * 3);
+    assert_eq!(wal.append_blocking(b"x").unwrap(), 2);
+}
+
+#[test]
+fn a_damaged_length_field_followed_by_valid_records_is_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = build(dir.path(), opts(1 << 20), &thirty(4));
+    let mut bytes = std::fs::read(&files[0]).unwrap();
+    bytes[20 + 38 + 3] = 0x7f; // huge length in record 2
+    std::fs::write(&files[0], &bytes).unwrap();
+    let err = Wal::open(dir.path(), opts(1 << 20)).err().unwrap();
+    assert!(matches!(err, Error::Corrupt(_)), "{err}");
+    assert_eq!(std::fs::read(&files[0]).unwrap(), bytes);
+}
+
+#[test]
+fn garbage_after_the_last_good_record_is_a_torn_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = build(dir.path(), opts(1 << 20), &thirty(2));
+    let mut bytes = std::fs::read(&files[0]).unwrap();
+    let good = bytes.len();
+    bytes.extend((0..200u32).map(|i| (i * 7 + 3) as u8));
+    std::fs::write(&files[0], &bytes).unwrap();
+    let (_wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    assert_eq!(rec.last_lsn, 2);
+    assert_eq!(rec.torn_bytes_discarded, 200);
+    assert_eq!(std::fs::metadata(&files[0]).unwrap().len() as usize, good);
 }
 
 #[test]
@@ -486,7 +534,14 @@ fn a_failed_sync_poisons_the_log() {
 
     // Later appends fail at once, without another sync attempt.
     let err = wal.append_blocking(b"late").unwrap_err();
-    assert!(err.to_string().contains("poisoned"), "{err}");
+    assert!(matches!(err, Error::Fatal(_)), "{err}");
+    assert!(
+        results
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| matches!(r, Err(Error::Fatal(_))))
+    );
     wal.append(b"later", collect(&results));
     assert_eq!(results.lock().unwrap().len(), 4);
     assert!(results.lock().unwrap()[3].is_err());
@@ -640,5 +695,5 @@ fn real_sync_mode_works() {
     wal.shutdown().unwrap();
     let (wal, rec) = Wal::open(dir.path(), o).unwrap();
     assert_eq!(rec.first_lsn, 3);
-    assert_eq!(replay_all(&wal, 0).len(), 3);
+    assert_eq!(replay_all(&wal, rec.first_lsn).len(), 3);
 }

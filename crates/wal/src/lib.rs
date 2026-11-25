@@ -27,6 +27,10 @@
 //! A failed sync is never retried and nothing is acknowledged after it, because
 //! after a failed `fsync` the contents of the file are unknown. The process
 //! must restart and recover; recovery decides what the file really holds.
+//! The error is [`Error::Fatal`]: the outcome of the record is unknown, and it
+//! may reappear on replay after the restart. Every record accepted by
+//! [`Wal::append`] has its callback run exactly once, with that error if the
+//! log thread dies, panics included.
 //!
 //! # Format
 //!
@@ -87,6 +91,21 @@ pub struct WalOptions {
     /// [`SyncMode::None`]. An error it returns is treated as a failed sync.
     /// It is not called during recovery or for directory syncs.
     pub sync_hook: Option<SyncHook>,
+    /// Operator override for damage in the middle of the last file. By default
+    /// `open` returns [`Error::Corrupt`] and leaves the file alone when a bad
+    /// record is followed by a valid one. When true, the log is cut at the
+    /// first bad record instead, as for a torn tail. **This throws away every
+    /// record after the damage, acknowledged ones included, and their sequence
+    /// numbers will be reused.** Default false.
+    pub discard_after_damage: bool,
+    /// The lowest sequence number the next record may get. The engine sets it
+    /// to one past the highest position it has already written into data
+    /// files. If the log would assign a lower number (it lost its tail, or was
+    /// wiped), every record on disk is by definition already below that
+    /// position: all log files are removed and a new one starts at this
+    /// number, and [`Recovery::reset_to`] says so. If it is at or below the
+    /// next number it has no effect. Must be below `u64::MAX`. Default `None`.
+    pub min_next_lsn: Option<Lsn>,
 }
 
 impl Default for WalOptions {
@@ -96,6 +115,8 @@ impl Default for WalOptions {
             sync_interval: Duration::from_millis(10),
             sync: SyncMode::Data,
             sync_hook: None,
+            discard_after_damage: false,
+            min_next_lsn: None,
         }
     }
 }
@@ -107,6 +128,8 @@ impl std::fmt::Debug for WalOptions {
             .field("sync_interval", &self.sync_interval)
             .field("sync", &self.sync)
             .field("sync_hook", &self.sync_hook.as_ref().map(|_| "<hook>"))
+            .field("discard_after_damage", &self.discard_after_damage)
+            .field("min_next_lsn", &self.min_next_lsn)
             .finish()
     }
 }
@@ -125,6 +148,11 @@ pub struct Recovery {
     /// Bytes cut from the end of the last file because the record there was
     /// incomplete or failed its checksum.
     pub torn_bytes_discarded: u64,
+    /// Set when [`WalOptions::min_next_lsn`] was above the log's own next
+    /// number: every file was removed and the log restarted at this number.
+    pub reset_to: Option<Lsn>,
+    /// Records that were on disk and removed by that reset.
+    pub records_discarded: u64,
 }
 
 /// Counters since the log was opened.
@@ -158,6 +186,8 @@ pub(crate) struct State {
     pub queue: Vec<Item>,
     pub next_lsn: Lsn,
     pub poisoned: Option<String>,
+    /// Highest sequence number covered by a completed sync.
+    pub durable_lsn: Lsn,
     pub shutdown: bool,
     pub appended: bool,
     pub pending_bytes: u64,
@@ -181,7 +211,7 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(crate) fn poison_error(msg: &str) -> Error {
-    Error::other(format!(
+    Error::fatal(format!(
         "write-ahead log is poisoned by an earlier failure and must be reopened: {msg}"
     ))
 }
@@ -190,8 +220,10 @@ pub(crate) fn poison_error(msg: &str) -> Error {
 pub struct Wal {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
-    /// Last sequence number that existed when the log was opened; replay
-    /// stops there so it never reads what the log thread is writing.
+    /// First and last sequence numbers that existed when the log was opened;
+    /// replay stops at the last so it never reads what the log thread is
+    /// writing.
+    recovered_first: Lsn,
     recovered_last: Lsn,
 }
 
@@ -200,34 +232,62 @@ impl Wal {
     ///
     /// Validates every file, repairs a torn tail (see the README for the
     /// exact rules) and starts the log thread, ready to append after the last
-    /// valid record.
+    /// valid record. With [`SyncMode::Data`] the last file and the directory
+    /// are synced before returning, so everything the returned [`Recovery`]
+    /// describes is durable.
     ///
-    /// Damage in the middle of the last file cannot be told apart from a torn
-    /// write: the first bad record ends the log and everything after it in
-    /// that file is cut, valid records included. `torn_bytes_discarded`
-    /// reports how much. Damage in any earlier file is [`Error::Corrupt`].
+    /// In the last file, a bad record with nothing valid after it is a torn
+    /// tail and is cut. A bad record followed by a valid one is damage, not a
+    /// tear: `open` returns [`Error::Corrupt`] and does not modify the file,
+    /// unless [`WalOptions::discard_after_damage`] is set. Damage in any
+    /// earlier file is [`Error::Corrupt`].
     ///
     /// Nothing prevents two processes opening the same directory; the caller
     /// must make sure only one does.
     pub fn open(dir: impl AsRef<Path>, options: WalOptions) -> Result<(Wal, Recovery)> {
         let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
+        if options.min_next_lsn == Some(Lsn::MAX) {
+            return Err(Error::invalid_argument(
+                "min_next_lsn must be below u64::MAX",
+            ));
+        }
+        create_dir_durably(dir, options.sync)?;
 
         let mut firsts = Vec::new();
+        let mut removed_tmp = false;
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if let Some(first) = entry.file_name().to_str().and_then(format::parse_file_name) {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(first) = format::parse_file_name(&name) {
                 firsts.push(first);
+            } else if format::is_tmp_name(&name) {
+                // A file whose creation never finished; it never held a record.
+                std::fs::remove_file(entry.path())?;
+                removed_tmp = true;
             }
         }
+        if removed_tmp {
+            writer::sync_dir(dir, options.sync)?;
+        }
         firsts.sort_unstable();
+        if let Some(&bad) = firsts.iter().find(|&&f| format::check_first(f).is_err()) {
+            return Err(Error::corrupt(format!(
+                "{}: the file name's sequence number is out of range",
+                format::file_path(dir, bad).display()
+            )));
+        }
 
-        // A last file with an incomplete header was being created when the
-        // process died; it never held a record, so it is removed.
+        // A last file that cannot hold a record yet was being created when the
+        // process died, on a filesystem that persists size before data; it is
+        // removed: one shorter than a header, or exactly a header whose
+        // contents are invalid.
         let mut removed_start = None;
         if let Some(&last) = firsts.last() {
             let path = format::file_path(dir, last);
-            if std::fs::metadata(&path)?.len() < HEADER_LEN {
+            let len = std::fs::metadata(&path)?.len();
+            if len < HEADER_LEN || (len == HEADER_LEN && format::read_header(&path)?.is_none()) {
                 std::fs::remove_file(&path)?;
                 writer::sync_dir(dir, options.sync)?;
                 firsts.pop();
@@ -253,9 +313,23 @@ impl Wal {
             let mode = if is_last { Mode::Lenient } else { Mode::Strict };
             let path = format::file_path(dir, first);
             let scan = format::scan_file(&path, first, mode, Lsn::MAX, |_, _| Ok(()))?;
+            // scan_file guarantees every number it counted is below u64::MAX.
             next = Some(first + scan.records);
             if i + 1 == firsts.len() {
                 if scan.good_end < scan.file_len {
+                    if !options.discard_after_damage
+                        && let Some(at) = format::find_valid_record_after(&path, scan.good_end)?
+                    {
+                        return Err(Error::corrupt(format!(
+                            "{}: record {} at offset {} is bad ({}) but a valid record follows at offset {at}; \
+                             the file is damaged, not torn, and was left unchanged \
+                             (WalOptions::discard_after_damage cuts the log here and loses the records after it)",
+                            path.display(),
+                            first + scan.records,
+                            scan.good_end,
+                            scan.damage.as_deref().unwrap_or("unknown damage"),
+                        )));
+                    }
                     let f = std::fs::OpenOptions::new().write(true).open(&path)?;
                     f.set_len(scan.good_end)?;
                     if options.sync == SyncMode::Data {
@@ -267,17 +341,44 @@ impl Wal {
             }
         }
 
+        let mut next_lsn = match (next, removed_start) {
+            (Some(n), _) => n,
+            (None, Some(start)) => start,
+            (None, None) => 1,
+        };
+        let mut reset_to = None;
+        let mut records_discarded = 0;
+        if let Some(min) = options.min_next_lsn
+            && min > next_lsn
+        {
+            // The caller has already written everything below `min` into data
+            // files, so nothing on disk is needed and none of it may keep
+            // numbers below `min` in use.
+            records_discarded = firsts.first().map_or(0, |&f| next_lsn - f);
+            remove_files_oldest_first(dir, &firsts)?;
+            firsts.clear();
+            active = None;
+            removed_start = Some(min);
+            next_lsn = min;
+            reset_to = Some(min);
+        }
+
         let (file, file_size, file_records) = match active {
             Some((first, size, records)) => {
                 let file = std::fs::OpenOptions::new()
                     .append(true)
                     .open(format::file_path(dir, first))?;
+                if options.sync == SyncMode::Data {
+                    // What recovery reports must survive a power loss: the
+                    // records may have been read from the page cache.
+                    file.sync_data()?;
+                    writer::sync_dir(dir, options.sync)?;
+                }
                 (file, size, records)
             }
             None => {
                 let start = removed_start.unwrap_or(1);
                 firsts.push(start);
-                next = Some(start);
                 (
                     writer::create_file(dir, start, options.sync)?,
                     HEADER_LEN,
@@ -285,18 +386,20 @@ impl Wal {
                 )
             }
         };
-        let next_lsn = next.expect("set above");
         let recovery = Recovery {
             first_lsn: firsts[0],
             last_lsn: next_lsn - 1,
             files: firsts.len(),
             torn_bytes_discarded: torn,
+            reset_to,
+            records_discarded,
         };
 
         let shared = Arc::new(Shared {
             dir: dir.to_path_buf(),
             state: Mutex::new(State {
                 next_lsn,
+                durable_lsn: recovery.last_lsn,
                 ..State::default()
             }),
             wake: Condvar::new(),
@@ -309,6 +412,7 @@ impl Wal {
             file_size,
             file_records,
             last_sync: None,
+            buf: Vec::new(),
         };
         let thread = std::thread::Builder::new()
             .name("nwdb-wal".into())
@@ -316,6 +420,7 @@ impl Wal {
         let wal = Wal {
             shared,
             thread: Some(thread),
+            recovered_first: recovery.first_lsn,
             recovered_last: recovery.last_lsn,
         };
         Ok((wal, recovery))
@@ -327,6 +432,13 @@ impl Wal {
     /// not replayed. The first error from `f` stops the replay and is
     /// returned. Files are re-verified as they are read.
     ///
+    /// Returns [`Error::Corrupt`] instead of replaying less than asked for:
+    /// when the log is not empty and `from` is below the first number still on
+    /// disk (those records were trimmed), and when `from` is above the last
+    /// number plus one (the log is behind what the caller believes was
+    /// written). `from == last + 1` replays nothing and is fine. `from` of 0
+    /// means the start of the log, like 1.
+    ///
     /// Must be called before the first append; afterwards it returns
     /// [`Error::InvalidArgument`].
     ///
@@ -337,8 +449,19 @@ impl Wal {
                 "replay must be called before the first append",
             ));
         }
+        let from = from.max(1);
+        let (first, last) = (self.recovered_first, self.recovered_last);
+        if last >= first && from < first {
+            return Err(Error::corrupt(format!(
+                "cannot replay from {from}: the log starts at {first}, earlier records were trimmed"
+            )));
+        }
+        if from > last + 1 {
+            return Err(Error::corrupt(format!(
+                "cannot replay from {from}: the log ends at {last}, it is behind what was written"
+            )));
+        }
         let files = lock(&self.shared.files).clone();
-        let last = self.recovered_last;
         let mut count = 0;
         for (i, &first) in files.iter().enumerate() {
             if first > last {
@@ -363,36 +486,62 @@ impl Wal {
     /// Queues `record` and returns at once. `on_durable` runs on the log
     /// thread, after the sync that covers the record has returned, with the
     /// record's sequence number, or with the error if the write or sync
-    /// failed. Callbacks run in sequence-number order. A callback must not
-    /// block for long, or it delays every acknowledgement behind it; a panic
-    /// in a callback is caught and ignored.
+    /// failed. Callbacks run in sequence-number order, and every accepted
+    /// record's callback runs exactly once, with [`Error::Fatal`] if the log
+    /// thread dies.
     ///
-    /// If the record is too large ([`MAX_RECORD_BYTES`]) or the log is already
-    /// poisoned, `on_durable` runs immediately on the calling thread with the
-    /// error and nothing is queued.
+    /// If the record is too large ([`MAX_RECORD_BYTES`], [`Error::InvalidArgument`])
+    /// or the log is already poisoned ([`Error::Fatal`]), `on_durable` runs
+    /// immediately on the calling thread with the error and nothing is queued.
+    ///
+    /// # Calling rules
+    ///
+    /// - Callbacks run on the log thread (immediate rejections on the calling
+    ///   thread). A callback must not block: it delays every acknowledgement
+    ///   behind it. It must not call [`append_blocking`](Wal::append_blocking),
+    ///   which would wait for the thread it is running on, and must not drop
+    ///   the last handle to the log, which would join that thread from itself.
+    ///   The caller must not hold a lock that the callback takes while calling
+    ///   `append`, since a rejection runs the callback inside the call.
+    ///   A panic in a callback is caught and ignored.
+    /// - The queue is unbounded. A caller that must bound memory watches
+    ///   [`WalStats::pending_bytes`] and holds back its own senders.
+    /// - [`Error::Fatal`] means the record's outcome is unknown: it may or may
+    ///   not be on disk, and it may reappear on replay after a restart.
+    ///
+    /// The record is copied once; [`append_owned`](Wal::append_owned) avoids that.
     pub fn append(&self, record: &[u8], on_durable: impl FnOnce(Result<Lsn>) + Send + 'static) {
         if record.len() > MAX_RECORD_BYTES {
-            return on_durable(Err(Error::invalid_argument(format!(
-                "record of {} bytes exceeds the limit of {MAX_RECORD_BYTES}",
-                record.len()
-            ))));
+            return on_durable(Err(too_large(record.len())));
         }
-        let payload = record.to_vec();
+        self.enqueue(record.to_vec(), Box::new(on_durable));
+    }
+
+    /// Like [`append`](Wal::append) but takes ownership of the record, so it
+    /// is not copied. The same calling rules apply.
+    pub fn append_owned(
+        &self,
+        record: Vec<u8>,
+        on_durable: impl FnOnce(Result<Lsn>) + Send + 'static,
+    ) {
+        if record.len() > MAX_RECORD_BYTES {
+            return on_durable(Err(too_large(record.len())));
+        }
+        self.enqueue(record, Box::new(on_durable));
+    }
+
+    fn enqueue(&self, payload: Vec<u8>, done: Box<dyn FnOnce(Result<Lsn>) + Send>) {
         let mut st = lock(&self.shared.state);
         if let Some(msg) = &st.poisoned {
             let err = poison_error(msg);
             drop(st);
-            return on_durable(Err(err));
+            return done(Err(err));
         }
         let lsn = st.next_lsn;
         st.next_lsn += 1;
         st.appended = true;
         st.pending_bytes += payload.len() as u64;
-        st.queue.push(Item {
-            lsn,
-            payload,
-            done: Box::new(on_durable),
-        });
+        st.queue.push(Item { lsn, payload, done });
         drop(st);
         self.shared.wake.notify_one();
     }
@@ -404,14 +553,16 @@ impl Wal {
             let _ = tx.send(r);
         });
         rx.recv()
-            .unwrap_or_else(|_| Err(Error::other("the log stopped before acknowledging")))
+            .unwrap_or_else(|_| Err(Error::fatal("the log stopped before acknowledging")))
     }
 
     /// Deletes every file all of whose records have sequence numbers below
     /// `lsn`, never the file currently being written, and returns how many
-    /// files were removed. The directory is synced afterwards.
+    /// files were removed.
     ///
-    /// Files go oldest first, so a failure part-way leaves a contiguous log.
+    /// Files go oldest first and the directory is synced after each removal,
+    /// so even a filesystem that does not preserve unlink order cannot leave a
+    /// gap in the file sequence, and a failure part-way leaves a contiguous log.
     pub fn truncate_before(&self, lsn: Lsn) -> Result<u64> {
         let mut files = lock(&self.shared.files);
         // A file's records all lie below the next file's first number.
@@ -419,7 +570,12 @@ impl Wal {
         let mut removed = 0;
         let mut outcome = Ok(());
         for &first in &files[..removable] {
-            match std::fs::remove_file(format::file_path(&self.shared.dir, first)) {
+            let step = std::fs::remove_file(format::file_path(&self.shared.dir, first))
+                .map_err(Error::from)
+                // Always a real directory sync, whatever the sync mode: a
+                // caller that sees this return may rely on the removal.
+                .and_then(|()| Ok(writer::sync_dir(&self.shared.dir, SyncMode::Data)?));
+            match step {
                 Ok(()) => removed += 1,
                 Err(e) => {
                     outcome = Err(e);
@@ -429,13 +585,14 @@ impl Wal {
         }
         files.drain(..removed);
         drop(files);
-        if removed > 0 {
-            // Always a real directory sync, whatever the sync mode: a caller
-            // that sees this return may rely on the removal.
-            writer::sync_dir(&self.shared.dir, SyncMode::Data)?;
-        }
         outcome?;
         Ok(removed as u64)
+    }
+
+    /// Highest sequence number covered by a completed sync. Right after
+    /// [`open`](Wal::open) it equals [`Recovery::last_lsn`].
+    pub fn durable_lsn(&self) -> Lsn {
+        lock(&self.shared.state).durable_lsn
     }
 
     /// A snapshot of the counters.
@@ -475,4 +632,37 @@ impl Drop for Wal {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+fn too_large(len: usize) -> Error {
+    Error::invalid_argument(format!(
+        "record of {len} bytes exceeds the limit of {MAX_RECORD_BYTES}"
+    ))
+}
+
+/// Creates `dir` and any missing parents, then syncs the parent of each
+/// directory created so the new entries are durable.
+fn create_dir_durably(dir: &Path, sync: SyncMode) -> Result<()> {
+    let missing: Vec<&Path> = dir.ancestors().take_while(|p| !p.exists()).collect();
+    std::fs::create_dir_all(dir)?;
+    for created in missing {
+        let parent = match created.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        // Best effort by construction: `sync_dir` does nothing where a
+        // directory cannot be opened and synced (non-unix platforms).
+        writer::sync_dir(parent, sync)?;
+    }
+    Ok(())
+}
+
+/// Removes log files oldest first, syncing the directory after each so a
+/// crash cannot leave a gap in the sequence.
+fn remove_files_oldest_first(dir: &Path, firsts: &[Lsn]) -> Result<()> {
+    for &first in firsts {
+        std::fs::remove_file(format::file_path(dir, first))?;
+        writer::sync_dir(dir, SyncMode::Data)?;
+    }
+    Ok(())
 }

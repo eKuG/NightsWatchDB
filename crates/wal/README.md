@@ -40,41 +40,112 @@ record = length       u32       payload length in bytes, at most 256 MiB
          payload      length bytes
 ```
 
+
+The header's first number must be at least 1 and below `u64::MAX`; anything
+else is `Error::Corrupt`, as is a sequence number that would overflow.
+
 A new file is started when the active one would grow past `max_file_bytes`; a
 single record larger than the limit gets a file to itself. The old file is
-synced before the new one is used, the new file's header is synced before any
-record follows it, and the directory is synced after a file is created or
-removed.
+synced before the new one is used.
+
+### File creation
+
+A file never has its final name until its header is durable. A new file is
+created as `wal-<n>.log.tmp`, its header is written and synced, it is renamed
+to `wal-<n>.log`, and the directory is synced. The directory is synced after
+every removal too. A crash can therefore leave a `.tmp` file, which `open`
+removes, but never a log file with a missing or unsynced header (on
+filesystems that persist a file's size before its data, such a file would be
+a zero-filled header). A newly created log directory is synced into its parent
+(best effort: skipped on platforms where a directory cannot be synced).
 
 ## Recovery
 
 `Wal::open` lists the files and checks them in order.
 
+- Leftover `.tmp` files are removed.
 - File numbers must be contiguous: each file's first number is the previous
   file's last plus one. A gap or overlap is `Error::Corrupt`.
 - In every file except the last, an invalid header, a short record or a
   checksum mismatch is `Error::Corrupt`. A header whose number differs from
   its file name is `Error::Corrupt` too.
-- In the last file, the first record that is incomplete or fails its checksum
-  marks the end of the log. The file is truncated to the end of the last good
-  record and synced, and `Recovery::torn_bytes_discarded` reports how much was
-  cut.
-- A last file shorter than a full header is removed: it was being created when
-  the process died and never held a record. Its predecessor must then be
-  intact, like any non-last file. A last file with a complete but invalid
-  header is `Error::Corrupt`.
+- A last file shorter than a full header, or exactly a header long with an
+  invalid header, is removed: it was being created when the process died and
+  never held a record. Its predecessor must then be intact, like any non-last
+  file. A last file longer than a header with an invalid header is
+  `Error::Corrupt`.
 - Appending continues in the last file if it has room.
+- With `SyncMode::Data`, the last file and the directory are synced before
+  `open` returns, so every record `Recovery` reports is durable. A record that
+  a dead process wrote but never synced is therefore either made durable by
+  recovery or cut as a torn tail, never replayed and then lost.
 
-**Damage in the middle of the last file hides the records after it.** A torn
-write and a flipped byte look the same to the scanner, so valid records
-following the first bad one in the last file are cut too. They were not yet
-acknowledged only if the damage was a torn write; for other damage they may
-have been. The size of the cut is reported, and a caller that wants to treat
-a large cut as an error can do so from `Recovery`.
+### Damage versus torn tail
+
+When a record in the last file is incomplete or fails its checksum, `open`
+scans the rest of the file for any later position at which a complete record
+with a valid checksum can be parsed.
+
+- If none exists, the bad record is a torn tail. The file is truncated to the
+  end of the last good record and synced, and `Recovery::torn_bytes_discarded`
+  reports how much was cut.
+- If one exists, the file is damaged, not torn: later records were fully
+  written, so they may have been acknowledged. `open` returns `Error::Corrupt`
+  naming the file, the offset of the bad record and the offset of the valid
+  one, and does not modify the file.
+
+The scan costs one pass over the tail in practice: a candidate whose length
+field exceeds the remaining bytes is skipped without hashing. An adversarial
+tail where every length field just fits would cost quadratic time in the tail
+size. (A torn record whose partial payload happens to contain a complete valid
+record is reported as damage; the override below resolves it.)
+
+`WalOptions::discard_after_damage` is an explicit operator override. When
+true, `open` cuts the log at the first bad record as for a torn tail.
+**This throws away acknowledged data**, and its sequence numbers are reused.
+
+### Keeping numbering above the engine's position
+
+`WalOptions::min_next_lsn` is the lowest number the next record may get. If the
+log's own next number is lower (the log lost its tail or was wiped while the
+engine had already written later records into data files), every record on
+disk is below the caller's position and is not needed. `open` removes all log
+files (oldest first, syncing the directory after each), starts a new file whose
+first number is `min_next_lsn`, and reports `Recovery::reset_to` and
+`Recovery::records_discarded`. If `min_next_lsn` is at or below the next number
+it has no effect.
+
+### Replay
+
+`replay(from)` is `Error::Corrupt` when the log is not empty and `from` is
+below the first number on disk (those records were trimmed), and when `from`
+is above the last number plus one (the log is behind the caller). `from` equal
+to last plus one replays nothing. `from` of 0 is treated as 1.
+
+`Wal::durable_lsn()` is the highest number covered by a completed sync; right
+after `open` it equals `Recovery::last_lsn`.
 
 ## Failure
 
-If a write or a sync fails the log is poisoned: every unacknowledged record
-gets the error, later appends fail at once, and nothing is retried. After a
-failed `fsync` the file's contents are unknown; the process must restart and
-let recovery decide.
+If a write or a sync fails, or the log thread panics, the log is poisoned:
+every unacknowledged record, including the batch being written, gets
+`Error::Fatal`, later appends fail at once with `Error::Fatal`, and nothing is
+retried. `Fatal` means the record's outcome is unknown: it may or may not be on
+disk and may reappear on replay after the restart. After a failed `fsync` the
+file's contents are unknown; the process must restart and let recovery decide.
+A record rejected for being too large is `Error::InvalidArgument`, the
+caller's mistake.
+
+## Calling rules
+
+- `append` callbacks run on the log thread; an immediate rejection (too large,
+  or poisoned) runs the callback on the calling thread, inside the call.
+- A callback must not block, must not call `append_blocking` (it would wait
+  for the thread it runs on), and must not drop the last handle to the log
+  (it would join its own thread). The caller must not hold a lock that the
+  callback takes while calling `append`.
+- Every record accepted by `append` has its callback run exactly once.
+- The queue is unbounded. Callers bound memory with `stats().pending_bytes`.
+- `append` copies the record once; `append_owned` takes it without copying.
+  The writer gathers small records into a 64 KiB buffer and writes larger
+  payloads directly, so no concatenated copy of the batch exists.
