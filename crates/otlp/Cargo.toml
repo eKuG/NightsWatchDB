@@ -1,0 +1,21 @@
+[package]
+name = "nwdb-otlp"
+description = "OTLP trace decoding for NightsWatchDB: serialized ExportTraceServiceRequest to span-table batches and back"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nwdb-core = { path = "../core" }
+arrow-array.workspace = true
+
+[dev-dependencies]
+prost = "=0.14.6"
+opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+rand = "=0.9.5"
+
+[lints]
+workspace = true
