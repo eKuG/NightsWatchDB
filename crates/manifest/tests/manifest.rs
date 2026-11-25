@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::thread;
 
 use nwdb_core::{Error, PartMeta, part_dir_name};
-use nwdb_manifest::{Edit, Manifest, ManifestOptions, ManifestState, unreferenced_part_dirs};
+use nwdb_manifest::{
+    Edit, Manifest, ManifestOptions, ManifestState, OpenMode, unreferenced_part_dirs,
+};
 
 fn part(id: u64) -> PartMeta {
     PartMeta {
@@ -33,7 +35,7 @@ fn add(ids: &[u64]) -> Edit {
 }
 
 fn open(dir: &Path) -> Manifest {
-    Manifest::open(dir, ManifestOptions::default()).unwrap()
+    Manifest::open(dir, OpenMode::Create, ManifestOptions::default()).unwrap()
 }
 
 fn file_names(dir: &Path) -> Vec<String> {
@@ -291,7 +293,7 @@ fn eight_writers_lose_nothing() {
             let dir = tmp.path().to_path_buf();
             let opts = opts.clone();
             thread::spawn(move || {
-                let m = Manifest::open(&dir, opts).unwrap();
+                let m = Manifest::open(&dir, OpenMode::Create, opts).unwrap();
                 for i in 0..EACH {
                     let id = t * 1000 + i + 1;
                     loop {
@@ -311,7 +313,9 @@ fn eight_writers_lose_nothing() {
         h.join().unwrap();
     }
 
-    let s = Manifest::open(tmp.path(), opts).unwrap().current();
+    let s = Manifest::open(tmp.path(), OpenMode::Create, opts)
+        .unwrap()
+        .current();
     let total = THREADS * EACH;
     assert_eq!(s.version, total);
     let mut want: Vec<u64> = (0..THREADS)
@@ -378,7 +382,7 @@ fn crash_leftovers() {
         ("empty", Vec::new()),
     ] {
         fs::write(dir.join(vname(2)), bytes).unwrap();
-        let err = Manifest::open(dir, ManifestOptions::default())
+        let err = Manifest::open(dir, OpenMode::Create, ManifestOptions::default())
             .err()
             .unwrap();
         match err {
@@ -390,7 +394,7 @@ fn crash_leftovers() {
     // A valid file whose content names another version is corrupt too.
     fs::write(dir.join(vname(2)), &v1).unwrap();
     assert!(matches!(
-        Manifest::open(dir, ManifestOptions::default())
+        Manifest::open(dir, OpenMode::Create, ManifestOptions::default())
             .err()
             .unwrap(),
         Error::Corrupt(_)
@@ -401,17 +405,18 @@ fn crash_leftovers() {
 fn old_versions_are_pruned() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let m = Manifest::open(dir, ManifestOptions { keep_versions: 3 }).unwrap();
+    let m = Manifest::open(dir, OpenMode::Create, ManifestOptions { keep_versions: 3 }).unwrap();
     for id in 1..=10 {
         m.commit(add(&[id])).unwrap();
     }
     assert_eq!(file_names(dir), [vname(8), vname(9), vname(10)]);
-    let again = Manifest::open(dir, ManifestOptions { keep_versions: 3 }).unwrap();
+    let again =
+        Manifest::open(dir, OpenMode::Create, ManifestOptions { keep_versions: 3 }).unwrap();
     assert_eq!(again.current().version, 10);
     assert_eq!(again.current().parts.len(), 10);
 
     // keep_versions of zero still keeps the newest file.
-    let z = Manifest::open(dir, ManifestOptions { keep_versions: 0 }).unwrap();
+    let z = Manifest::open(dir, OpenMode::Create, ManifestOptions { keep_versions: 0 }).unwrap();
     z.commit(add(&[11])).unwrap();
     assert_eq!(file_names(dir), [vname(11)]);
 }
@@ -422,17 +427,17 @@ fn reserved_ids_and_unreferenced_dirs() {
     let parts = tmp.path().join("parts");
     let m = open(&tmp.path().join("manifest"));
 
-    let r1 = m.reserve_part_ids(3);
-    let r2 = m.reserve_part_ids(2);
+    let r1 = m.reserve_part_ids(3).unwrap();
+    let r2 = m.reserve_part_ids(2).unwrap();
     assert_eq!((r1.clone(), r2.clone()), (1..4, 4..6));
-    assert!(m.reserve_part_ids(0).is_empty());
+    assert!(m.reserve_part_ids(0).unwrap().is_empty());
 
     // Committing only the first range raises next_part_id to the parts added;
     // ids reserved earlier but never committed are not handed out again by
     // this handle.
     let s = m.commit(add(&r1.collect::<Vec<_>>())).unwrap();
     assert_eq!(s.next_part_id, 4);
-    assert_eq!(m.reserve_part_ids(1), 6..7);
+    assert_eq!(m.reserve_part_ids(1).unwrap(), 6..7);
     let s = m.commit(add(&[4, 5])).unwrap();
     assert_eq!(s.next_part_id, 6);
 
@@ -442,7 +447,7 @@ fn reserved_ids_and_unreferenced_dirs() {
         ..Edit::default()
     })
     .unwrap();
-    assert_eq!(m.reserve_part_ids(1), 100..101);
+    assert_eq!(m.reserve_part_ids(1).unwrap(), 100..101);
 
     // Nothing there yet.
     assert!(unreferenced_part_dirs(&parts, &s).unwrap().is_empty());

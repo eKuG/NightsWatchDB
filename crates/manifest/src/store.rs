@@ -3,14 +3,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nwdb_core::{Error, Result, part_dir_name};
+use nwdb_core::{Error, Result};
 
 use crate::file::{TEMP_PREFIX, file_name, parse_file_name};
-use crate::state::{Edit, ManifestState};
+use crate::state::{Edit, MAX_NEXT_PART_ID, ManifestState};
 
 /// Options for [`Manifest::open`].
 #[derive(Debug, Clone)]
@@ -26,37 +26,90 @@ impl Default for ManifestOptions {
     }
 }
 
-struct Inner {
-    state: Arc<ManifestState>,
-    /// First id not yet handed out by `reserve_part_ids` in this process.
-    next_reserved: u64,
+/// What [`Manifest::open`] does when the manifest directory has no manifest
+/// file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// First start of a new database: create the directory if it is missing.
+    /// An existing directory without manifest files is version 0.
+    Create,
+    /// Restart of an existing database: the directory must exist and hold at
+    /// least one manifest file, otherwise [`Error::NotFound`]. A wrong path or
+    /// an unmounted volume is an error, never an empty database.
+    MustExist,
 }
+
+/// Test hook: runs inside `commit`, after the temporary file is written and
+/// before the link, with the writer lock held.
+type CommitHook = Arc<dyn Fn() + Send + Sync>;
 
 /// A handle on a manifest directory.
 ///
-/// Several handles, in this or other processes, may share one directory; they
-/// coordinate only through the create-if-absent publish of the next version.
+/// One writer per data directory: the engine takes an exclusive lock on the
+/// data directory and holds exactly one `Manifest`. Other handles would still
+/// be detected (the loser of a publish race gets [`Error::Conflict`]), but
+/// that is a second line of defence, not a supported way to run concurrent
+/// writers.
+///
+/// Readers ([`current`](Self::current)) take only a short read lock on the
+/// published pointer and never wait for a commit in progress.
 pub struct Manifest {
     dir: PathBuf,
     keep_versions: u64,
-    inner: Mutex<Inner>,
+    /// The last state known to be durable. Held only to clone or swap the
+    /// pointer, never across I/O.
+    published: RwLock<Arc<ManifestState>>,
+    /// Serialises `commit` and `reload`; held across file writes and syncs.
+    writer: Mutex<()>,
+    /// First id not yet handed out by `reserve_part_ids` in this process.
+    next_reserved: Mutex<u64>,
+    /// Set when a failure after the link left the outcome unknown.
+    poisoned: AtomicBool,
+    commit_hook: Mutex<Option<CommitHook>>,
+    fail_dir_sync: AtomicBool,
 }
 
 impl Manifest {
-    /// Opens the manifest in `dir`, creating the directory if it is missing.
+    /// Opens the manifest in `dir`.
     ///
-    /// Leftover temporary files from a crashed commit are removed (this also
-    /// removes the temporary file of a commit running right now in another
-    /// handle, which then writes it again). The
-    /// highest-numbered manifest file is loaded; an empty directory gives the
-    /// empty state at version 0.
+    /// With [`OpenMode::Create`] the directory is created if missing (and its
+    /// parent synced); with [`OpenMode::MustExist`] a missing directory, or
+    /// one with no manifest file, is [`Error::NotFound`].
+    ///
+    /// Leftover temporary files from a crashed commit are removed. The
+    /// highest-numbered manifest file is loaded, and the directory is synced
+    /// before returning, so the version reported is durable: a previous
+    /// process may have linked it and died before syncing.
     ///
     /// Returns [`Error::Corrupt`] if the highest-numbered file is damaged. It
     /// does not fall back to an older file: an older version could bring
     /// removed parts back to life or forget data already acknowledged.
-    pub fn open(dir: impl AsRef<Path>, options: ManifestOptions) -> Result<Self> {
+    pub fn open(dir: impl AsRef<Path>, mode: OpenMode, options: ManifestOptions) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        match mode {
+            OpenMode::Create => {
+                if !dir.is_dir() {
+                    fs::create_dir_all(&dir)?;
+                    // Make the new directory's name durable.
+                    if let Some(parent) = dir.parent() {
+                        let parent = if parent.as_os_str().is_empty() {
+                            Path::new(".")
+                        } else {
+                            parent
+                        };
+                        sync_dir(parent)?;
+                    }
+                }
+            }
+            OpenMode::MustExist => {
+                if !dir.is_dir() {
+                    return Err(Error::not_found(format!(
+                        "manifest directory {} does not exist",
+                        dir.display()
+                    )));
+                }
+            }
+        }
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             if entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX) {
@@ -66,73 +119,150 @@ impl Manifest {
                 }
             }
         }
-        let state = Arc::new(load_highest(&dir)?);
+        let state = match load_highest(&dir)? {
+            Some(s) => s,
+            None if mode == OpenMode::MustExist => {
+                return Err(Error::not_found(format!(
+                    "manifest directory {} holds no manifest file",
+                    dir.display()
+                )));
+            }
+            None => ManifestState::empty(),
+        };
+        // The file we loaded may only be in the page cache.
+        sync_dir(&dir)?;
+        let state = Arc::new(state);
         Ok(Self {
             dir,
             keep_versions: options.keep_versions.max(1) as u64,
-            inner: Mutex::new(Inner {
-                next_reserved: state.next_part_id,
-                state,
-            }),
+            next_reserved: Mutex::new(state.next_part_id),
+            published: RwLock::new(state),
+            writer: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
+            commit_hook: Mutex::new(None),
+            fail_dir_sync: AtomicBool::new(false),
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, Inner> {
-        // The guarded data is only ever replaced whole, so a panic in another
-        // thread never leaves it half updated.
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    /// The writer lock. It guards `()`, so a panic in another thread cannot
+    /// leave anything half updated.
+    fn lock_writer(&self) -> MutexGuard<'_, ()> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn check_poisoned(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(Error::fatal(
+                "manifest handle is poisoned by an earlier failure after publishing; \
+                 restart the process and recover",
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_published(&self, state: Arc<ManifestState>) {
+        // The pointer is only ever replaced whole, so a poisoned lock still
+        // holds valid data.
+        *self.published.write().unwrap_or_else(|e| e.into_inner()) = state;
     }
 
     /// The snapshot readers hold. It never changes, whatever is committed
-    /// later.
+    /// later, and taking it never waits for a commit in progress. After an
+    /// [`Error::Fatal`] it is the last state known to be durable.
     pub fn current(&self) -> Arc<ManifestState> {
-        self.lock().state.clone()
+        self.published
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
-    /// Re-reads the highest version from disk and makes it current.
+    /// Re-reads the highest version from disk, syncs the directory so that
+    /// version is durable, and makes it current.
+    ///
+    /// Returns [`Error::Fatal`] on a poisoned handle and [`Error::Corrupt`]
+    /// if the highest file is damaged.
     pub fn reload(&self) -> Result<Arc<ManifestState>> {
-        let mut inner = self.lock();
-        let state = Arc::new(load_highest(&self.dir)?);
-        inner.state = state.clone();
+        let _w = self.lock_writer();
+        self.check_poisoned()?;
+        let state = load_highest(&self.dir)?.unwrap_or_else(ManifestState::empty);
+        sync_dir(&self.dir)?;
+        let state = Arc::new(state);
+        self.set_published(state.clone());
         Ok(state)
     }
 
     /// Applies `edit` to the current state and publishes it as the next
     /// version.
     ///
-    /// Returns [`Error::InvalidArgument`] if the edit is not valid for the
-    /// current state, and [`Error::Conflict`] if another writer already
-    /// published the next version. In both cases nothing changed; after a
-    /// conflict the caller should [`reload`](Self::reload), re-evaluate its
-    /// edit against the new state and retry.
+    /// What the errors mean:
     ///
-    /// An [`Error::Io`] before the file is published leaves nothing changed.
-    /// An I/O error from the final directory sync means the new version is
-    /// published and current but may not yet be durable; call
-    /// [`reload`](Self::reload) to see the outcome instead of repeating the
-    /// edit.
+    /// * [`Error::InvalidArgument`]: the edit is invalid against this
+    ///   handle's current state (removing a part that is not live, adding an
+    ///   id that is live, going backwards, an implausible `next_part_id`).
+    ///   After a conflict and [`reload`](Self::reload) the caller must
+    ///   re-decide its edit against the reloaded state; an edit that is then
+    ///   still invalid is the caller's bug, not a race. A handle that has not
+    ///   reloaded learns of other writers only through `Conflict`.
+    /// * [`Error::Conflict`]: someone else published this version (or a
+    ///   newer one) first. Nothing changed; reload, re-decide and retry.
+    /// * Any other error before the link, such as [`Error::Io`]: nothing
+    ///   changed.
+    /// * [`Error::Fatal`]: the link succeeded but the directory sync failed,
+    ///   so the new version is visible on disk but may not be durable. The
+    ///   handle is poisoned: every later `commit` and `reload` returns
+    ///   `Fatal`, and `current()` stays at the last state known durable. The
+    ///   process must restart; `open` syncs the directory and reports
+    ///   whichever version survived.
     pub fn commit(&self, edit: Edit) -> Result<Arc<ManifestState>> {
-        let mut inner = self.lock();
-        let next = inner.state.apply(&edit, now_unix_ms())?;
+        let _w = self.lock_writer();
+        self.check_poisoned()?;
+        let next = self.current().apply(&edit, now_unix_ms())?;
         let bytes = next.encode()?;
 
         self.publish(&bytes, next.version)?;
 
+        // From here the version exists on disk: any failure is Fatal.
+        let synced = if self.fail_dir_sync.load(Ordering::SeqCst) {
+            Err(Error::other("injected directory sync failure"))
+        } else {
+            sync_dir(&self.dir)
+        };
+        if let Err(e) = synced {
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(Error::fatal(format!(
+                "manifest version {} was published but syncing the directory failed \
+                 ({e}); it may or may not survive a crash, restart and recover",
+                next.version
+            )));
+        }
         let next = Arc::new(next);
-        inner.state = next.clone();
-        let synced = sync_dir(&self.dir);
+        self.set_published(next.clone());
         self.prune(next.version);
-        synced?;
         Ok(next)
+    }
+
+    /// Test only: runs `hook` inside every commit, after the temporary file
+    /// is written and before the link, with the writer lock held.
+    #[doc(hidden)]
+    pub fn set_commit_hook(&self, hook: Option<CommitHook>) {
+        *self.commit_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    /// Test only: makes the directory sync after the link fail.
+    #[doc(hidden)]
+    pub fn set_fail_dir_sync(&self, fail: bool) {
+        self.fail_dir_sync.store(fail, Ordering::SeqCst);
     }
 
     /// Writes `bytes` to a temporary file and links it to the name of
     /// `version`, removing the temporary name afterwards in every case.
     fn publish(&self, bytes: &[u8], version: u64) -> Result<()> {
-        // `open` in another handle removes every temporary file it sees, which
-        // can include ours between the write and the link. The link then
-        // reports NotFound and nothing has been published, so writing again
-        // is safe.
+        // Defence only: with one writer per data directory nothing else
+        // removes our temporary file. A second handle's `open` would remove
+        // every temporary file it sees, including ours between the write and
+        // the link; the link then reports NotFound with nothing published, so
+        // writing again is safe. Bounded, so a persistent NotFound (for
+        // example a deleted directory) still surfaces.
         let mut attempt = 0;
         loop {
             let temp = self.dir.join(format!(
@@ -157,9 +287,19 @@ impl Manifest {
         f.sync_all()?;
         drop(f);
 
-        // A handle that is far behind could otherwise publish a version that
-        // old-file cleanup has already removed, and no reader would ever load
-        // it. Refuse if this version or anything newer exists.
+        let hook = self
+            .commit_hook
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(h) = hook {
+            h();
+        }
+
+        // Kept even with a single writer: a handle that is far behind could
+        // otherwise publish a version that old-file cleanup has already
+        // removed, and no reader would ever load it. Refuse if this version
+        // or anything newer exists.
         if highest_version(&self.dir)?.is_some_and(|h| h >= version) {
             return Err(conflict(version));
         }
@@ -195,23 +335,22 @@ impl Manifest {
     /// parts are never committed. A later [`commit`](Self::commit) that adds
     /// the parts raises `next_part_id` past them.
     ///
-    /// Consequence for the engine: ids are not recorded anywhere until a
-    /// commit, so after a crash the parts directory may hold directories
-    /// whose ids the manifest does not know, and a restarted process hands
-    /// the same ids out again. Delete every directory listed by
-    /// [`unreferenced_part_dirs`] at startup, before any id is reserved. Two
-    /// processes reserving from one directory can collide; that is caught
-    /// when the second one commits, because the id is then already live.
+    /// Ids are not recorded anywhere until a commit, so after a crash the
+    /// parts directory may hold directories whose ids the manifest does not
+    /// know, and a restarted process would hand the same ids out again. See
+    /// [`highest_part_dir_id`] for the startup rule that prevents this.
     ///
-    /// # Panics
-    ///
-    /// If the ids would pass `u64::MAX`, which no real workload reaches.
-    pub fn reserve_part_ids(&self, n: u64) -> Range<u64> {
-        let mut inner = self.lock();
-        let start = inner.next_reserved.max(inner.state.next_part_id);
-        let end = start.checked_add(n).expect("part id space exhausted");
-        inner.next_reserved = end;
-        start..end
+    /// Returns [`Error::InvalidArgument`] if the ids would pass
+    /// [`MAX_NEXT_PART_ID`]; nothing is reserved then.
+    pub fn reserve_part_ids(&self, n: u64) -> Result<Range<u64>> {
+        let mut reserved = self.next_reserved.lock().unwrap_or_else(|e| e.into_inner());
+        let start = (*reserved).max(self.current().next_part_id);
+        let end = start
+            .checked_add(n)
+            .filter(|&e| e <= MAX_NEXT_PART_ID)
+            .ok_or_else(|| Error::invalid_argument("part id space exhausted"))?;
+        *reserved = end;
+        Ok(start..end)
     }
 }
 
@@ -227,7 +366,7 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Makes a link or removal in `dir` durable.
+/// Makes a link, creation or removal in `dir` durable.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> Result<()> {
     fs::File::open(dir)?.sync_all()?;
@@ -251,13 +390,13 @@ fn highest_version(dir: &Path) -> Result<Option<u64>> {
     Ok(best)
 }
 
-/// Loads the highest-numbered manifest file, or the empty state.
-fn load_highest(dir: &Path) -> Result<ManifestState> {
+/// Loads the highest-numbered manifest file, or `None` if there is none.
+fn load_highest(dir: &Path) -> Result<Option<ManifestState>> {
     // The file can disappear between listing and reading when another handle
     // commits and removes old files; listing again finds the newer one.
     for _ in 0..8 {
         let Some(v) = highest_version(dir)? else {
-            return Ok(ManifestState::empty());
+            return Ok(None);
         };
         let name = file_name(v);
         let bytes = match fs::read(dir.join(&name)) {
@@ -272,35 +411,35 @@ fn load_highest(dir: &Path) -> Result<ManifestState> {
                 state.version
             )));
         }
-        return Ok(state);
+        return Ok(Some(state));
     }
     Err(Error::other(
         "manifest files kept disappearing while loading",
     ))
 }
 
-/// Lists directories under `parts_dir` that `state` does not reference.
-///
-/// A directory counts if its name is a 20-digit part id (a final part) or
-/// ends in `.tmp` (a part still being written). A final directory is
-/// referenced when `state` holds a live part with that id; a `.tmp` directory
-/// never is. Other names and plain files are left alone. A missing
-/// `parts_dir` gives an empty list. The result is sorted by name.
-///
-/// Call this at startup, before any writer runs: while a flush is in flight
-/// its directory is unreferenced too. After a crash the listed directories
-/// are leftovers and must be deleted before their ids can be reused.
-pub fn unreferenced_part_dirs(parts_dir: &Path, state: &ManifestState) -> Result<Vec<PathBuf>> {
+/// The part id a directory name stands for: 20 digits (a final part) or 20
+/// digits plus `.tmp` (a part being written). Returns the id and whether the
+/// directory is final.
+fn part_dir_id(name: &str) -> Option<(u64, bool)> {
+    let (digits, is_final) = match name.strip_suffix(".tmp") {
+        Some(d) => (d, false),
+        None => (name, true),
+    };
+    if digits.len() != 20 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(|id| (id, is_final))
+}
+
+/// Part directories under `parts_dir` as `(path, id, is_final)`; a missing
+/// `parts_dir` is empty.
+fn part_dirs(parts_dir: &Path) -> Result<Vec<(PathBuf, u64, bool)>> {
     let rd = match fs::read_dir(parts_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
-    let live: HashSet<String> = state
-        .parts
-        .iter()
-        .map(|p| part_dir_name(p.part_id))
-        .collect();
     let mut out = Vec::new();
     for entry in rd {
         let entry = entry?;
@@ -308,11 +447,53 @@ pub fn unreferenced_part_dirs(parts_dir: &Path, state: &ManifestState) -> Result
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_final = name.len() == 20 && name.bytes().all(|b| b.is_ascii_digit());
-        if (is_final && !live.contains(&name)) || name.ends_with(".tmp") {
-            out.push(entry.path());
+        if let Some((id, is_final)) = part_dir_id(&name) {
+            out.push((entry.path(), id, is_final));
         }
     }
+    Ok(out)
+}
+
+/// The largest part id among final and temporary part directories under
+/// `parts_dir`, or `None` if there are none (or no `parts_dir`).
+///
+/// Used at startup so ids are never reused after a crash; see the README.
+pub fn highest_part_dir_id(parts_dir: &Path) -> Result<Option<u64>> {
+    Ok(part_dirs(parts_dir)?.into_iter().map(|(_, id, _)| id).max())
+}
+
+/// Lists directories under `parts_dir` that `state` does not reference.
+///
+/// A directory counts if its name is a 20-digit part id (a final part) or
+/// that followed by `.tmp` (a part still being written). A final directory is
+/// referenced when `state` holds a live part with that id; a `.tmp` directory
+/// never is. Other names and plain files are left alone. A missing
+/// `parts_dir` gives an empty list. The result is sorted by name.
+///
+/// Refuses with [`Error::Corrupt`] when `state` is version 0 (nothing has
+/// ever been committed) and `parts_dir` holds any final part directory: an
+/// empty manifest next to existing parts means a lost or wrong manifest,
+/// never a reason to delete them.
+///
+/// Call this at startup, before any writer runs: while a flush is in flight
+/// its directory is unreferenced too. After a crash the listed directories
+/// are leftovers and must be deleted, after the first commit described in
+/// the README, so their ids are never reused.
+pub fn unreferenced_part_dirs(parts_dir: &Path, state: &ManifestState) -> Result<Vec<PathBuf>> {
+    let dirs = part_dirs(parts_dir)?;
+    if state.version == 0 && dirs.iter().any(|(_, _, is_final)| *is_final) {
+        return Err(Error::corrupt(format!(
+            "manifest is at version 0 but {} contains part directories; \
+             refusing to treat them as unreferenced",
+            parts_dir.display()
+        )));
+    }
+    let live: HashSet<u64> = state.parts.iter().map(|p| p.part_id).collect();
+    let mut out: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter(|(_, id, is_final)| !*is_final || !live.contains(id))
+        .map(|(path, _, _)| path)
+        .collect();
     out.sort();
     Ok(out)
 }

@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 /// The only on-disk format version this crate reads and writes.
 pub(crate) const FORMAT_VERSION: u32 = 1;
 
+/// Largest `next_part_id` accepted on load or in an edit. A real database
+/// never gets near 2^62 parts; a larger value is a damaged or hostile file,
+/// and refusing it keeps id arithmetic far from overflow.
+pub const MAX_NEXT_PART_ID: u64 = 1 << 62;
+
 /// One immutable version of the manifest.
 ///
 /// Unknown fields are ignored when reading, so an older reader still loads a
@@ -70,6 +75,12 @@ impl ManifestState {
         if self.parts.windows(2).any(|w| w[0].part_id >= w[1].part_id) {
             return Err("parts are not sorted by unique part id".to_string());
         }
+        if self.next_part_id > MAX_NEXT_PART_ID {
+            return Err(format!(
+                "next_part_id {} is implausibly large (limit {MAX_NEXT_PART_ID})",
+                self.next_part_id
+            ));
+        }
         if let Some(last) = self.parts.last()
             && last.part_id >= self.next_part_id
         {
@@ -83,7 +94,8 @@ impl ManifestState {
 
     /// Computes the state that results from `edit`, as version + 1.
     ///
-    /// Nothing is modified; on error the edit is simply rejected.
+    /// Nothing is modified. Every error is [`Error::InvalidArgument`]: the
+    /// edit is invalid against `self`, the state the caller built it from.
     pub(crate) fn apply(&self, edit: &Edit, now_unix_ms: u64) -> Result<Self> {
         let mut removed = BTreeSet::new();
         for &id in &edit.remove {
@@ -129,16 +141,18 @@ impl ManifestState {
             }
             Some(n) => n,
             None => {
-                // An id of u64::MAX cannot be followed by another one.
                 let above_added = match added.last() {
-                    Some(&max) => max.checked_add(1).ok_or_else(|| {
-                        Error::invalid_argument("part id u64::MAX leaves no next id")
-                    })?,
+                    Some(&max) => max.saturating_add(1),
                     None => 0,
                 };
                 self.next_part_id.max(above_added)
             }
         };
+        if next_part_id > MAX_NEXT_PART_ID {
+            return Err(Error::invalid_argument(format!(
+                "next_part_id {next_part_id} is implausibly large (limit {MAX_NEXT_PART_ID})"
+            )));
+        }
         let version = self
             .version
             .checked_add(1)
