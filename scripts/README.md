@@ -36,3 +36,37 @@ checks after `kill -9` and after a `docker stop`, which must exit with code 0.
 It prints `PASS` or `FAIL` and removes its containers, network and volume on
 exit; the two images (`nightswatchdb:e2e`, `nwdb-tracegen:e2e`) stay.
 `E2E_TRACES` sets the number of traces (default 3000).
+
+## bench.sh
+
+Benchmarks the server image: one dataset on one resource profile.
+
+```sh
+scripts/bench.sh [--dataset d1|d2|smoke] [--profile small|standard] [--out DIR]
+```
+
+- Profiles: `small` limits the server to 2 CPUs and 4 GB, `standard` to 8 CPUs
+  and 12 GB. The generator and the query tool are not limited.
+- Datasets: `d1` is `tracegen --bytes 8GB --seed 1` (text-heavy) and `d2` is
+  `tracegen --no-content --spans 10000000 --seed 1` (spans only), the
+  definitions of `experiments/expA`. `smoke` is `--no-content --spans 30000
+  --seed 1`, for checking the harness (about a minute); it needs no corpus.
+- `d1` and `d2` read the text corpus from the Docker volume `nwdb-bench-corpus`.
+  The first run copies `.data/corpus` into it (read-only, once); later runs
+  reuse it. If `.data/corpus` is missing the script says so and names
+  `bench/corpusprep`.
+- Steps: build the three images, create a network and a fresh data volume,
+  start the server, load the dataset over OTLP gRPC with gzip, record storage,
+  restart cleanly, load a small extra batch and `kill -9` the server, restart,
+  then run `bench/querybench` against the restarted server. After each step the
+  span count the server reports is compared with what was sent; any difference
+  fails the run.
+- Output: `result.json` and `result.md` in `DIR`
+  (default `.data/bench/<date>-<commit>-<dataset>-<profile>/`), plus the
+  generator summaries and the raw `querybench.json`. Only these small files
+  reach the host; data stays in Docker volumes.
+- `BENCH_QUERIES`, `BENCH_WARMUP` and `BENCH_CONCURRENCY` change the query
+  phase (defaults 200, 20, 1).
+- It removes its containers, network and data volume on exit. The images and
+  the corpus volume stay. It refuses to start while another `nwdb-bench-*`
+  container is running.
