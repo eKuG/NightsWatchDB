@@ -538,12 +538,20 @@ fn index_file_known_answer() {
         mk(0x05, 1, -50, 40),
     ];
     write_part(tmp.path(), 1, &spans, 10, WriterOptions::default());
-    let got = std::fs::read(part_dir(tmp.path(), 1).join(INDEX_FILE)).unwrap();
+    let dir = part_dir(tmp.path(), 1);
+    let got = std::fs::read(dir.join(INDEX_FILE)).unwrap();
 
     let mut want: Vec<u8> = Vec::new();
     want.extend_from_slice(b"NWTI");
-    want.extend_from_slice(&[1, 0, 0, 0]);
+    want.extend_from_slice(&[2, 0, 0, 0]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
+    // Length (u64) and CRC-32C (u32) of spans.parquet, then summary.parquet.
+    for file in [SPANS_FILE, SUMMARY_FILE] {
+        let bytes = std::fs::read(dir.join(file)).unwrap();
+        want.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        want.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+    }
+    assert_eq!(want.len(), 40);
     // Trace 0x05: first row 2, one row, start -50, end 40.
     want.extend_from_slice(&[0x05; 16]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
@@ -556,13 +564,22 @@ fn index_file_known_answer() {
     want.extend_from_slice(&[2, 0, 0, 0]);
     want.extend_from_slice(&[100, 0, 0, 0, 0, 0, 0, 0]);
     want.extend_from_slice(&[0x2C, 0x01, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(want.len(), 16 + 2 * 44);
-    // CRC-32C of everything above, little-endian.
-    want.extend_from_slice(&CRC_OF_KNOWN_ANSWER.to_le_bytes());
+    assert_eq!(want.len(), 40 + 2 * 44);
+    // CRC-32C of everything above, little-endian. The header holds the
+    // checksums of the Parquet files, so this one is computed, with the
+    // algorithm pinned by the check value at the top of the test.
+    let crc = crc32c::crc32c(&want);
+    want.extend_from_slice(&crc.to_le_bytes());
     assert_eq!(got, want);
-}
 
-const CRC_OF_KNOWN_ANSWER: u32 = 0x1C9B_94A8;
+    // The reader exposes the same values.
+    let reader = PartReader::open(&dir).unwrap();
+    let spans_bytes = std::fs::read(dir.join(SPANS_FILE)).unwrap();
+    let sum = reader.spans_checksum().unwrap();
+    assert_eq!(sum.len, spans_bytes.len() as u64);
+    assert_eq!(sum.crc32c, crc32c::crc32c(&spans_bytes));
+    assert!(reader.summary_checksum().is_some());
+}
 
 /// Copies a valid part and returns the copy's directory.
 fn copy_part(src: &Path, dst_parent: &Path) -> PathBuf {
@@ -605,7 +622,7 @@ fn corrupt_parts_are_rejected_at_open() {
     expect_corrupt(&|b| b[0] = b'X', "bad magic");
     expect_corrupt(
         &|b| {
-            b[4] = 2;
+            b[4] = 3;
             reseal(b);
         },
         "bad version",
@@ -625,7 +642,7 @@ fn corrupt_parts_are_rejected_at_open() {
         &|b| {
             // The first record's row count, made one larger, with a valid
             // checksum: the ranges no longer tile the Parquet rows.
-            b[16 + 24] = b[16 + 24].wrapping_add(1);
+            b[40 + 24] = b[40 + 24].wrapping_add(1);
             reseal(b);
         },
         "row ranges disagree with the Parquet file",
@@ -633,7 +650,7 @@ fn corrupt_parts_are_rejected_at_open() {
     expect_corrupt(
         &|b| {
             // Two records swapped: ids out of order, checksum valid.
-            let (first, second) = (16, 16 + 44);
+            let (first, second) = (40, 40 + 44);
             let a: Vec<u8> = b[first..second].to_vec();
             let c: Vec<u8> = b[second..second + 44].to_vec();
             b[first..second].copy_from_slice(&c);
@@ -951,6 +968,15 @@ fn lifecycle_of_the_part_directory() {
     assert!(w.finish().is_err());
     assert!(!part_dir(&parts, 11).exists());
 
+    // A window that is not positive is refused before anything is created.
+    for window in [0, -1] {
+        assert!(matches!(
+            PartWriter::create(&parts, 13, 0, window, WriterOptions::default()).err(),
+            Some(Error::InvalidArgument(_))
+        ));
+    }
+    assert!(!parts.join(format!("{}.tmp", part_dir_name(13))).exists());
+
     // Bad options are refused before anything is created.
     let bad = WriterOptions {
         row_group_rows: 0,
@@ -1003,7 +1029,7 @@ fn part_meta_describes_the_part() {
 
     assert_eq!(meta.part_id, 42);
     assert_eq!(meta.level, 0);
-    assert_eq!(meta.format_version, 1);
+    assert_eq!(meta.format_version, 2);
     assert_eq!(meta.window_start_ns, window_start);
     assert_eq!(meta.window_ns, WINDOW_NS);
     assert_eq!(meta.rows, spans.len() as u64);

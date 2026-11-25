@@ -3,6 +3,7 @@
 
 use crate::{Error, Result, SpanRecord, TraceId};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -33,6 +34,77 @@ pub struct TraceSummary {
     pub session_id: Option<String>,
     /// First non-null `user_id` in span order.
     pub user_id: Option<String>,
+}
+
+impl TraceSummary {
+    /// Merges the summary of another part of the same trace into this one.
+    ///
+    /// Rules, chosen so that `a.merge(b)` and `b.merge(a)` give equal results:
+    ///
+    /// - The trace ids must be equal, else [`Error::InvalidArgument`] and
+    ///   `self` is unchanged.
+    /// - `start_ns` is the minimum and `end_ns` the maximum.
+    /// - `span_count` and the token sums add, saturating.
+    /// - `error` is the logical or.
+    /// - `models` is the sorted distinct union.
+    /// - `root_service` and `root_name` come from the summary that has a root
+    ///   (a `root_name`). If both do, from the one with the earlier
+    ///   `start_ns`; on equal starts, from the one with the smaller
+    ///   `(root_name, root_service)`.
+    /// - `session_id` and `user_id` are the first non-null value, preferring
+    ///   the summary with the earlier `start_ns`; on equal starts the smaller
+    ///   string wins.
+    pub fn merge(&mut self, other: &TraceSummary) -> Result<()> {
+        if self.trace_id != other.trace_id {
+            return Err(Error::invalid_argument(format!(
+                "cannot merge the summary of trace {} into trace {}",
+                other.trace_id, self.trace_id
+            )));
+        }
+        let other_first = match other.start_ns.cmp(&self.start_ns) {
+            Ordering::Less => Some(true),
+            Ordering::Greater => Some(false),
+            Ordering::Equal => None,
+        };
+        // Whether to take the other side's value when both are present;
+        // `tie` decides when the starts are equal.
+        let pick_other = |tie: bool| other_first.unwrap_or(tie);
+
+        match (&self.root_name, &other.root_name) {
+            (None, Some(_)) => {
+                self.root_name = other.root_name.clone();
+                self.root_service = other.root_service.clone();
+            }
+            (Some(_), Some(_)) => {
+                let tie =
+                    (&other.root_name, &other.root_service) < (&self.root_name, &self.root_service);
+                if pick_other(tie) {
+                    self.root_name = other.root_name.clone();
+                    self.root_service = other.root_service.clone();
+                }
+            }
+            _ => {}
+        }
+        let first_non_null = |mine: &mut Option<String>, theirs: &Option<String>| {
+            if let Some(t) = theirs
+                && mine.as_ref().is_none_or(|m| pick_other(t < m))
+            {
+                *mine = Some(t.clone());
+            }
+        };
+        first_non_null(&mut self.session_id, &other.session_id);
+        first_non_null(&mut self.user_id, &other.user_id);
+
+        self.start_ns = self.start_ns.min(other.start_ns);
+        self.end_ns = self.end_ns.max(other.end_ns);
+        self.span_count = self.span_count.saturating_add(other.span_count);
+        self.error |= other.error;
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        let models: BTreeSet<&String> = self.models.iter().chain(&other.models).collect();
+        self.models = models.into_iter().cloned().collect();
+        Ok(())
+    }
 }
 
 /// The Arrow schema of a summary file: one row per [`TraceSummary`], with the
@@ -380,6 +452,121 @@ mod tests {
             (s.trace_id, s.start_ns, s.span_count),
             (TraceId([8; 16]), 100, 1)
         );
+    }
+
+    fn full(id: u8, start: i64, root: Option<(&str, Option<&str>)>) -> TraceSummary {
+        TraceSummary {
+            trace_id: TraceId([id; 16]),
+            start_ns: start,
+            end_ns: start + 10,
+            root_service: root.and_then(|r| r.1).map(str::to_owned),
+            root_name: root.map(|r| r.0.to_owned()),
+            span_count: 2,
+            error: false,
+            input_tokens: 5,
+            output_tokens: 7,
+            models: vec!["m1".into()],
+            session_id: None,
+            user_id: None,
+        }
+    }
+
+    /// Merges in both orders, checks they agree and returns the result.
+    fn merged(a: &TraceSummary, b: &TraceSummary) -> TraceSummary {
+        let mut ab = a.clone();
+        ab.merge(b).unwrap();
+        let mut ba = b.clone();
+        ba.merge(a).unwrap();
+        assert_eq!(ab, ba, "merge must not depend on the order");
+        ab
+    }
+
+    #[test]
+    fn merge_requires_the_same_trace() {
+        let mut a = full(1, 0, None);
+        let before = a.clone();
+        assert!(matches!(
+            a.merge(&full(2, 0, None)),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(a, before);
+    }
+
+    #[test]
+    fn merge_combines_times_counts_tokens_error_and_models() {
+        let mut a = full(1, 100, None);
+        a.end_ns = 500;
+        a.models = vec!["b".into(), "d".into()];
+        let mut b = full(1, 50, None);
+        b.end_ns = 200;
+        b.error = true;
+        b.span_count = 3;
+        b.input_tokens = 1;
+        b.output_tokens = 2;
+        b.models = vec!["a".into(), "b".into()];
+        let m = merged(&a, &b);
+        assert_eq!((m.start_ns, m.end_ns), (50, 500));
+        assert_eq!(m.span_count, 5);
+        assert_eq!((m.input_tokens, m.output_tokens), (6, 9));
+        assert!(m.error);
+        assert_eq!(m.models, ["a", "b", "d"]);
+
+        let mut big = full(1, 0, None);
+        big.span_count = u32::MAX;
+        big.input_tokens = i64::MAX;
+        let m = merged(&big, &full(1, 0, None));
+        assert_eq!((m.span_count, m.input_tokens), (u32::MAX, i64::MAX));
+    }
+
+    #[test]
+    fn merge_takes_the_root_from_the_summary_that_has_one() {
+        let rooted = full(1, 500, Some(("root", Some("svc"))));
+        let rootless = full(1, 10, None);
+        let m = merged(&rooted, &rootless);
+        assert_eq!(m.root_name.as_deref(), Some("root"));
+        assert_eq!(m.root_service.as_deref(), Some("svc"));
+        let m = merged(&rootless, &rootless.clone());
+        assert_eq!((m.root_name, m.root_service), (None, None));
+    }
+
+    #[test]
+    fn merge_with_two_roots_takes_the_earlier_one() {
+        let early = full(1, 10, Some(("early", None)));
+        let late = full(1, 20, Some(("late", Some("svc"))));
+        let m = merged(&early, &late);
+        // The service is the early root's, which has none.
+        assert_eq!(m.root_name.as_deref(), Some("early"));
+        assert_eq!(m.root_service, None);
+
+        // Equal starts: the smaller (name, service) wins in either order.
+        let a = full(1, 10, Some(("a", Some("z"))));
+        let b = full(1, 10, Some(("b", Some("a"))));
+        assert_eq!(merged(&a, &b).root_name.as_deref(), Some("a"));
+        let a2 = full(1, 10, Some(("a", None)));
+        assert_eq!(merged(&a, &a2).root_service, None);
+    }
+
+    #[test]
+    fn merge_session_and_user_prefer_the_earlier_summary() {
+        let mut early = full(1, 10, None);
+        early.session_id = Some("s-early".into());
+        let mut late = full(1, 20, None);
+        late.session_id = Some("s-late".into());
+        late.user_id = Some("u-late".into());
+        let m = merged(&early, &late);
+        // Session from the earlier summary, user from the only one that has it.
+        assert_eq!(m.session_id.as_deref(), Some("s-early"));
+        assert_eq!(m.user_id.as_deref(), Some("u-late"));
+
+        // Equal starts: the smaller string, in either order.
+        let mut a = full(1, 10, None);
+        a.user_id = Some("b".into());
+        let mut b = full(1, 10, None);
+        b.user_id = Some("a".into());
+        assert_eq!(merged(&a, &b).user_id.as_deref(), Some("a"));
+
+        let m = merged(&full(1, 0, None), &full(1, 1, None));
+        assert_eq!((m.session_id, m.user_id), (None, None));
     }
 
     #[test]

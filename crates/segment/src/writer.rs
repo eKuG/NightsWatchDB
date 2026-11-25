@@ -1,6 +1,6 @@
 //! Writing one part.
 
-use crate::index::{self, INDEX_FILE, TraceEntry};
+use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
 use crate::{SPANS_FILE, SUMMARY_FILE};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
@@ -12,16 +12,19 @@ use nwdb_core::{
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Version of the part's file formats, recorded in [`PartMeta`].
-pub const FORMAT_VERSION: u32 = 1;
+/// Version 2 added the length and CRC-32C of both Parquet files to `traces.idx`.
+pub const FORMAT_VERSION: u32 = 2;
 
 const ZSTD_LEVEL: i32 = 3;
 /// Size at which a data page is closed. Parquet's default, stated here
@@ -77,8 +80,12 @@ impl WriterOptions {
     }
 }
 
-pub(crate) fn parquet_props(row_group_rows: usize) -> WriterProperties {
-    WriterProperties::builder()
+/// Writer settings. `spans` selects the span table, whose four raw binary
+/// columns get no statistics (nothing prunes by them) and, except `resource`,
+/// no dictionary: `attrs`, `events` and `links` are close to unique per row,
+/// so a dictionary is wasted work, while `resource` repeats heavily.
+fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
+    let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(ZSTD_LEVEL).expect("level is within zstd's range"),
         ))
@@ -92,8 +99,42 @@ pub(crate) fn parquet_props(row_group_rows: usize) -> WriterProperties {
         .set_data_page_size_limit(DATA_PAGE_BYTES)
         .set_dictionary_page_size_limit(DATA_PAGE_BYTES)
         .set_data_page_row_count_limit(DATA_PAGE_ROWS)
-        .set_write_batch_size(WRITE_BATCH_VALUES)
-        .build()
+        .set_write_batch_size(WRITE_BATCH_VALUES);
+    if spans {
+        for name in ["resource", "attrs", "events", "links"] {
+            builder = builder
+                .set_column_statistics_enabled(ColumnPath::from(name), EnabledStatistics::None);
+        }
+        for name in ["attrs", "events", "links"] {
+            builder = builder.set_column_dictionary_enabled(ColumnPath::from(name), false);
+        }
+        builder = builder.set_column_dictionary_enabled(ColumnPath::from("resource"), true);
+    }
+    builder.build()
+}
+
+/// Length and CRC-32C of everything written to a file so far.
+#[derive(Default)]
+struct Digest {
+    crc: AtomicU32,
+    len: AtomicU64,
+}
+
+impl Digest {
+    // Only the thread that owns the writer updates it, so plain load and
+    // store suffice.
+    fn add(&self, bytes: &[u8]) {
+        let crc = crc32c::crc32c_append(self.crc.load(Ordering::Relaxed), bytes);
+        self.crc.store(crc, Ordering::Relaxed);
+        self.len.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> FileChecksum {
+        FileChecksum {
+            len: self.len.load(Ordering::Relaxed),
+            crc32c: self.crc.load(Ordering::Relaxed),
+        }
+    }
 }
 
 fn pq(e: parquet::errors::ParquetError) -> Error {
@@ -101,15 +142,21 @@ fn pq(e: parquet::errors::ParquetError) -> Error {
 }
 
 /// A file shared between the Parquet writer, which owns it for writing, and
-/// the part writer, which syncs it after the Parquet writer has finished.
-struct SharedFile(Arc<File>);
+/// the part writer, which syncs it after the Parquet writer has finished. It
+/// digests every byte that reaches the file.
+struct SharedFile {
+    file: Arc<File>,
+    digest: Arc<Digest>,
+}
 
 impl Write for SharedFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        (&*self.0).write(buf)
+        let n = (&*self.file).write(buf)?;
+        self.digest.add(&buf[..n]);
+        Ok(n)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        (&*self.0).flush()
+        (&*self.file).flush()
     }
 }
 
@@ -119,11 +166,20 @@ fn new_parquet_writer(
     path: &Path,
     schema: SchemaRef,
     rows: usize,
-) -> Result<(FileWriter, Arc<File>)> {
+    spans: bool,
+) -> Result<(FileWriter, Arc<File>, Arc<Digest>)> {
     let file = Arc::new(File::create_new(path)?);
-    let sink = BufWriter::with_capacity(IO_BUFFER, SharedFile(file.clone()));
-    let writer = ArrowWriter::try_new(sink, schema, Some(parquet_props(rows))).map_err(pq)?;
-    Ok((writer, file))
+    let digest = Arc::new(Digest::default());
+    let sink = BufWriter::with_capacity(
+        IO_BUFFER,
+        SharedFile {
+            file: file.clone(),
+            digest: digest.clone(),
+        },
+    );
+    let writer =
+        ArrowWriter::try_new(sink, schema, Some(parquet_props(rows, spans))).map_err(pq)?;
+    Ok((writer, file, digest))
 }
 
 fn group_is_full(options: &WriterOptions, rows: usize, bytes: u64) -> bool {
@@ -157,6 +213,7 @@ pub struct PartWriter {
 
     spans: Option<FileWriter>,
     spans_file: Arc<File>,
+    spans_digest: Arc<Digest>,
     /// Rows and value bytes in the span row group being filled.
     group_rows: usize,
     group_bytes: u64,
@@ -183,7 +240,15 @@ impl PartWriter {
     /// `parts_dir` if it does not exist.
     ///
     /// Fails with [`Error::InvalidArgument`] if the final or the temporary
-    /// directory already exists, or if `options` has a zero bound.
+    /// directory already exists, if `window_ns` is not positive, or if
+    /// `options` has a zero bound.
+    ///
+    /// After any error from [`write`](Self::write) or
+    /// [`finish`](Self::finish) other than [`Error::Fatal`], the writer is
+    /// gone or unusable and nothing is left behind; the caller must still
+    /// use a new part id for the next attempt. After [`Error::Fatal`] the
+    /// part may or may not exist and be durable: do not reuse the id and
+    /// restart.
     pub fn create(
         parts_dir: impl AsRef<Path>,
         part_id: u64,
@@ -192,6 +257,11 @@ impl PartWriter {
         options: WriterOptions,
     ) -> Result<Self> {
         options.validate()?;
+        if window_ns <= 0 {
+            return Err(Error::invalid_argument(format!(
+                "window_ns must be positive, got {window_ns}"
+            )));
+        }
         let parts_dir = parts_dir.as_ref();
         let name = part_dir_name(part_id);
         let final_dir = parts_dir.join(&name);
@@ -204,13 +274,14 @@ impl PartWriter {
                 )));
             }
         }
-        fs::create_dir_all(parts_dir)?;
+        create_dir_all_synced(parts_dir)?;
         fs::create_dir(&tmp_dir)?;
 
-        let (spans, spans_file) = match new_parquet_writer(
+        let (spans, spans_file, spans_digest) = match new_parquet_writer(
             &tmp_dir.join(SPANS_FILE),
             span_schema(),
             options.row_group_rows,
+            true,
         ) {
             Ok(w) => w,
             Err(e) => {
@@ -227,6 +298,7 @@ impl PartWriter {
             options,
             spans: Some(spans),
             spans_file,
+            spans_digest,
             group_rows: 0,
             group_bytes: 0,
             rows: 0,
@@ -390,11 +462,15 @@ impl PartWriter {
         Ok(())
     }
 
-    /// Writes the index and the summary, makes the part durable and moves it
+    /// Writes the summary and the index, makes the part durable and moves it
     /// to its final directory.
     ///
-    /// Fails with [`Error::InvalidArgument`] if no rows were written; nothing
-    /// is left behind in that case or on any other failure.
+    /// Fails with [`Error::InvalidArgument`] if no rows were written. On any
+    /// failure before the directory is renamed, nothing is left behind, but
+    /// the caller must use a new part id for the next attempt. If a step
+    /// after the rename fails (syncing the parts directory), the part may or
+    /// may not be durable and the result is [`Error::Fatal`]: the caller must
+    /// not reuse the id and should restart.
     pub fn finish(mut self) -> Result<PartMeta> {
         self.check_usable()?;
         self.end_current_trace();
@@ -408,12 +484,27 @@ impl PartWriter {
         spans.close().map_err(pq)?;
         self.spans_file.sync_all()?;
 
+        let spans_sum = self.spans_digest.get();
+        let summary_sum = self.write_summary()?;
+        for (name, sum) in [(SPANS_FILE, spans_sum), (SUMMARY_FILE, summary_sum)] {
+            let on_disk = fs::metadata(self.tmp_dir.join(name))?.len();
+            if on_disk != sum.len {
+                return Err(Error::other(format!(
+                    "{name} has {on_disk} bytes on disk but {} were written",
+                    sum.len
+                )));
+            }
+        }
+
         self.entries.sort_by_key(|e| e.trace_id);
+        let checksums = FileChecksums {
+            spans: spans_sum,
+            summary: summary_sum,
+        };
         write_synced(
             &self.tmp_dir.join(INDEX_FILE),
-            &index::encode(&self.entries),
+            &index::encode(&self.entries, checksums),
         )?;
-        self.write_summary()?;
 
         let mut files = BTreeMap::new();
         for name in [SPANS_FILE, INDEX_FILE, SUMMARY_FILE] {
@@ -425,7 +516,16 @@ impl PartWriter {
         sync_dir(&self.tmp_dir)?;
         fs::rename(&self.tmp_dir, &self.final_dir)?;
         self.committed = true;
-        sync_dir(self.final_dir.parent().expect("part dir has a parent"))?;
+        // The rename has happened: from here on the part may exist, so a
+        // failure must not look like one that left nothing behind.
+        sync_after_rename(parent_of(&self.final_dir)).map_err(|e| {
+            Error::fatal(format!(
+                "part {} was renamed into place but syncing {} failed ({e}); it may or may not \
+                 be durable: do not reuse the part id and restart",
+                self.part_id,
+                parent_of(&self.final_dir).display()
+            ))
+        })?;
 
         Ok(PartMeta {
             part_id: self.part_id,
@@ -454,12 +554,14 @@ impl PartWriter {
         })
     }
 
-    fn write_summary(&mut self) -> Result<()> {
+    /// Writes `summary.parquet` and returns its length and checksum.
+    fn write_summary(&mut self) -> Result<FileChecksum> {
         self.summaries.sort_by_key(|s| (s.start_ns, s.trace_id));
-        let (mut writer, file) = new_parquet_writer(
+        let (mut writer, file, digest) = new_parquet_writer(
             &self.tmp_dir.join(SUMMARY_FILE),
             summary_schema(),
             self.options.summary_row_group_rows,
+            false,
         )?;
         let mut builder = SummaryBatchBuilder::new();
         for summary in &self.summaries {
@@ -473,7 +575,7 @@ impl PartWriter {
         }
         writer.close().map_err(pq)?;
         file.sync_all()?;
-        Ok(())
+        Ok(digest.get())
     }
 }
 
@@ -495,6 +597,47 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next [`sync_after_rename`] on this thread fail.
+    static FAIL_SYNC_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn sync_after_rename(dir: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_SYNC_AFTER_RENAME.with(|f| f.replace(false)) {
+        return Err(std::io::Error::other("injected failure").into());
+    }
+    sync_dir(dir)
+}
+
+/// The directory that holds `path`; `.` for a bare relative name.
+fn parent_of(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Creates `dir` and any missing parents, and syncs the parent of every
+/// directory it created: a new directory is not durable until its parent has
+/// been synced.
+fn create_dir_all_synced(dir: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut p = dir;
+    while !p.as_os_str().is_empty() && !p.exists() {
+        missing.push(p);
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(dir)?;
+    for created in missing {
+        sync_dir(parent_of(created))?;
+    }
     Ok(())
 }
 
@@ -521,6 +664,36 @@ fn row_value_bytes(batch: &RecordBatch) -> Vec<u64> {
 mod tests {
     use super::*;
     use nwdb_core::{BatchLimits, SpanBatchBuilder, SpanId, SpanRecord};
+
+    #[test]
+    fn a_failure_after_the_rename_is_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = PartWriter::create(tmp.path(), 5, 0, 1_000, WriterOptions::default()).unwrap();
+        let mut b = SpanBatchBuilder::new(BatchLimits::DEFAULT);
+        b.append(&SpanRecord {
+            trace_id: TraceId([1; 16]),
+            span_id: SpanId([1; 8]),
+            name: "n",
+            ..SpanRecord::default()
+        });
+        w.write(&b.finish()).unwrap();
+        FAIL_SYNC_AFTER_RENAME.with(|f| f.set(true));
+        let err = w.finish().unwrap_err();
+        assert!(
+            matches!(&err, Error::Fatal(m) if m.contains("do not reuse")),
+            "{err}"
+        );
+        // The part is in place (it may be durable), and its id is taken.
+        let dir = tmp.path().join(part_dir_name(5));
+        assert!(dir.is_dir());
+        assert!(
+            !tmp.path()
+                .join(format!("{}.tmp", part_dir_name(5)))
+                .exists()
+        );
+        let again = PartWriter::create(tmp.path(), 5, 0, 1_000, WriterOptions::default());
+        assert!(matches!(again.err(), Some(Error::InvalidArgument(_))));
+    }
 
     #[test]
     fn value_bytes_match_the_core_measure() {

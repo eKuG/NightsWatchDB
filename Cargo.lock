@@ -459,6 +459,7 @@ version = "0.0.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "bytes",
  "crc32c",
  "nwdb-core",
  "parquet",

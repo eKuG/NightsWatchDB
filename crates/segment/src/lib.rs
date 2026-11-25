@@ -18,7 +18,7 @@ mod index;
 mod reader;
 mod writer;
 
-pub use index::{INDEX_FILE, TraceEntry};
+pub use index::{FileChecksum, INDEX_FILE, TraceEntry};
 pub use reader::{PartReader, Scan, ScanOptions};
 pub use writer::{FORMAT_VERSION, PartWriter, WriterOptions};
 

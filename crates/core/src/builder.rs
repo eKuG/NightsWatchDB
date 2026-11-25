@@ -6,16 +6,19 @@ use arrow_array::builder::{
 use arrow_array::{ArrayRef, RecordBatch};
 use std::sync::Arc;
 
-// Pre-sizing. Row-count capacity is capped so a huge `max_rows` does not
-// reserve memory for rows that may never come. Short string columns reserve
-// 32 bytes a row. The four raw columns reserve 1 MiB of data up front: large
-// enough that typical rows do not grow the buffer at all, small enough that
-// an idle builder costs only a few MiB. Beyond that, Arrow's buffers grow
-// geometrically, so a 1 MiB value costs a handful of reallocations, not one
-// per value.
-const MAX_PRESIZED_ROWS: usize = 8_192;
-const SHORT_STRING_BYTES: usize = 32;
-const RAW_COLUMN_BYTES: usize = 1 << 20;
+// Pre-sizing. An idle builder reserves a few tens of KiB in total (it is not
+// counted in `value_bytes`): room for `PRESIZED_ROWS` rows of fixed-width
+// values and offsets, a few bytes per short string and 64 bytes of `attrs` per
+// row. Arrow's buffers then grow geometrically, so a large value costs a
+// handful of reallocations, not one per value.
+const PRESIZED_ROWS: usize = 64;
+const SHORT_STRING_BYTES: usize = 8;
+const ATTRS_BYTES_PER_ROW: usize = 64;
+
+/// Largest number of bytes one `Utf8` column may hold before the builder
+/// reports itself full. Arrow's `Utf8` offsets are 32 bit, so a column cannot
+/// hold 2 GiB; stopping at 1 GiB leaves room for one more value of up to 1 GiB.
+const STRING_COLUMN_LIMIT: usize = 1 << 30;
 
 /// Accumulates [`SpanRecord`]s into an Arrow batch with the span schema.
 ///
@@ -24,10 +27,19 @@ const RAW_COLUMN_BYTES: usize = 1 << 20;
 /// [`is_full`](Self::is_full) after appending and calls
 /// [`finish`](Self::finish). A single row larger than `max_bytes` therefore
 /// ends up alone in a batch rather than being rejected.
+///
+/// The builder is also full once any single string column holds 1 GiB, because
+/// Arrow's `Utf8` offsets are 32 bit. Callers must check `is_full` after every
+/// append: a string column of 2 GiB or more cannot be represented and
+/// `append` would panic on it. The check prevents that as long as no single
+/// string value is longer than 1 GiB, so callers must reject longer ones.
 pub struct SpanBatchBuilder {
     limits: BatchLimits,
     rows: usize,
     value_bytes: usize,
+    /// Bytes held by the fullest string column.
+    max_string_column: usize,
+    string_column_limit: usize,
 
     trace_id: FixedSizeBinaryBuilder,
     span_id: FixedSizeBinaryBuilder,
@@ -64,8 +76,9 @@ pub struct SpanBatchBuilder {
     dropped_links_count: UInt32Builder,
 }
 
-fn put_str(b: &mut StringBuilder, v: Option<&str>) -> usize {
+fn put_str(b: &mut StringBuilder, v: Option<&str>, fullest: &mut usize) -> usize {
     b.append_option(v);
+    *fullest = (*fullest).max(b.values_slice().len());
     v.map_or(0, str::len)
 }
 
@@ -77,13 +90,15 @@ fn put_bytes(b: &mut LargeBinaryBuilder, v: Option<&[u8]>) -> usize {
 impl SpanBatchBuilder {
     /// Creates an empty builder with the given limits.
     pub fn new(limits: BatchLimits) -> Self {
-        let n = limits.max_rows.min(MAX_PRESIZED_ROWS);
+        let n = limits.max_rows.min(PRESIZED_ROWS);
         let short = || StringBuilder::with_capacity(n, n * SHORT_STRING_BYTES);
-        let raw = || LargeBinaryBuilder::with_capacity(n, RAW_COLUMN_BYTES);
+        let raw = |bytes_per_row: usize| LargeBinaryBuilder::with_capacity(n, n * bytes_per_row);
         Self {
             limits,
             rows: 0,
             value_bytes: 0,
+            max_string_column: 0,
+            string_column_limit: STRING_COLUMN_LIMIT,
             trace_id: FixedSizeBinaryBuilder::with_capacity(n, 16),
             span_id: FixedSizeBinaryBuilder::with_capacity(n, 8),
             parent_span_id: FixedSizeBinaryBuilder::with_capacity(n, 8),
@@ -110,10 +125,10 @@ impl SpanBatchBuilder {
             agent_name: short(),
             tool_name: short(),
             error_type: short(),
-            resource: raw(),
-            attrs: raw(),
-            events: raw(),
-            links: raw(),
+            resource: raw(0),
+            attrs: raw(ATTRS_BYTES_PER_ROW),
+            events: raw(0),
+            links: raw(0),
             dropped_attributes_count: UInt32Builder::with_capacity(n),
             dropped_events_count: UInt32Builder::with_capacity(n),
             dropped_links_count: UInt32Builder::with_capacity(n),
@@ -131,6 +146,7 @@ impl SpanBatchBuilder {
             None => self.parent_span_id.append_null(),
         }
         self.name.append_value(r.name);
+        let mut fullest = self.max_string_column.max(self.name.values_slice().len());
         self.kind.append_value(r.kind);
         self.start_ns.append_value(r.start_ns);
         self.end_ns.append_value(r.end_ns);
@@ -146,27 +162,28 @@ impl SpanBatchBuilder {
         self.dropped_links_count.append_value(r.dropped_links_count);
 
         let mut bytes = r.name.len() + r.attrs.len();
-        bytes += put_str(&mut self.status_message, r.status_message);
-        bytes += put_str(&mut self.trace_state, r.trace_state);
-        bytes += put_str(&mut self.service_name, r.service_name);
-        bytes += put_str(&mut self.scope_name, r.scope_name);
-        bytes += put_str(&mut self.scope_version, r.scope_version);
-        bytes += put_str(&mut self.operation, r.operation);
-        bytes += put_str(&mut self.provider, r.provider);
-        bytes += put_str(&mut self.request_model, r.request_model);
-        bytes += put_str(&mut self.response_model, r.response_model);
-        bytes += put_str(&mut self.conversation_id, r.conversation_id);
-        bytes += put_str(&mut self.session_id, r.session_id);
-        bytes += put_str(&mut self.user_id, r.user_id);
-        bytes += put_str(&mut self.agent_name, r.agent_name);
-        bytes += put_str(&mut self.tool_name, r.tool_name);
-        bytes += put_str(&mut self.error_type, r.error_type);
+        bytes += put_str(&mut self.status_message, r.status_message, &mut fullest);
+        bytes += put_str(&mut self.trace_state, r.trace_state, &mut fullest);
+        bytes += put_str(&mut self.service_name, r.service_name, &mut fullest);
+        bytes += put_str(&mut self.scope_name, r.scope_name, &mut fullest);
+        bytes += put_str(&mut self.scope_version, r.scope_version, &mut fullest);
+        bytes += put_str(&mut self.operation, r.operation, &mut fullest);
+        bytes += put_str(&mut self.provider, r.provider, &mut fullest);
+        bytes += put_str(&mut self.request_model, r.request_model, &mut fullest);
+        bytes += put_str(&mut self.response_model, r.response_model, &mut fullest);
+        bytes += put_str(&mut self.conversation_id, r.conversation_id, &mut fullest);
+        bytes += put_str(&mut self.session_id, r.session_id, &mut fullest);
+        bytes += put_str(&mut self.user_id, r.user_id, &mut fullest);
+        bytes += put_str(&mut self.agent_name, r.agent_name, &mut fullest);
+        bytes += put_str(&mut self.tool_name, r.tool_name, &mut fullest);
+        bytes += put_str(&mut self.error_type, r.error_type, &mut fullest);
         bytes += put_bytes(&mut self.resource, r.resource);
         bytes += put_bytes(&mut self.events, r.events);
         bytes += put_bytes(&mut self.links, r.links);
 
         self.rows += 1;
         self.value_bytes += bytes;
+        self.max_string_column = fullest;
     }
 
     /// Number of rows appended since the last [`finish`](Self::finish).
@@ -186,9 +203,13 @@ impl SpanBatchBuilder {
         self.rows == 0
     }
 
-    /// True once the row bound or the byte bound has been reached.
+    /// True once the row bound or the byte bound has been reached, or any
+    /// single string column holds 1 GiB. Callers must check this after every
+    /// append and [`finish`](Self::finish) when it is true.
     pub fn is_full(&self) -> bool {
-        self.rows >= self.limits.max_rows || self.value_bytes >= self.limits.max_bytes
+        self.rows >= self.limits.max_rows
+            || self.value_bytes >= self.limits.max_bytes
+            || self.max_string_column >= self.string_column_limit
     }
 
     /// Returns the rows appended so far as a batch with the span schema and
@@ -197,6 +218,7 @@ impl SpanBatchBuilder {
     pub fn finish(&mut self) -> RecordBatch {
         self.rows = 0;
         self.value_bytes = 0;
+        self.max_string_column = 0;
         let columns: Vec<ArrayRef> = vec![
             Arc::new(self.trace_id.finish()),
             Arc::new(self.span_id.finish()),
@@ -280,6 +302,38 @@ mod tests {
         assert_eq!(b.value_bytes(), 120);
         assert!(b.is_full());
         assert_eq!(b.rows(), 2);
+    }
+
+    #[test]
+    fn full_when_one_string_column_reaches_its_limit() {
+        let mut b = SpanBatchBuilder::new(BatchLimits {
+            max_rows: 1_000,
+            max_bytes: usize::MAX,
+        });
+        b.string_column_limit = 100;
+        let r = SpanRecord {
+            name: "0123456789",
+            // Spread over several columns: the total passes 100 but no
+            // single column does, so the builder is not full.
+            session_id: Some("abcdefghij"),
+            user_id: Some("abcdefghij"),
+            ..SpanRecord::default()
+        };
+        for _ in 0..9 {
+            b.append(&r);
+        }
+        assert!(b.value_bytes() > 100 && !b.is_full());
+        b.append(&r);
+        assert!(b.is_full());
+        b.finish();
+        assert!(!b.is_full());
+    }
+
+    #[test]
+    fn idle_builder_reserves_little() {
+        let mut b = SpanBatchBuilder::new(BatchLimits::DEFAULT);
+        let reserved = b.finish().get_array_memory_size();
+        assert!(reserved < 64 * 1024, "{reserved} bytes reserved");
     }
 
     #[test]
