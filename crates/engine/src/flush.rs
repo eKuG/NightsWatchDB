@@ -199,7 +199,11 @@ impl Inner {
                 let mut builder = SpanBatchBuilder::new(self.opts.batch_limits);
                 for t in &grouped.traces[range.clone()] {
                     for e in &grouped.entries[t.from..t.to] {
-                        builder.append(&cols[e.batch as usize].record(e.row as usize));
+                        builder.append_from(
+                            &cols[e.batch as usize],
+                            e.batch as usize,
+                            e.row as usize,
+                        );
                         if builder.is_full() {
                             writer.write(&builder.finish())?;
                         }

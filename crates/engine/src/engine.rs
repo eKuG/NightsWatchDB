@@ -178,6 +178,9 @@ pub struct EngineStats {
     pub flushes: u64,
     /// True while a flush is writing parts or committing.
     pub flushing: bool,
+    /// True once the engine has met a fatal error: it accepts and flushes
+    /// nothing more, and only a restart recovers it.
+    pub fatal: bool,
     /// The most recent error from a flush, the log or trimming, if any.
     pub last_error: Option<String>,
 }
@@ -701,6 +704,7 @@ impl Engine {
             parts: c.vis.parts.len(),
             flushes: c.flushes,
             flushing: c.flushing,
+            fatal: c.fatal.is_some(),
             last_error: c.last_error.clone(),
         }
     }
