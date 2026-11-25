@@ -113,6 +113,25 @@ The span table also gained the instrumentation scope's attributes and the
 resource and scope schema URLs, so nothing a sender puts in an OTLP request is
 dropped.
 
+A second independent review, of the fixes themselves, ran after the tag and
+found three more defects. They are fixed in the commits that follow
+`checkpoint-02`:
+
+- The statement above, that a refused start leaves the directory unchanged,
+  was not true for one kind of refusal: a log record that does not decode.
+  By the time replay reached it, start-up had already written parts and
+  committed manifest versions. Start-up now reads and checks every log record
+  before its first change. No acknowledged data was at risk.
+- A stray part directory with an id a little below the limit could still use
+  up the id space. Ids far above anything the database has handed out no
+  longer count.
+- Token totals could depend on flush timing when a sender reported negative
+  token counts. A negative number is no longer treated as a count.
+
+Four tests that could pass for the wrong reason were tightened; the
+crash-injection tests now require proof that the process died at the named
+stage.
+
 Known limits at this checkpoint:
 
 - Killing a process does not drop the operating system's page cache, so the
