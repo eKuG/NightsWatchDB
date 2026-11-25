@@ -567,16 +567,33 @@ async fn a_connection_has_at_most_64_streams_open() {
     let mut c2 = c.clone();
     let m2 = m.clone();
     let mut extra = tokio::spawn(async move { export(&mut c2, None, vec![m2]).await });
-    let waited = tokio::time::timeout(Duration::from_millis(700), &mut extra).await;
-    assert!(waited.is_err(), "the 65th stream was served at once");
+    // The client library normally holds a 65th call back once it has seen the
+    // server's limit; if it sends it anyway, the server refuses the stream.
+    // Either is right. What must not happen is that the call is served while
+    // 64 streams are open.
+    let held_back = match tokio::time::timeout(Duration::from_millis(700), &mut extra).await {
+        Err(_) => true,
+        Ok(Ok(r)) => panic!("the 65th stream was served at once: {}", r.code),
+        // The export helper panics on a stream the server reset.
+        Ok(Err(refused)) => {
+            assert!(refused.is_panic(), "{refused}");
+            false
+        }
+    };
     // Ending the others frees streams.
     for call in &mut open {
         call.end();
     }
-    let r = tokio::time::timeout(Duration::from_secs(20), extra)
-        .await
-        .expect("the waiting stream was never served")
-        .unwrap();
+    let r = if held_back {
+        tokio::time::timeout(Duration::from_secs(20), extra)
+            .await
+            .expect("the waiting stream was never served")
+            .unwrap()
+    } else {
+        tokio::time::timeout(Duration::from_secs(20), export(&mut c, None, vec![m]))
+            .await
+            .expect("no stream was served after the others ended")
+    };
     assert_eq!(r.code, OK, "{}", r.message);
     server.shutdown().await.unwrap();
 }

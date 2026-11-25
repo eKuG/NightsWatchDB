@@ -624,6 +624,7 @@ async fn list_and_token_endpoints_with_filters() {
         "flushing",
         "last_error",
         "payload_logical_bytes",
+        "payload_unique_bytes",
         "payload_stored_bytes",
     ] {
         assert!(stats.get(k).is_some(), "stats lacks {k}");
@@ -1299,10 +1300,14 @@ async fn a_growing_conversation_is_stored_once_and_reads_back_identical() {
     server.engine().flush().unwrap();
     let stats = http(api, "/api/v1/stats").await.json();
     let logical = stats["payload_logical_bytes"].as_u64().unwrap();
+    let unique = stats["payload_unique_bytes"].as_u64().unwrap();
     let stored = stats["payload_stored_bytes"].as_u64().unwrap();
-    eprintln!("payload logical {logical} stored {stored}");
+    eprintln!("payload logical {logical} unique {unique} stored {stored}");
     assert!(logical > 1_000_000, "{logical}");
-    assert!(stored > 0 && stored * 10 < logical, "{stored} of {logical}");
+    // The distinct text, before compression, is what proves that repeats are
+    // shared: compression alone could make the stored size small.
+    assert!(unique > 0 && unique * 3 < logical, "{unique} of {logical}");
+    assert!(stored > 0 && stored <= unique, "{stored} of {unique}");
     let after = http(api, &path).await;
     assert_eq!(
         after.body, before.body,

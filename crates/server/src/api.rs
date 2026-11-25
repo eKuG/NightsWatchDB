@@ -411,6 +411,7 @@ async fn stats(State(api): State<Api>) -> Response {
             "fatal": s.fatal,
             "last_error": s.last_error,
             "payload_logical_bytes": s.payload_logical_bytes,
+            "payload_unique_bytes": s.payload_unique_bytes,
             "payload_stored_bytes": s.payload_stored_bytes,
         }),
     )

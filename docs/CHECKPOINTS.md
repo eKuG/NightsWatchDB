@@ -5,7 +5,7 @@ its tests pass in a Linux container, it has been through an independent
 review, and it is committed, tagged `checkpoint-NN` and pushed.
 
 ```
-Progress  [████░░░░░░░░░░░░]  4 of 16 checkpoints
+Progress  [█████░░░░░░░░░░░]  5 of 16 checkpoints
 ```
 
 | # | Checkpoint | State |
@@ -14,8 +14,8 @@ Progress  [████░░░░░░░░░░░░]  4 of 16 checkpoint
 | 1 | Storage core as libraries: shared types, write-ahead log, span parts (segment files, trace index, summary), manifest | done |
 | 2 | Engine: memory buffer, flush, recovery from the log, snapshot reads; open a trace, list traces, aggregate | done |
 | 3 | Server: OTLP door for traces, HTTP query API, container image, end-to-end test with the generator | done |
-| 4 | Large text out of line, each distinct piece stored once | next |
-| 5 | Text index over distinct pieces; search | |
+| 4 | Large text out of line, each distinct piece stored once | done |
+| 5 | Text index over distinct pieces; search | index library built and reviewed; search not wired in yet |
 | 6 | Compaction, retention, late spans | |
 | 7 | Scores and annotations | |
 | 8 | Logs | |
@@ -215,3 +215,74 @@ Known limits at this checkpoint:
 - A log file stays on disk until it reaches its size limit even when
   everything in it has been flushed.
 - A whole trace is held in memory by the engine while it is read.
+
+## Checkpoint 4: large text stored once
+
+In agent traces every model call sends the system prompt, the tool
+definitions and the conversation so far again. A part now stores each distinct
+piece of that text once.
+
+- When a part is written, large text is cut out of the bytes of a span's
+  attributes, events and links exactly as the sender sent them: any long
+  value, every value under a known content attribute, and each message of a
+  JSON array of messages separately. The span row keeps the small bytes and
+  references to the pieces.
+- Nothing is re-encoded. A value is read by putting its bytes and pieces back
+  together, so it is the sender's bytes by construction, and each rebuilt
+  value is checked against a checksum taken when it was written.
+- Two pieces share storage only if their bytes are equal. A hash finds the
+  candidates and the bytes are then compared, because a hash alone would let
+  one sender's text stand in for another's.
+- Listing traces and summing tokens never open the text files.
+- The part format is version 5. Parts written by earlier development versions
+  are refused with a message that says so.
+
+Measured in the tests (small data, debug builds; not a benchmark):
+
+| Data | Text as sent | Stored | |
+|---|---|---|---|
+| Agent conversations, 3 traces of 30 calls | 14.4 MB | 0.54 MB | 27 times smaller |
+| A growing conversation through the server | 2.08 MB | 0.10 MB | 21 times smaller |
+| Text with no repetition | 1.35 MB | | the part is 1.4% larger than without the store |
+
+Sharing is within one part. Parts are only merged by compaction, which is
+checkpoint 6, so until then the same system prompt is stored once per flush
+rather than once per time window, and the storage numbers of the experiment
+are not reached yet.
+
+An independent review found no input for which a value read back differs from
+what was written. It did find five defects in bounds and in the handling of
+damaged files, each proven with a failing test and fixed:
+
+- Two parts whose text files had equal lengths could have them swapped, and a
+  part would then return the other part's text without an error. The text
+  files are now bound to their part by checksum when the part is opened.
+- One flipped bit in a span row could make a read return a piece belonging to
+  another span. Every rebuilt value now carries a checksum.
+- Reading one 4 KB span could decompress a thousand blocks; a crafted row
+  could ask for a terabyte and abort the process. Blocks are now read once
+  per batch, and sizes are checked before anything is allocated.
+- Memory grew with the number of pieces, and a sender could choose to send
+  millions of tiny ones. There is now a smallest piece, a largest number of
+  pieces per part, and compact tables: an open part holds about one byte per
+  piece instead of twelve.
+
+Two things found outside the review, by running the benchmark harness on ten
+million spans:
+
+- Listing the newest traces took 6.4 seconds. It read every trace summary in
+  the range and asked every part about every trace. It now reads newest first
+  and stops when the answer cannot change, and it keeps a map of the traces
+  that are spread over more than one part. The tests count the work done per
+  query, and were checked to fail when the stopping rule is deliberately
+  broken.
+- The harness itself needed half an hour to page through the traces, for the
+  same reason.
+
+Known limits at this checkpoint:
+
+- The fixes of this checkpoint have not yet had a second independent review.
+- A value shorter than 8 bytes is never stored as a piece, and text beyond
+  16.7 million pieces in one part is stored in the row.
+- Verifying a part rebuilds every value in it.
+- No measured benchmark results are in the repository yet.

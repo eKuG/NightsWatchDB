@@ -271,12 +271,13 @@ curl http://127.0.0.1:4320/healthz
 
 **`GET /api/v1/stats`** returns the engine counters: `records_ingested`,
 `bytes_ingested`, `acked_lsn`, `flushed_lsn`, `buffered_bytes`, `parts`,
-`flushes`, `flushing`, `fatal`, `last_error`, `payload_logical_bytes` and
-`payload_stored_bytes`. The last two are for the flushed parts: the large text
-(prompts, completions, tool definitions and results, and other long values)
-their spans hold, counting every use, and what it takes on disk once each
-distinct piece is stored once per part and compressed. In agent traces the
-second is a small fraction of the first. A trace reads back exactly as it was
+`flushes`, `flushing`, `fatal`, `last_error`, `payload_logical_bytes`,
+`payload_unique_bytes` and `payload_stored_bytes`. The last three are for the
+flushed parts: the large text (prompts, completions, tool definitions and
+results, and other long values) their spans hold, counting every use; the same
+text with each distinct piece counted once per part; and what that takes on
+disk after compression. In agent traces the second is a small fraction of the
+first. A trace reads back exactly as it was
 sent either way.
 
 ```sh
