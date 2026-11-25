@@ -74,6 +74,25 @@ caveats are in [docs/benchmarks](docs/benchmarks/README.md).
 | `docs/CHECKPOINTS.md` | The build plan and current state |
 | `docs/benchmarks/` | Measured results |
 
+## What the server measures today
+
+At checkpoint 4, on a laptop in Docker with 2 CPUs and 4 GB. Method, caveats
+and every number: [docs/benchmarks](docs/benchmarks/README.md).
+
+| | NightsWatchDB server | ClickHouse baseline (earlier run) |
+|---|---|---|
+| 8 GB of agent-trace text, stored | 62 MB | 496 MB |
+| ... list traces with a filter, median | about 1 ms | 586 ms |
+| 10M spans without text, stored | 560 MB | 469 MB |
+| ... open a trace, median | 0.9 ms | 11.5 ms |
+| ... list the newest 50 traces, median | 0.8 ms | 4.9 ms |
+| ... token totals over the whole range, median | 379 ms | 272 ms |
+
+It is ahead where the design is built and behind where it is not: span-only
+data is stored in many small parts until compaction exists, and long-range
+aggregates read them one by one. The baseline used the exporter's schema as
+shipped and was not measured in the same run.
+
 ## Running it
 
 ```sh

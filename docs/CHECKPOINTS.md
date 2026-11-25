@@ -245,10 +245,17 @@ Measured in the tests (small data, debug builds; not a benchmark):
 | A growing conversation through the server | 2.08 MB | 0.10 MB | 21 times smaller |
 | Text with no repetition | 1.35 MB | | the part is 1.4% larger than without the store |
 
+Measured with the benchmark harness on the reference datasets (2 CPUs, 4 GB;
+full results in [benchmarks](benchmarks/README.md)): 8.0 GB of agent-trace
+text is stored in 62.1 MB, 129 times smaller, which is what the experiment
+predicted and about an eighth of what the ClickHouse baseline needed for the
+same data. Ten million spans without text take 560 MB, which is worse than
+the experiment and worse than the baseline.
+
 Sharing is within one part. Parts are only merged by compaction, which is
-checkpoint 6, so until then the same system prompt is stored once per flush
-rather than once per time window, and the storage numbers of the experiment
-are not reached yet.
+checkpoint 6, so the same system prompt is stored once per flush rather than
+once per time window. On the text-heavy dataset that already reaches the
+experiment's size; on span-only data the many small parts cost space.
 
 An independent review found no input for which a value read back differs from
 what was written. It did find five defects in bounds and in the handling of
@@ -285,4 +292,5 @@ Known limits at this checkpoint:
 - A value shorter than 8 bytes is never stored as a piece, and text beyond
   16.7 million pieces in one part is stored in the row.
 - Verifying a part rebuilds every value in it.
-- No measured benchmark results are in the repository yet.
+- Span-only data takes more space than the baseline, and token totals over
+  a long range are slower than the baseline, until parts are compacted.

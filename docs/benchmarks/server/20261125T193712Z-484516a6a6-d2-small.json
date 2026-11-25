@@ -1,0 +1,37 @@
+{
+  "commit": "484516a6a6",
+  "dirty": false,
+  "date": "2026-11-25T21:40:13Z",
+  "dataset": {"name": "d2", "generator_flags": "--no-content --spans 10000000 --seed 1", "crash_batch_flags": "--no-content --traces 100 --seed 2", "compression": "gzip", "spans": 10000039, "traces": 545063, "encoded_bytes": 3622025986},
+  "profile": {"name": "small", "cpus": 2, "memory": "4g"},
+  "environment": {
+    "host_cpu": "Apple M4 Pro", "host_cores": 14,
+    "docker_version": "29.9.3", "docker_platform": "linux/aarch64", "docker_kernel": "7.0.14-linuxkit",
+    "docker_vm_cpus": 14, "docker_vm_memory_bytes": 16787087360
+  },
+  "images": {"server": "sha256:5fee5b5a9c291b1c07ebd4d3e23ce68302bc3cbdf9dd9516fb3d4ee9d86a1ab9", "tracegen": "sha256:c8595137c66e1bdd062c7d1ec9d476fdaa396422a029195eb18596adc90415b7", "querybench": "sha256:fed718faa7cc117ea5620626a51a3d6d713b8d13afe633e2158a318e20659c7d"},
+  "measured_with": "cgroup",
+  "ingest": {
+    "spans": 10000039, "encoded_bytes": 3622025986, "wire_bytes": 473701162, "wall_s": 249.131,
+    "spans_per_s": 40140, "encoded_mb_per_s": 14.5, "wire_mb_per_s": 1.9,
+    "server_cpu_s": 36.86, "server_cpu_user_s": 30.82, "server_cpu_sys_s": 6.04,
+    "server_cpu_s_per_million_spans": 3.69, "server_peak_memory_bytes": 1278369792
+  },
+  "storage": {
+    "parts_bytes": 559644324, "wal_bytes": 133743726, "manifest_bytes": 453113, "total_bytes": 693845259,
+    "parts": 125, "bytes_per_span": 69.4, "parts_bytes_per_span": 56.0
+  },
+  "restart": {"clean_ms": 137.7, "crash_ms": 190.3, "crash_batch_spans": 2464, "server_peak_memory_after_restarts_bytes": 71798784},
+  "queries": {"config":{"addr":"nwdb-bench-59697-server:4320","from_ns":1767225600000000000,"to_ns":1767315600000000000,"hour_start_ns":1767268800000000000,"n":200,"warmup":20,"seed":1,"concurrency":1,"service":"docs-qa","model":"gpt-4o"},
+"discovered_traces":545163,"discovery_ms":1877535.7,"server_span_count":10002503,"token_rows_truncated":false,
+"kinds":[
+{"kind":"open_trace","count":200,"errors":0,"p50_ms":2.111,"p95_ms":2.871,"p99_ms":3.358,"max_ms":3.666,"bytes":2649362},
+{"kind":"list_newest_50","count":200,"errors":0,"p50_ms":6620.062,"p95_ms":10385.756,"p99_ms":11086.45,"max_ms":11128.075,"bytes":3533800},
+{"kind":"list_service_50","count":200,"errors":0,"p50_ms":6043.713,"p95_ms":7443.141,"p99_ms":10062.405,"max_ms":10942.14,"bytes":3444600},
+{"kind":"list_model_50","count":200,"errors":0,"p50_ms":5206.078,"p95_ms":8473.407,"p99_ms":9587.198,"max_ms":11636.455,"bytes":3443200},
+{"kind":"list_error_50","count":200,"errors":0,"p50_ms":4347.526,"p95_ms":4459.968,"p99_ms":5432.445,"max_ms":6579.938,"bytes":3525800},
+{"kind":"tokens_range","count":200,"errors":0,"p50_ms":387.209,"p95_ms":390.44,"p99_ms":393.319,"max_ms":405.632,"bytes":165600},
+{"kind":"tokens_hour","count":200,"errors":0,"p50_ms":22.053,"p95_ms":22.348,"p99_ms":22.547,"max_ms":23.138,"bytes":158400}
+]},
+  "server_peak_memory_after_queries_bytes": 1797918720
+}

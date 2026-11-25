@@ -103,3 +103,100 @@ experiments. `standard` is 8 CPUs and 12 GB.
 - The server has no call that returns a span count; the harness sums the
   counts of the token endpoint over the whole range instead.
 - Warm caches only: the page cache of the Docker VM is not dropped.
+
+### Results at checkpoint 4
+
+Run on 2026-11-25 with the `small` profile (2 CPUs, 4 GB) on an Apple M4 Pro
+under Docker Desktop, nothing else running, commit `dade925` (tag
+`checkpoint-04`). The files written by each run are in [server/](server/).
+
+**Text-heavy data (`d1`): 8.0 GB of agent traces, 91,419 spans, 5,034 traces.**
+
+| | |
+|---|---|
+| Sent (protobuf before compression) | 8,018 MB |
+| Stored, all part files | 62.1 MB, 129 times smaller |
+| Left in the log after the last flush | 15.4 MB |
+| Server CPU for the whole load | 19.8 s, or 2.5 CPU-seconds per GB |
+| Server peak memory during the load | 846 MiB |
+| Restart after a clean stop / after `kill -9` | 92 ms / 122 ms |
+
+| Query | p50 ms | p99 ms |
+|---|---|---|
+| Open a trace (2.3 MB of JSON on average) | 1.6 | 59 |
+| List the newest 50 traces | 0.48 | 0.64 |
+| List 50 for one service | 1.08 | 1.20 |
+| List 50 for one model | 0.76 | 0.95 |
+| List 50 with an error | 0.62 | 0.73 |
+| Token totals, whole range | 5.5 | 5.7 |
+| Token totals, one hour | 0.78 | 0.87 |
+
+**Span-only data (`d2`): 10,000,039 spans, 545,163 traces, no message text.**
+
+| | |
+|---|---|
+| Sent (protobuf before compression) | 3,622 MB |
+| Stored, all part files | 560 MB, 56 bytes per span, in 125 parts |
+| Left in the log after the last flush | 134 MB |
+| Server CPU for the whole load | 37.3 s, or 3.7 CPU-seconds per million spans |
+| Server peak memory during the load | 1,218 MiB |
+| Restart after a clean stop / after `kill -9` | 160 ms / 203 ms |
+
+| Query | p50 ms | p99 ms |
+|---|---|---|
+| Open a trace | 0.89 | 1.19 |
+| List the newest 50 traces | 0.76 | 0.83 |
+| List 50 for one service | 0.95 | 1.12 |
+| List 50 for one model | 0.84 | 1.15 |
+| List 50 with an error | 0.79 | 0.93 |
+| Token totals, whole range | 379 | 386 |
+| Token totals, one hour | 21.8 | 22.6 |
+
+**What the first run found.** The same span-only dataset was first run on the
+commit before (`484516a`, while other work was using the machine). Listing
+took 6.6 seconds at the median, and the harness needed 31 minutes to page
+through the traces. The list query read every trace summary in the range and
+asked every part about every trace. It now reads newest first and stops when
+the answer cannot change. The responses have the same sizes before and after.
+
+| Query, span-only data | p50 before, ms | p50 after, ms |
+|---|---|---|
+| List the newest 50 traces | 6,620 | 0.76 |
+| List 50 for one service | 6,044 | 0.95 |
+| List 50 for one model | 5,206 | 0.84 |
+| List 50 with an error | 4,348 | 0.79 |
+| Open a trace | 2.1 | 0.89 |
+| Server memory after the query phase | 1,715 MiB | 104 MiB |
+
+**Beside the earlier numbers.** The datasets and the profile are the ones of
+experiment A, so the server can be set beside that experiment and beside the
+ClickHouse baseline measured then. They are not one run: the baseline was
+measured on another day through its own pipeline, and it used the
+OpenTelemetry Collector exporter's schema as shipped, which a tuned schema
+would beat.
+
+| | Server now | Experiment code | ClickHouse baseline |
+|---|---|---|---|
+| 8 GB of text, stored | 62.1 MB | 62.0 MB + 3.9 MB span tables | 495.8 MB |
+| 8 GB of text, token totals p50 | 5.5 ms | 1.4 ms | 420 ms |
+| 8 GB of text, list with a filter p50 | 0.6 to 1.1 ms | 0.34 ms | 586 ms |
+| 10M spans, stored | 560 MB | 385 MB | 469 MB |
+| 10M spans, open a trace p50 | 0.89 ms | 0.59 ms | 11.5 ms |
+| 10M spans, list newest 50 p50 | 0.76 ms | 7.0 ms | 4.9 ms |
+| 10M spans, list with a filter p50 | 0.8 to 1.0 ms | 8.8 ms | 773 ms |
+| 10M spans, token totals p50 | 379 ms | 86 ms | 272 ms |
+
+**Where the server is behind.**
+
+- Span-only data takes 560 MB, more than the experiment (385 MB) and more
+  than the baseline (469 MB). It is in 125 small parts that are never merged;
+  compaction is checkpoint 6. Until that is built and measured, this is a
+  deficit, not a promise.
+- Token totals over the whole range of the span-only data take 379 ms, slower
+  than the baseline's 272 ms. The query reads five columns of every part on
+  one thread.
+- Opening a large trace has a long tail: 59 ms at the 99th percentile on the
+  text-heavy data, where a trace is megabytes of JSON.
+- Peak memory during a load is 0.8 to 1.2 GB with the default buffer sizes.
+- The log keeps up to one file of already-flushed records on disk.
+- Full-text search is not in the server yet, so it is not measured.
