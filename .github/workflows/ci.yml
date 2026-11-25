@@ -41,3 +41,12 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
+
+  # Builds the container image, loads generated traces over OTLP and checks
+  # the data after a kill -9 and after a clean stop.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/e2e.sh
