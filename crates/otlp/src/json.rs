@@ -22,6 +22,14 @@
 //! rule the decoder uses for the promoted columns. Object keys come out
 //! sorted. Values nested deeper than [`MAX_DEPTH`] are rejected so that
 //! hostile input cannot exhaust the stack.
+//!
+//! The functions in this module build the whole value in memory and fail on the
+//! first thing they cannot read, so one bad span can make a trace unreadable
+//! and a large column needs hundreds of times its size in memory. They are
+//! superseded by the streaming writers in this crate ([`write_attrs`] and its
+//! siblings) and will be removed once their callers have moved.
+//!
+//! [`write_attrs`]: crate::write_attrs
 
 use crate::wire::{At, Cur, Fault, R, utf8};
 use nwdb_core::Result;
@@ -31,6 +39,8 @@ use serde_json::{Map, Number, Value};
 pub const MAX_DEPTH: usize = 64;
 
 /// The `attrs` column (length-prefixed `KeyValue` messages) as an object.
+///
+/// Superseded by [`crate::write_attrs`].
 pub fn attrs_to_json(column: &[u8]) -> Result<Value> {
     let mut map = Map::new();
     each_prefixed(column, |msg| put_key_value(&mut map, msg, 0)).at("attrs")?;
@@ -39,6 +49,8 @@ pub fn attrs_to_json(column: &[u8]) -> Result<Value> {
 
 /// The `resource` column (a `Resource` message) as an object of its
 /// attributes.
+///
+/// Superseded by [`crate::write_resource`].
 pub fn resource_to_json(resource: &[u8]) -> Result<Value> {
     message_attributes(resource, 1, "resource")
         .map(Value::Object)
@@ -47,6 +59,8 @@ pub fn resource_to_json(resource: &[u8]) -> Result<Value> {
 
 /// The `scope` column (an `InstrumentationScope` message) as an object of
 /// its attributes.
+///
+/// Superseded by [`crate::write_scope_attrs`].
 pub fn scope_to_json(scope: &[u8]) -> Result<Value> {
     message_attributes(scope, 3, "scope")
         .map(Value::Object)
@@ -54,6 +68,8 @@ pub fn scope_to_json(scope: &[u8]) -> Result<Value> {
 }
 
 /// The `events` column as an array of `{time_ns, name, attributes}`.
+///
+/// Superseded by [`crate::write_events`].
 pub fn events_to_json(column: &[u8]) -> Result<Value> {
     let mut out = Vec::new();
     each_prefixed(column, |msg| {

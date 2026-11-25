@@ -1,6 +1,8 @@
-use crate::wire::{Cur, put_varint};
+use crate::repair::{Kind, is_clean, repair};
+use crate::walk::{Next, Rd};
+use crate::wire::put_varint;
 use arrow_array::RecordBatch;
-use nwdb_core::{Error, Result, SpanColumns, SpanRecord};
+use nwdb_core::{Result, SpanColumns, SpanRecord};
 
 fn put_tag(out: &mut Vec<u8>, field: u32, wire: u8) {
     put_varint(out, u64::from(field) << 3 | u64::from(wire));
@@ -13,18 +15,43 @@ fn put_len_field(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
 }
 
 /// Writes each element of a column of length-prefixed messages as its own
-/// repeated field.
-fn put_repeated(out: &mut Vec<u8>, field: u32, column: &[u8], what: &str) -> Result<()> {
-    let mut c = Cur::new(column);
-    // Each element is a varint length followed by that many bytes. The reader
-    // is the same bounds-checked one the decoder uses.
-    while !c.is_empty() {
-        let msg = c.len_delimited().map_err(|_| {
-            Error::corrupt(format!("span table column `{what}` is not length-prefixed"))
-        })?;
-        put_len_field(out, field, msg);
+/// repeated field, and returns how many it had to leave out.
+///
+/// An element that a standard parser would read is written as stored. One it
+/// would refuse is repaired, or left out when it cannot be, and the rest of a
+/// column whose framing is broken counts as one left out.
+fn put_repeated(out: &mut Vec<u8>, field: u32, column: &[u8], kind: Kind) -> u64 {
+    let mut dropped = 0;
+    let mut r = Rd::new(column);
+    loop {
+        match r.prefixed() {
+            Next::End => return dropped,
+            Next::Bad => return dropped + 1,
+            Next::Item(m) if is_clean(m, kind) => put_len_field(out, field, m),
+            Next::Item(m) => match repair(m, kind) {
+                Some(fixed) => put_len_field(out, field, &fixed),
+                None => dropped += 1,
+            },
+        }
     }
-    Ok(())
+}
+
+/// Writes a `Resource` or `InstrumentationScope` as field `field`: as stored
+/// when a standard parser reads it, repaired when it can be, and empty when
+/// it cannot.
+fn put_message(out: &mut Vec<u8>, field: u32, msg: &[u8], kind: Kind) {
+    if is_clean(msg, kind) {
+        put_len_field(out, field, msg);
+    } else {
+        put_len_field(out, field, &repair(msg, kind).unwrap_or_default());
+    }
+}
+
+/// A count as a field, added to what the sender reported and capped at what
+/// the field can hold.
+fn put_count(out: &mut Vec<u8>, field: u32, sent: u32, left_out: u64) {
+    let total = u64::from(sent).saturating_add(left_out);
+    put_varint_field(out, field, total.min(u64::from(u32::MAX)));
 }
 
 fn put_varint_field(out: &mut Vec<u8>, field: u32, v: u64) {
@@ -40,7 +67,7 @@ fn put_str_field(out: &mut Vec<u8>, field: u32, v: Option<&str>) {
     }
 }
 
-fn encode_span(out: &mut Vec<u8>, r: &SpanRecord<'_>) -> Result<()> {
+fn encode_span(out: &mut Vec<u8>, r: &SpanRecord<'_>) {
     put_len_field(out, 1, r.trace_id.as_bytes());
     put_len_field(out, 2, r.span_id.as_bytes());
     put_str_field(out, 3, r.trace_state);
@@ -57,12 +84,12 @@ fn encode_span(out: &mut Vec<u8>, r: &SpanRecord<'_>) -> Result<()> {
         put_tag(out, 8, 1);
         out.extend_from_slice(&(r.end_ns as u64).to_le_bytes());
     }
-    put_repeated(out, 9, r.attrs, "attrs")?;
-    put_varint_field(out, 10, u64::from(r.dropped_attributes_count));
-    put_repeated(out, 11, r.events.unwrap_or(&[]), "events")?;
-    put_varint_field(out, 12, u64::from(r.dropped_events_count));
-    put_repeated(out, 13, r.links.unwrap_or(&[]), "links")?;
-    put_varint_field(out, 14, u64::from(r.dropped_links_count));
+    let attrs = put_repeated(out, 9, r.attrs, Kind::KeyValue);
+    put_count(out, 10, r.dropped_attributes_count, attrs);
+    let events = put_repeated(out, 11, r.events.unwrap_or(&[]), Kind::Event);
+    put_count(out, 12, r.dropped_events_count, events);
+    let links = put_repeated(out, 13, r.links.unwrap_or(&[]), Kind::Link);
+    put_count(out, 14, r.dropped_links_count, links);
     let message = r.status_message.filter(|s| !s.is_empty());
     if message.is_some() || r.status_code != 0 {
         let mut status = Vec::new();
@@ -74,7 +101,6 @@ fn encode_span(out: &mut Vec<u8>, r: &SpanRecord<'_>) -> Result<()> {
         put_tag(out, 16, 5);
         out.extend_from_slice(&r.flags.to_le_bytes());
     }
-    Ok(())
 }
 
 fn non_empty(v: Option<&str>) -> Option<&str> {
@@ -119,8 +145,18 @@ fn scope_of<'a>(r: &SpanRecord<'a>) -> ScopeKey<'a> {
 /// version are not written: they are copies of data that is already in those
 /// bytes. Decoding the result gives back the same rows.
 ///
-/// Returns [`Error::InvalidArgument`] for a batch that does not have the span
-/// schema and [`Error::Corrupt`] for a raw column that is not length-prefixed.
+/// The result is always a message a standard OTLP parser accepts, whatever the
+/// stored bytes hold, because the decoder keeps attributes, events, links,
+/// resource and scope as sent without reading them. A piece a parser would
+/// read is written exactly as stored. Otherwise it is repaired: a string that
+/// is not UTF-8 gets U+FFFD for each invalid sequence; a key-value, event or
+/// link that cannot be read (or whose values nest more than 64 messages deep)
+/// is left out and added to the `dropped_attributes_count`,
+/// `dropped_events_count` or `dropped_links_count` of the message it was in;
+/// a resource or scope that cannot be read at all is written empty.
+///
+/// Returns [`nwdb_core::Error::InvalidArgument`] for a batch that does not
+/// have the span schema.
 pub fn encode_spans(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut resource: Option<OpenResource> = None;
@@ -137,7 +173,7 @@ pub fn encode_spans(batches: &[RecordBatch]) -> Result<Vec<u8>> {
                 resource = Some(OpenResource::new(key));
             }
             span_buf.clear();
-            encode_span(&mut span_buf, &r)?;
+            encode_span(&mut span_buf, &r);
             if let Some(open) = resource.as_mut() {
                 open.push_span(scope_of(&r), &span_buf);
             }
@@ -187,7 +223,7 @@ impl OpenScope {
         let mut body = Vec::new();
         let key = &self.key;
         if let Some(scope) = &key.scope {
-            put_len_field(&mut body, 1, scope);
+            put_message(&mut body, 1, scope, Kind::Scope);
         } else if key.name.is_some() || key.version.is_some() {
             let mut scope = Vec::new();
             put_str_field(&mut scope, 1, key.name.as_deref());
@@ -243,7 +279,7 @@ impl OpenResource {
         }
         let mut body = Vec::new();
         if let Some(r) = &self.bytes {
-            put_len_field(&mut body, 1, r);
+            put_message(&mut body, 1, r, Kind::Resource);
         }
         body.extend_from_slice(&self.scopes);
         put_str_field(&mut body, 3, self.schema_url.as_deref());

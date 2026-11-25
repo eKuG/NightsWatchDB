@@ -82,11 +82,71 @@ element has a tag byte before it), so each is assembled in a reused scratch
 buffer and then appended to the builder: two copies for those columns. Writing
 straight into the builder needs a streaming append in `nwdb-core`.
 
+## JSON view of the raw columns
+
+`write_attrs`, `write_resource`, `write_scope_attrs`, `write_events` and
+`write_links` write JSON text straight to a `std::io::Write` in one pass. They
+use a fixed 8 KiB buffer plus the recursion stack (at most `MAX_DEPTH`, 64,
+values deep), so the memory does not grow with the column, and the only error
+they return is the writer's own: whatever the stored bytes hold, the output is
+valid JSON. `resource_dropped_attributes` and `scope_dropped_attributes` give
+the `dropped_attributes_count` of a resource and a scope (0 when absent or
+unreadable). The older `attrs_to_json` and its siblings build a
+`serde_json::Value`, fail on the first thing they cannot read and need hundreds
+of times the column's size in memory; they are superseded and will be removed.
+
+Mapping: string, bool, int (number), double (number; `"NaN"`, `"Infinity"` and
+`"-Infinity"` as strings), array, key-value list (object), bytes (standard
+base64), unset (null). Events carry `time_ns`, `name`, `attributes` and
+`dropped_attributes_count` when not zero. Links carry `trace_id` and `span_id`
+(hex), `trace_state` when not empty, `flags` when not zero, `attributes` and
+`dropped_attributes_count` when not zero.
+
+Deviations from what a protobuf parser would make of the same bytes:
+
+- A string or key that is not valid UTF-8 is written with each invalid
+  sequence replaced by U+FFFD.
+- What cannot be read as the message it should be (a key-value, an any-value,
+  an event, a link, or the rest of a column once its framing is broken) and a
+  value nested deeper than `MAX_DEPTH` is written as
+  `{"$unparsed": "<base64 of the raw bytes>"}` in the place of the value; for
+  an unreadable entry of an object, as the member `"$unparsed"` (it repeats if
+  that happens more than once in one object). The walk goes on with the next
+  sibling when the framing allows it.
+- Keys are written in stored order and are not de-duplicated: a key the sender
+  repeated appears twice. JSON parsers keep the last occurrence, which is the
+  rule the promoted columns use. De-duplicating would need memory proportional
+  to the number of keys.
+- When a `KeyValue` carries its `value` field twice, the last occurrence is
+  shown. Protobuf merges them (a second string replaces the first, an empty
+  second value leaves the first in place, and two key-value lists are
+  appended); merging needs the whole message in memory.
+
+## The protobuf view is always valid OTLP
+
+The decoder keeps attributes, events, links, resource and scope as sent
+without reading them, so `encode_spans` checks each stored piece before writing
+it, with a walk that allocates nothing: the structure of its message type at
+every level, wire types of known fields, and UTF-8 in every string field. A
+piece that passes is written byte for byte as stored. Otherwise a repaired copy
+is written:
+
+- A string that is not UTF-8 gets U+FFFD for each invalid sequence.
+- A key-value, event or link that cannot be read is left out and counted in the
+  `dropped_attributes_count`, `dropped_events_count` or `dropped_links_count`
+  of the message it was in (for an event or link attribute, of the event or
+  link). The rest of a column whose length prefixes are broken counts as one.
+- A value nested more than 64 messages deep (a value in an array in an array is
+  four) is treated as unreadable. This is counted in messages rather than
+  values because common parsers refuse more than 100 levels of messages.
+- A resource or scope that cannot be read at all is written as an empty
+  message.
+
 ## Not handled
 
 - The bodies of `events` and `links`, and attribute values that are not
-  promoted, are not looked into: they are stored as received and malformed
-  contents there are not detected.
+  promoted, are not looked into when decoding: they are stored as received and
+  malformed contents there are not detected. The readers above cope with that.
 - OTLP/JSON and OTLP/HTTP framing, gzip, gRPC: the input is the protobuf body.
 - Metrics and logs.
 - `encode_spans` groups on consecutive equal resource bytes and resource
