@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nwdb_core::{Error, Result};
 
 use crate::file::{TEMP_PREFIX, file_name, parse_file_name};
-use crate::state::{Edit, MAX_NEXT_PART_ID, ManifestState};
+use crate::state::{Edit, MAX_NEXT_PART_ID, ManifestState, PART_ID_LEFTOVER_WINDOW};
 
 /// Options for [`Manifest::open`].
 #[derive(Debug, Clone)]
@@ -457,18 +457,22 @@ fn part_dirs(parts_dir: &Path) -> Result<Vec<(PathBuf, u64, bool)>> {
 /// The largest part id among final and temporary part directories under
 /// `parts_dir`, or `None` if there are none (or no `parts_dir`).
 ///
-/// Ids from `MAX_NEXT_PART_ID - 1` up are ignored. Ids at or above the limit
-/// were never handed out, and the last one below it is out of reach in
-/// practice (2^62 ids), so such a directory is a stray; raising
-/// `next_part_id` to the limit for it would leave no id to hand out.
-/// [`unreferenced_part_dirs`] still lists the stray directories.
+/// `next_part_id` is the manifest's current value. Ids at or above
+/// `next_part_id + PART_ID_LEFTOVER_WINDOW` (and any id from
+/// `MAX_NEXT_PART_ID` up) are ignored: no flush of this database could have
+/// written them, so such a directory is a stray, and raising `next_part_id`
+/// for it would use up the id space. [`unreferenced_part_dirs`] still lists
+/// the stray directories.
 ///
 /// Used at startup so ids are never reused after a crash; see the README.
-pub fn highest_part_dir_id(parts_dir: &Path) -> Result<Option<u64>> {
+pub fn highest_part_dir_id(parts_dir: &Path, next_part_id: u64) -> Result<Option<u64>> {
+    let limit = next_part_id
+        .checked_add(PART_ID_LEFTOVER_WINDOW)
+        .map_or(MAX_NEXT_PART_ID, |l| l.min(MAX_NEXT_PART_ID));
     Ok(part_dirs(parts_dir)?
         .into_iter()
         .map(|(_, id, _)| id)
-        .filter(|&id| id < MAX_NEXT_PART_ID - 1)
+        .filter(|&id| id < limit)
         .max())
 }
 

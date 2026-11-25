@@ -11,6 +11,9 @@
 //!
 //! - `READY` once the engine is open and recovered;
 //! - `A <id>` for each record, after the engine acknowledged it;
+//! - `ABORT <Stage>` immediately before the process aborts itself at a stage
+//!   (see `NWDB_ABORT_AT`), so the test can tell that abort from any other
+//!   way of dying;
 //! - `F 1` / `F 0` when a flush starts (the buffer is frozen) and when it ends
 //!   (the log is trimmed), from the engine's stage hook, so the interval
 //!   covers the whole flush.
@@ -91,6 +94,7 @@ fn main() {
             && format!("{stage:?}") == *name
             && seen.fetch_add(1, Ordering::SeqCst) + 1 == *n
         {
+            say(&format!("ABORT {name}"));
             std::process::abort();
         }
         Ok(())

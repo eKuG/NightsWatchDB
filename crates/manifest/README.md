@@ -158,10 +158,15 @@ Every restart:
 
 1. `open(.., OpenMode::MustExist, ..)`. `NotFound` or `Corrupt` stops the
    engine; nothing is deleted.
-2. `highest_part_dir_id(parts_dir)` gives the largest id among final and
-   temporary part directories, ignoring ids from `MAX_NEXT_PART_ID - 1` up
-   (strays that were never handed out; step 3 deletes them like any other
-   unreferenced directory). If it is `Some(h)` and `h >= next_part_id`,
+2. `highest_part_dir_id(parts_dir, next_part_id)` gives the largest id among
+   final and temporary part directories, ignoring ids at or above
+   `next_part_id + PART_ID_LEFTOVER_WINDOW` (2^32) and any id from
+   `MAX_NEXT_PART_ID` up. Ids are handed out in order and only flushes that
+   did not commit leave ids above `next_part_id`, so a leftover of this
+   database is close above it; a directory further away is a stray, and
+   raising `next_part_id` for it would use up the id space. Step 3 deletes
+   strays like any other unreferenced directory. If it is `Some(h)` and
+   `h >= next_part_id`,
    first commit `Edit { next_part_id: Some(h + 1), .. }`, so ids are never
    reused even if a later step fails.
 3. Only then delete every directory returned by

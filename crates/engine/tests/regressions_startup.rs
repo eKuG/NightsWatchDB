@@ -6,7 +6,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::*;
-use nwdb_core::{Error, TraceId};
+use nwdb_core::Error;
 use nwdb_engine::{Engine, EngineOptions};
 use nwdb_manifest::{Manifest, ManifestOptions, OpenMode};
 
@@ -144,28 +144,6 @@ fn a_damaged_log_file_wholly_inside_parts_does_not_block_start_up() {
         }
     };
     m.check(&e, "after start-up");
-    e.shutdown().unwrap();
-}
-
-/// A stray directory whose name is a 20-digit number near the id limit is
-/// taken as a part id that must never be reused. Start-up deletes the
-/// directory but raises `next_part_id` to the limit for good, and from then
-/// on every flush fails: the engine can never write a part again.
-#[test]
-fn a_stray_part_directory_with_a_huge_id_does_not_stop_later_flushes() {
-    let dir = tempfile::tempdir().unwrap();
-    open(opts(dir.path())).shutdown().unwrap();
-    let stray = dir.path().join("parts").join(nwdb_core::part_dir_name(
-        nwdb_manifest::MAX_NEXT_PART_ID - 1,
-    ));
-    std::fs::create_dir_all(&stray).unwrap();
-
-    let e = open(opts(dir.path()));
-    assert!(!stray.exists());
-    ingest(&e, &one(1)).unwrap();
-    let r = e.flush();
-    assert!(r.is_ok(), "flush failed after a stray directory: {r:?}");
-    assert!(e.get_trace(TraceId(1u128.to_be_bytes())).unwrap().is_some());
     e.shutdown().unwrap();
 }
 

@@ -17,7 +17,7 @@ fn abort_env(stage: &str, n: u64) -> Vec<(&'static str, String)> {
 /// Runs a child on `dir` until it aborts at `stage`, the `n`-th time.
 fn crash_at(dir: &std::path::Path, first_id: u64, stage: &str, n: u64) -> Vec<u64> {
     let run = run_child(dir, first_id, 0, &abort_env(stage, n), None);
-    assert!(!run.success, "the child did not abort at {stage}");
+    run.assert_aborted_at(stage);
     run.acked
 }
 
@@ -106,7 +106,7 @@ fn every_open_stage_leaves_a_recoverable_directory() {
         let before = tree_of(dir.path(), &["manifest", "parts"]);
 
         let run = run_child(dir.path(), 5_000_000, 0, &recovery_env(stage), None);
-        assert!(!run.success, "the child did not abort at {stage}");
+        run.assert_aborted_at(stage);
         let after = tree_of(dir.path(), &["manifest", "parts"]);
         let (state, unreferenced) = disk_state(dir.path());
         match stage {

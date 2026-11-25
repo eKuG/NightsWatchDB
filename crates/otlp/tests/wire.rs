@@ -187,14 +187,16 @@ fn wrong_value_types_leave_the_column_null() {
 fn token_columns_take_ints_and_numeric_strings() {
     let cases = [
         (str_val("123"), Some("123")),
-        (str_val("-7"), Some("-7")),
+        (str_val("-7"), None),
         (str_val("0"), Some("0")),
         (str_val("12x"), None),
         (str_val(""), None),
         (str_val(" 5"), None),
         (str_val("1.5"), None),
         (str_val("99999999999999999999"), None),
-        (Value::IntValue(i64::MIN), Some("-9223372036854775808")),
+        (Value::IntValue(i64::MIN), None),
+        (Value::IntValue(-1), None),
+        (Value::IntValue(i64::MAX), Some("9223372036854775807")),
         (Value::IntValue(0), Some("0")),
     ];
     for (v, want) in cases {
@@ -202,6 +204,66 @@ fn token_columns_take_ints_and_numeric_strings() {
         assert_eq!(got[4].as_deref(), want, "{v:?}");
         let got = promoted(vec![kv("gen_ai.usage.completion_tokens", v)]);
         assert_eq!(got[5].as_deref(), want);
+    }
+}
+
+/// A token count cannot be below zero: a negative value is not usable, so
+/// the older name is tried, or the column stays null. The attribute stays in
+/// `attrs` untouched.
+#[test]
+fn a_negative_token_count_is_not_usable() {
+    for (col, new, old) in [
+        (4, "gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens"),
+        (
+            5,
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.completion_tokens",
+        ),
+    ] {
+        // Only a negative value: the column is null.
+        assert_eq!(promoted(vec![kv(new, Value::IntValue(-3))])[col], None);
+        assert_eq!(promoted(vec![kv(old, str_val("-3"))])[col], None);
+        // A negative newer name falls through to a usable older one, in
+        // either order on the wire.
+        assert_eq!(
+            promoted(vec![
+                kv(new, Value::IntValue(-3)),
+                kv(old, Value::IntValue(8))
+            ])[col]
+                .as_deref(),
+            Some("8")
+        );
+        assert_eq!(
+            promoted(vec![kv(old, str_val("8")), kv(new, str_val("-3"))])[col].as_deref(),
+            Some("8")
+        );
+        // Two negatives: null. Zero is a usable value and wins over an older one.
+        assert_eq!(
+            promoted(vec![
+                kv(new, Value::IntValue(-3)),
+                kv(old, Value::IntValue(-4))
+            ])[col],
+            None
+        );
+        assert_eq!(
+            promoted(vec![
+                kv(new, Value::IntValue(0)),
+                kv(old, Value::IntValue(8))
+            ])[col]
+                .as_deref(),
+            Some("0")
+        );
+        // The attribute itself is kept as received.
+        let batches = decoder()
+            .decode(&request_with_attrs(vec![kv(new, Value::IntValue(-3))]))
+            .unwrap();
+        let rows = all_rows(&batches);
+        assert!(
+            rows[0]
+                .attrs
+                .windows(new.len())
+                .any(|w| w == new.as_bytes())
+        );
     }
 }
 

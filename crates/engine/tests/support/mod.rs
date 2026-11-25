@@ -22,6 +22,32 @@ pub struct ChildRun {
     /// A flush was in progress (frozen, not yet trimmed) at the last marker.
     pub flushing_at_end: bool,
     pub success: bool,
+    /// The stage named by the child's `ABORT` line, if it printed one.
+    pub aborted_at: Option<String>,
+    /// The signal that ended the child, if one did.
+    pub signal: Option<i32>,
+}
+
+/// The signal `std::process::abort` raises.
+pub const SIGABRT: i32 = 6;
+
+impl ChildRun {
+    /// Panics unless the child announced an abort at `stage` and then died of
+    /// SIGABRT. A child that panicked or exited early fails here.
+    pub fn assert_aborted_at(&self, stage: &str) {
+        assert_eq!(
+            self.aborted_at.as_deref(),
+            Some(stage),
+            "the child did not reach the abort at {stage} (success: {}, signal: {:?})",
+            self.success,
+            self.signal
+        );
+        assert_eq!(
+            self.signal,
+            Some(SIGABRT),
+            "the child announced the abort at {stage} but was not ended by SIGABRT"
+        );
+    }
 }
 
 /// Starts the child on `dir` and waits until it dies by itself (it aborts at
@@ -47,6 +73,7 @@ pub fn run_child(
     let reader = std::thread::spawn(move || {
         let mut acked = Vec::new();
         let mut flushing = false;
+        let mut aborted_at = None;
         for line in out.lines() {
             let Ok(line) = line else { break };
             match line.split_once(' ') {
@@ -58,10 +85,11 @@ pub fn run_child(
                 }
                 Some(("A", id)) => acked.push(id.parse::<u64>().unwrap()),
                 Some(("F", f)) => flushing = f == "1",
+                Some(("ABORT", stage)) => aborted_at = Some(stage.to_string()),
                 _ => {}
             }
         }
-        (acked, flushing)
+        (acked, flushing, aborted_at)
     });
     let started = Instant::now();
     let mut killed_at = None;
@@ -87,11 +115,13 @@ pub fn run_child(
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    let (acked, flushing_at_end) = reader.join().unwrap();
+    let (acked, flushing_at_end, aborted_at) = reader.join().unwrap();
     ChildRun {
         acked,
         flushing_at_end,
         success: status.success(),
+        aborted_at,
+        signal: std::os::unix::process::ExitStatusExt::signal(&status),
     }
 }
 

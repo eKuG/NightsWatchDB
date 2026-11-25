@@ -51,8 +51,9 @@ once per batch, and each row holds a key.
 The promotion table is the `PROMOTED` constant in `src/decode.rs`: new name
 first, older names after. Promoted columns are copies; `attrs` keeps the
 originals. A text column takes a string value. A token column takes an int
-value, or a string that parses as a base-10 `i64`. Any other value type is
-unusable. The first name, newest first, whose value is usable selects the
+value, or a string that parses as a base-10 `i64`, that is not negative. A
+negative number, or any other value type, is unusable (the attribute itself
+stays in `attrs`). The first name, newest first, whose value is usable selects the
 value, so a newer name beats an older one whatever their order, and a newer
 name with an unusable value does not hide a usable older one. If no name has a
 usable value the column is null. A key that occurs twice takes its last

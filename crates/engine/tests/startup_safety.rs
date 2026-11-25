@@ -246,41 +246,19 @@ fn a_lost_log_can_be_accepted() {
     e.shutdown().unwrap();
 }
 
-#[test]
-fn an_undecodable_log_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut m = Model::default();
-    let e = open(opts(dir.path()));
-    for t in 1..=3 {
-        ingest(&e, &one(t)).unwrap();
-        m.add(&one(t));
+/// Options with a buffer so small that a replay flushes after every record.
+fn replay_flushes(dir: &Path, small: bool) -> EngineOptions {
+    let mut o = opts(dir);
+    if small {
+        o.buffer_bytes = 1;
     }
-    drop(e);
-    let saved = tempfile::tempdir().unwrap();
-    copy_dir(&dir.path().join("wal"), saved.path());
-    let (wal, _) = Wal::open(
-        dir.path().join("wal"),
-        WalOptions {
-            sync: SyncMode::None,
-            ..WalOptions::default()
-        },
-    )
-    .unwrap();
-    wal.append_blocking(&[77, 1, 2, 3]).unwrap();
-    wal.shutdown().unwrap();
-
-    let err = refused(opts(dir.path()), dir.path());
-    assert!(is_corrupt(&err), "{err}");
-    std::fs::remove_dir_all(dir.path().join("wal")).unwrap();
-    copy_dir(saved.path(), &dir.path().join("wal"));
-    opens_with_everything(opts(dir.path()), &m, "after restoring the log");
+    o
 }
 
-/// Part directories the manifest does not reference may be the only decoded
-/// copy of data whose log record no longer decodes: they are deleted only
-/// after the replay worked.
-#[test]
-fn leftover_parts_survive_a_refused_replay() {
+/// A log with a record no decoder knows at the end, with or without a
+/// leftover part directory above `next_part_id`: the refused start changes
+/// nothing, and restoring the log lets the database open with every record.
+fn an_undecodable_record(small_buffer: bool, with_leftover: bool) {
     let dir = tempfile::tempdir().unwrap();
     let mut m = Model::default();
     let e = open(opts(dir.path()));
@@ -301,20 +279,37 @@ fn leftover_parts_survive_a_refused_replay() {
     .unwrap();
     wal.append_blocking(&[77, 1, 2, 3]).unwrap();
     wal.shutdown().unwrap();
+    // Part directories the manifest does not reference may be the only
+    // decoded copy of data whose log record no longer decodes: they must
+    // outlive a refused replay.
     let leftover = dir.path().join("parts").join("00000000000000000007");
-    std::fs::create_dir_all(&leftover).unwrap();
-    std::fs::write(leftover.join("spans.parquet"), b"junk").unwrap();
+    if with_leftover {
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("spans.parquet"), b"junk").unwrap();
+    }
 
-    let err = Engine::open(opts(dir.path()), decoders())
-        .err()
-        .expect("start-up accepted an undecodable record");
+    let err = refused(replay_flushes(dir.path(), small_buffer), dir.path());
     assert!(is_corrupt(&err), "{err}");
-    assert!(leftover.is_dir(), "the refused start-up deleted a leftover");
-
     std::fs::remove_dir_all(dir.path().join("wal")).unwrap();
     copy_dir(saved.path(), &dir.path().join("wal"));
-    opens_with_everything(opts(dir.path()), &m, "after restoring the log");
+    opens_with_everything(
+        replay_flushes(dir.path(), small_buffer),
+        &m,
+        "after restoring the log",
+    );
     assert!(!leftover.exists());
+}
+
+#[test]
+fn an_undecodable_log_record() {
+    an_undecodable_record(false, false);
+    an_undecodable_record(true, false);
+}
+
+#[test]
+fn leftover_parts_survive_a_refused_replay() {
+    an_undecodable_record(false, true);
+    an_undecodable_record(true, true);
 }
 
 #[test]
@@ -360,25 +355,51 @@ fn bad_arguments_are_refused_before_the_disk_is_touched() {
     assert!(!dir.exists());
 }
 
+/// The lock is on the directory itself. While an engine is open, remove and
+/// recreate everything a process could remove without closing it: files at the
+/// top level, and every subdirectory (moved away and back, as a backup tool
+/// or an administrator might). A second `open` still gets `Conflict`.
 #[test]
 fn the_directory_lock_does_not_depend_on_a_file_in_it() {
     let dir = tempfile::tempdir().unwrap();
-    let e = open(opts(dir.path()));
-    assert!(!dir.path().join("LOCK").exists());
-    // Whatever is deleted or created in the directory, a second engine is
-    // refused while the first runs.
-    for entry in std::fs::read_dir(dir.path()).unwrap() {
-        let p = entry.unwrap().path();
-        if p.is_file() {
-            std::fs::remove_file(p).unwrap();
-        }
+    let data = dir.path().join("db");
+    let e = open(opts(&data));
+    let conflict = || {
+        matches!(
+            Engine::open(opts(&data), decoders()),
+            Err(Error::Conflict(_))
+        )
+    };
+    assert!(conflict());
+    assert!(!data.join("LOCK").exists());
+
+    // Files that a lock file might have been called, created and deleted.
+    for name in ["LOCK", "lock", ".lock", "db.lock", "manifest.lock"] {
+        std::fs::write(data.join(name), b"").unwrap();
+        assert!(conflict(), "{name} created");
+        std::fs::remove_file(data.join(name)).unwrap();
+        assert!(conflict(), "{name} removed");
     }
-    std::fs::write(dir.path().join("LOCK"), b"").unwrap();
-    std::fs::remove_file(dir.path().join("LOCK")).unwrap();
-    assert!(matches!(
-        Engine::open(opts(dir.path()), decoders()),
-        Err(Error::Conflict(_))
-    ));
+    // Every subdirectory moved away and back.
+    let mut names: Vec<_> = std::fs::read_dir(&data)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert!(names.len() >= 2, "{names:?}");
+    for name in &names {
+        let away = data.join(format!("away-{}", name.to_string_lossy()));
+        std::fs::rename(data.join(name), &away).unwrap();
+        assert!(conflict(), "{name:?} moved away");
+        std::fs::rename(&away, data.join(name)).unwrap();
+        assert!(conflict(), "{name:?} moved back");
+    }
+    // The directory itself moved away and back.
+    let away = dir.path().join("db-away");
+    std::fs::rename(&data, &away).unwrap();
+    std::fs::rename(&away, &data).unwrap();
+    assert!(conflict(), "the directory moved away and back");
+
     e.shutdown().unwrap();
-    open(opts(dir.path())).shutdown().unwrap();
+    open(opts(&data)).shutdown().unwrap();
 }

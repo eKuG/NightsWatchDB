@@ -282,19 +282,19 @@ fn implausible_ids_are_rejected_in_edits() {
 fn highest_part_dir_id_sees_final_and_temporary_dirs() {
     let tmp = tempfile::tempdir().unwrap();
     let parts = tmp.path().join("parts");
-    assert_eq!(highest_part_dir_id(&parts).unwrap(), None);
+    assert_eq!(highest_part_dir_id(&parts, 1).unwrap(), None);
     fs::create_dir_all(&parts).unwrap();
-    assert_eq!(highest_part_dir_id(&parts).unwrap(), None);
+    assert_eq!(highest_part_dir_id(&parts, 1).unwrap(), None);
 
     fs::create_dir_all(parts.join(part_dir_name(4))).unwrap();
     fs::create_dir_all(parts.join("scratch")).unwrap();
     fs::write(parts.join(part_dir_name(50)), "a file").unwrap();
-    assert_eq!(highest_part_dir_id(&parts).unwrap(), Some(4));
+    assert_eq!(highest_part_dir_id(&parts, 1).unwrap(), Some(4));
 
     fs::create_dir_all(parts.join(format!("{}.tmp", part_dir_name(9)))).unwrap();
-    assert_eq!(highest_part_dir_id(&parts).unwrap(), Some(9));
+    assert_eq!(highest_part_dir_id(&parts, 1).unwrap(), Some(9));
     fs::create_dir_all(parts.join(part_dir_name(7))).unwrap();
-    assert_eq!(highest_part_dir_id(&parts).unwrap(), Some(9));
+    assert_eq!(highest_part_dir_id(&parts, 1).unwrap(), Some(9));
 }
 
 /// Finding 6: the documented startup rule, end to end.
@@ -313,7 +313,9 @@ fn startup_rule_never_reuses_ids() {
     drop(m);
 
     let m = Manifest::open(&dir, OpenMode::MustExist, opts()).unwrap();
-    let highest = highest_part_dir_id(&parts).unwrap().unwrap();
+    let highest = highest_part_dir_id(&parts, m.current().next_part_id)
+        .unwrap()
+        .unwrap();
     let s = m
         .commit(Edit {
             next_part_id: Some(highest + 1),
@@ -366,8 +368,9 @@ fn error_meanings_after_a_lost_race() {
     ));
 }
 
-/// Directories with ids at or near the limit are strays: they do not count
-/// for the highest id, but they still count as part directories.
+/// Directories far above `next_part_id`, or at or above the limit, are
+/// strays: they do not count for the highest id, but they still count as part
+/// directories.
 #[test]
 fn huge_part_dir_ids_do_not_raise_the_highest_id() {
     let tmp = tempfile::tempdir().unwrap();
@@ -377,6 +380,33 @@ fn huge_part_dir_ids_do_not_raise_the_highest_id() {
     fs::create_dir_all(parts.join(part_dir_name(MAX_NEXT_PART_ID - 1))).unwrap();
     fs::create_dir_all(parts.join(part_dir_name(u64::MAX))).unwrap();
     fs::create_dir_all(parts.join(format!("{}.tmp", part_dir_name(MAX_NEXT_PART_ID)))).unwrap();
-    assert_eq!(highest_part_dir_id(&parts).unwrap(), Some(3));
+    assert_eq!(highest_part_dir_id(&parts, 1).unwrap(), Some(3));
     assert!(nwdb_manifest::has_part_dirs(&parts).unwrap());
+}
+
+/// The leftover window: an id just below `next_part_id + window` counts, one
+/// at or above it does not, whatever `next_part_id` is.
+#[test]
+fn highest_part_dir_id_ignores_ids_a_window_above_next_part_id() {
+    use nwdb_manifest::PART_ID_LEFTOVER_WINDOW as W;
+    let tmp = tempfile::tempdir().unwrap();
+    let parts = tmp.path().join("parts");
+    for next in [1, 1000, MAX_NEXT_PART_ID - 5, MAX_NEXT_PART_ID - 1] {
+        let _ = fs::remove_dir_all(&parts);
+        fs::create_dir_all(parts.join(part_dir_name(next.saturating_sub(1)))).unwrap();
+        // Just inside the window, unless that is past the limit.
+        let inside = (next + W - 1).min(MAX_NEXT_PART_ID - 1);
+        fs::create_dir_all(parts.join(part_dir_name(inside))).unwrap();
+        assert_eq!(highest_part_dir_id(&parts, next).unwrap(), Some(inside));
+        // At the window's edge (or at the limit) and above: ignored.
+        let _ = fs::remove_dir_all(parts.join(part_dir_name(inside)));
+        for edge in [next + W, next + W + 1, MAX_NEXT_PART_ID, u64::MAX] {
+            fs::create_dir_all(parts.join(part_dir_name(edge))).unwrap();
+        }
+        assert_eq!(
+            highest_part_dir_id(&parts, next).unwrap(),
+            Some(next.saturating_sub(1)),
+            "next_part_id {next}"
+        );
+    }
 }

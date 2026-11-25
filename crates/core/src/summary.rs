@@ -49,7 +49,8 @@ impl TraceSummary {
     /// - The trace ids must be equal, else [`Error::InvalidArgument`] and
     ///   `self` is unchanged.
     /// - `start_ns` is the minimum and `end_ns` the maximum.
-    /// - `span_count` and the token sums add, saturating.
+    /// - `span_count` and the token sums add, saturating; a negative token sum
+    ///   counts as 0.
     /// - `error` is the logical or.
     /// - `models` is the sorted distinct union.
     /// - `root_service` and `root_name` come from the summary that has a root
@@ -89,8 +90,17 @@ impl TraceSummary {
         self.end_ns = self.end_ns.max(other.end_ns);
         self.span_count = self.span_count.saturating_add(other.span_count);
         self.error |= other.error;
-        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        // A negative count in a column counts as 0 (see `SummaryBuilder`), so
+        // both sides are non-negative here and saturating addition is
+        // associative: the total does not depend on how spans were grouped.
+        self.input_tokens = self
+            .input_tokens
+            .max(0)
+            .saturating_add(other.input_tokens.max(0));
+        self.output_tokens = self
+            .output_tokens
+            .max(0)
+            .saturating_add(other.output_tokens.max(0));
         let models: BTreeSet<&String> = self.models.iter().chain(&other.models).collect();
         self.models = models.into_iter().cloned().collect();
         Ok(())
@@ -205,10 +215,16 @@ impl SummaryBuilder {
         acc.end_ns = acc.end_ns.max(s.end_ns);
         acc.span_count = acc.span_count.saturating_add(1);
         acc.error |= s.error_type.is_some() || s.status_code == STATUS_CODE_ERROR;
-        acc.input_tokens = acc.input_tokens.saturating_add(s.input_tokens.unwrap_or(0));
+        // A token count cannot be negative; one that is (written by another
+        // ingest path) counts as 0. With only non-negative terms saturating
+        // addition is associative, so the sums do not depend on which spans
+        // were summarised together.
+        acc.input_tokens = acc
+            .input_tokens
+            .saturating_add(s.input_tokens.unwrap_or(0).max(0));
         acc.output_tokens = acc
             .output_tokens
-            .saturating_add(s.output_tokens.unwrap_or(0));
+            .saturating_add(s.output_tokens.unwrap_or(0).max(0));
 
         if s.parent_span_id.is_none() {
             let cand = (s.name, s.service_name);
@@ -595,7 +611,18 @@ mod tests {
                 s.session_id = IDS[rng.random_range(0..4)];
                 s.user_id = IDS[rng.random_range(0..4)];
                 s.request_model = MODELS[rng.random_range(0..3)];
-                s.input_tokens = rng.random_bool(0.5).then(|| rng.random_range(0..9));
+                s.input_tokens = rng.random_bool(0.5).then(|| match rng.random_range(0..6) {
+                    0 => i64::MAX,
+                    1 => i64::MAX - rng.random_range(0..3),
+                    2 => -rng.random_range(1..9),
+                    3 => i64::MIN,
+                    _ => rng.random_range(0..9),
+                });
+                s.output_tokens = rng.random_bool(0.5).then(|| match rng.random_range(0..6) {
+                    0 => i64::MAX,
+                    1 => -1,
+                    _ => rng.random_range(0..9),
+                });
                 s.status_code = rng.random_range(0..3);
                 s
             })

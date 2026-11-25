@@ -13,7 +13,7 @@ mod file;
 mod state;
 mod store;
 
-pub use state::{Edit, MAX_NEXT_PART_ID, ManifestState};
+pub use state::{Edit, MAX_NEXT_PART_ID, ManifestState, PART_ID_LEFTOVER_WINDOW};
 pub use store::{
     Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id, unreferenced_part_dirs,
 };

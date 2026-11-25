@@ -49,9 +49,9 @@ pub struct TokenAgg {
     pub model: Option<String>,
     /// Number of spans.
     pub count: u64,
-    /// Sum of `input_tokens`, null counted as 0, saturating.
+    /// Sum of `input_tokens`, null or negative counted as 0, saturating.
     pub input_tokens: i64,
-    /// Sum of `output_tokens`, null counted as 0, saturating.
+    /// Sum of `output_tokens`, null or negative counted as 0, saturating.
     pub output_tokens: i64,
 }
 
@@ -397,8 +397,11 @@ impl Snapshot {
                     output_tokens: 0,
                 });
             e.count += 1;
-            e.input_tokens = e.input_tokens.saturating_add(input.unwrap_or(0));
-            e.output_tokens = e.output_tokens.saturating_add(output.unwrap_or(0));
+            // A negative count (written by another ingest path) counts as 0.
+            // With only non-negative terms saturating addition is
+            // associative, so the sums do not depend on flush timing.
+            e.input_tokens = e.input_tokens.saturating_add(input.unwrap_or(0).max(0));
+            e.output_tokens = e.output_tokens.saturating_add(output.unwrap_or(0).max(0));
         };
         let projection = [
             col::START_NS,

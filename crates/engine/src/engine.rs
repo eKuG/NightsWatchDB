@@ -89,7 +89,8 @@ pub type StageHook = Arc<dyn Fn(Stage) -> Result<()> + Send + Sync>;
 /// first change to `manifest/` and `parts/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stage {
-    /// Every check that can refuse the start has passed.
+    /// Every check that can refuse the start has passed, including a read of
+    /// every log record the replay will decode.
     OpenChecked,
     /// The first manifest version exists if the database is new, and part ids
     /// on disk are below `next_part_id`.
@@ -306,6 +307,34 @@ impl Drop for Handle {
     }
 }
 
+/// Decodes one log record (`[tag] + bytes`) into span batches, refusing with
+/// `Corrupt` what start-up cannot replay. Returns the batches and their
+/// memory size.
+fn decode_record(
+    decoders: &HashMap<u8, Arc<dyn RecordDecoder>>,
+    lsn: Lsn,
+    payload: &[u8],
+) -> Result<(Vec<RecordBatch>, usize)> {
+    let Some((&tag, body)) = payload.split_first() else {
+        return Err(Error::corrupt(format!("log record {lsn} is empty")));
+    };
+    let decoder = decoders
+        .get(&tag)
+        .ok_or_else(|| Error::corrupt(format!("log record {lsn} has unknown format tag {tag}")))?;
+    let batches = decoder.decode(body).map_err(|e| match e {
+        Error::Corrupt(m) => Error::corrupt(format!("log record {lsn}: {m}")),
+        other => Error::corrupt(format!("log record {lsn} does not decode: {other}")),
+    })?;
+    let mut bytes = 0;
+    for b in &batches {
+        SpanColumns::try_new(b).map_err(|e| {
+            Error::corrupt(format!("log record {lsn} decodes to a wrong table: {e}"))
+        })?;
+        bytes += b.get_array_memory_size();
+    }
+    Ok((batches, bytes))
+}
+
 fn sync_dir(dir: &Path) {
     // Best effort by design: the callers only use it to make a deletion
     // durable sooner, and a leftover is deleted again at the next start-up.
@@ -328,7 +357,10 @@ impl Engine {
     /// (never treating a missing manifest next to part directories as an
     /// empty database) and open every live part; open the log and check it
     /// reaches back to the manifest's position (`Corrupt` if it does not, or
-    /// if it ends below it, see [`EngineOptions::accept_lost_log`]); only
+    /// if it ends below it, see [`EngineOptions::accept_lost_log`]); read
+    /// every record to be replayed once and check it (`Corrupt` for an
+    /// unknown tag, a record that does not decode or decodes to the wrong
+    /// table, a gap in the numbers); only
     /// then create the first manifest version of a new database and make
     /// part ids unreusable; replay the log into the buffer; delete the part
     /// directories the manifest does not reference; and start the threads. A
@@ -446,6 +478,28 @@ impl Engine {
                 recovery.first_lsn
             )));
         }
+        // The replay below can refuse too (an unknown tag, a record that does
+        // not decode, a gap), and by then the disk would have changed. Read
+        // every record once first and check what the replay would check; a
+        // record's batches are dropped at once.
+        let expected = recovery.last_lsn.saturating_sub(flushed);
+        let mut next = flushed + 1;
+        let checked = wal.replay(flushed + 1, |lsn, payload| {
+            decode_record(&decoder_map, lsn, payload)?;
+            if lsn != next {
+                return Err(Error::corrupt(format!(
+                    "log record {lsn} follows {}",
+                    next - 1
+                )));
+            }
+            next += 1;
+            Ok(())
+        })?;
+        if checked != expected {
+            return Err(Error::corrupt(format!(
+                "the log holds {checked} records after the manifest's position, expected {expected}"
+            )));
+        }
         run_hook(&options.stage_hook, Stage::OpenChecked)?;
 
         // 4. From here the disk changes. A new database gets its empty first
@@ -463,10 +517,11 @@ impl Engine {
                 m
             }
         };
-        // Part ids that exist on disk must never be handed out again. Ids the
-        // manifest could never have handed out are ignored by
-        // `highest_part_dir_id`.
-        if let Some(highest) = highest_part_dir_id(&parts_dir)?
+        // Part ids that exist on disk must never be handed out again. A
+        // directory far above `next_part_id` (see `PART_ID_LEFTOVER_WINDOW`)
+        // cannot be a leftover of this database and is ignored here; it is
+        // deleted with the other unreferenced directories after the replay.
+        if let Some(highest) = highest_part_dir_id(&parts_dir, manifest.current().next_part_id)?
             && let Some(next) = highest.checked_add(1)
             && next > manifest.current().next_part_id
         {
@@ -775,23 +830,7 @@ impl Inner {
     /// Start-up: decodes one log record into the buffer, flushing when the
     /// buffer is full.
     fn replay_record(&self, lsn: Lsn, payload: &[u8]) -> Result<()> {
-        let Some((&tag, body)) = payload.split_first() else {
-            return Err(Error::corrupt(format!("log record {lsn} is empty")));
-        };
-        let decoder = self.decoders.get(&tag).ok_or_else(|| {
-            Error::corrupt(format!("log record {lsn} has unknown format tag {tag}"))
-        })?;
-        let batches = decoder.decode(body).map_err(|e| match e {
-            Error::Corrupt(m) => Error::corrupt(format!("log record {lsn}: {m}")),
-            other => Error::corrupt(format!("log record {lsn} does not decode: {other}")),
-        })?;
-        let mut bytes = 0;
-        for b in &batches {
-            SpanColumns::try_new(b).map_err(|e| {
-                Error::corrupt(format!("log record {lsn} decodes to a wrong table: {e}"))
-            })?;
-            bytes += b.get_array_memory_size();
-        }
+        let (batches, bytes) = decode_record(&self.decoders, lsn, payload)?;
         let full = {
             let mut c = lock(&self.core);
             if lsn != c.applied_lsn + 1 {

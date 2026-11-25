@@ -47,8 +47,13 @@ fn reference_value(attrs: &[KeyValue], names: &[&str], int: bool) -> Option<Stri
         let v = last.value.as_ref().and_then(|v| v.value.as_ref());
         match v {
             Some(Value::StringValue(s)) if !int => Some(s.clone()),
-            Some(Value::StringValue(s)) => s.parse::<i64>().ok().map(|n| n.to_string()),
-            Some(Value::IntValue(n)) if int => Some(n.to_string()),
+            // A token count below zero is not usable.
+            Some(Value::StringValue(s)) => s
+                .parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0)
+                .map(|n| n.to_string()),
+            Some(Value::IntValue(n)) if int && *n >= 0 => Some(n.to_string()),
             _ => None,
         }
     })

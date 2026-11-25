@@ -11,6 +11,14 @@ pub(crate) const FORMAT_VERSION: u32 = 1;
 /// and refusing it keeps id arithmetic far from overflow.
 pub const MAX_NEXT_PART_ID: u64 = 1 << 62;
 
+/// How far above the manifest's `next_part_id` a part directory's id can be
+/// and still be a leftover of this database. Ids are handed out in order and
+/// only flushes that did not commit leave ids above `next_part_id`, so a
+/// leftover is within a few ids of it. A directory at or above
+/// `next_part_id + PART_ID_LEFTOVER_WINDOW` is a stray: it never raises
+/// `next_part_id` (that would use up the id space), it is only deleted.
+pub const PART_ID_LEFTOVER_WINDOW: u64 = 1 << 32;
+
 /// One immutable version of the manifest.
 ///
 /// Unknown fields are ignored when reading, so an older reader still loads a

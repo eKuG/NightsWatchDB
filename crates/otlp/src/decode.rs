@@ -197,11 +197,17 @@ impl<'a> Seen<'a> {
         })
     }
 
+    /// A token count: a negative number is not a usable value (a count
+    /// cannot be below zero, and sums of mixed signs depend on grouping), so
+    /// the next older name is tried. The attribute itself stays in `attrs`.
     fn count(&self, col: Col) -> Option<i64> {
-        self.first(col, |v| match v {
-            Val::Int(n) => Some(n),
-            Val::Str(s) => s.parse().ok(),
-            Val::Other => None,
+        self.first(col, |v| {
+            match v {
+                Val::Int(n) => Some(n),
+                Val::Str(s) => s.parse().ok(),
+                Val::Other => None,
+            }
+            .filter(|n| *n >= 0)
         })
     }
 }

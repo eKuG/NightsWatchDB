@@ -74,22 +74,42 @@ finishes before the next.
    `wal_flushed_lsn + 1` (empty or not) the records in between were
    acknowledged and are gone: `Corrupt`. A new database has nothing to
    refuse here.
-4. Only now: for a new database, create the manifest and commit an empty first
-   version (so a crash during the very first flush, parts on disk and no
-   manifest file, is not mistaken for a lost manifest). Then raise
+4. Check the records to be replayed. Read every record from
+   `wal_flushed_lsn + 1` once and check exactly what the replay would refuse:
+   not empty, a known tag, decodes, decodes to the span table, numbers
+   contiguous, the count as expected. Each record's batches are dropped at
+   once, so one record's worth of memory is held. Any failure is `Corrupt` and
+   nothing has changed. The stage `OpenChecked` is reached only after this
+   pass.
+5. Only now the disk changes. For a new database, create the manifest and commit
+   an empty first version (so a crash during the very first flush, parts on
+   disk and no manifest file, is not mistaken for a lost manifest). Then raise
    `next_part_id` above the highest part directory id (final or `.tmp`), so an
-   id that ever reached the disk is never handed out again. Ids at or near
-   `MAX_NEXT_PART_ID` were never handed out and are ignored here (checked
-   arithmetic); such a directory is an ordinary unreferenced one.
-5. Replay from `wal_flushed_lsn + 1`; each record is `[tag] + bytes`. An empty
-   record, an unknown tag, a decode failure, a decoded batch without the span
-   schema, or a gap in the numbers is `Corrupt`. While replaying, the buffer is
-   flushed whenever it reaches `buffer_bytes`, so a long log needs no more
-   memory than a running engine; the log is not trimmed until it has been read.
-6. Only after the replay succeeded: delete the part directories the manifest
+   id that ever reached the disk is never handed out again. Only ids below
+   `next_part_id + PART_ID_LEFTOVER_WINDOW` (2^32) count: ids are handed out in
+   order and only flushes that did not commit leave ids above `next_part_id`,
+   so a leftover of this database is close above it. A directory at or above
+   that (and any id from `MAX_NEXT_PART_ID` up) is a stray: it never raises
+   `next_part_id`, because that would use up the id space and stop every later
+   flush; it is an ordinary unreferenced directory and is deleted in step 7.
+   The arithmetic is checked.
+6. Replay from `wal_flushed_lsn + 1`; each record is `[tag] + bytes`. The
+   checks of step 4 are made again as internal-error guards (the decoders are
+   deterministic, so they cannot refuse for those reasons). While replaying,
+   the buffer is flushed whenever it reaches `buffer_bytes`, so a long log
+   needs no more memory than a running engine; the log is not trimmed until it
+   has been read.
+7. Only after the replay succeeded: delete the part directories the manifest
    does not reference. One of them may be the only decoded copy of data whose
    log record no longer decodes, so it must outlive a refused replay.
-7. Start the threads and accept requests.
+8. Start the threads and accept requests.
+
+A refusal is a verdict on what is on disk: log, manifest or parts are damaged
+or missing, and the start changes nothing. The one exception is a failure
+while working, as opposed to a refusal: an I/O error or a full disk during a
+flush made by the replay can leave the start-up half done (some parts written,
+some manifest versions committed, the leftovers not yet deleted). That is a
+failure, not a refusal, and the next start continues from where it stopped.
 
 ## Threads
 
@@ -175,7 +195,8 @@ from the log. A panic in the stage hook after the commit is ignored.
 `EngineOptions::stage_hook` is a test facility, in the manner of the log's
 `sync_hook`: the engine calls it with a `Stage` at each of these points.
 
-- Start-up: `OpenChecked` (every refusing check passed, nothing changed yet),
+- Start-up: `OpenChecked` (every refusing check passed, including the read of
+  the records to replay; nothing changed yet),
   `IdsRaised`, `ReplayFinished`, `LeftoversDeleted`.
 - A flush: `FlushFrozen`, `PartWritten` (once per part), `AllPartsWritten`
   (before the commit), `Committed` (before publishing), `Published`
@@ -211,6 +232,10 @@ does not block, and is not blocked by, ingest or flush.
   and one summary row-group read per extra part that holds the trace;
   candidates' summaries are held in memory, and the buffer is summarised on
   every call.
+- Token sums: a negative count in a column (possible from another ingest
+  path; the OTLP door never stores one) counts as 0, so every term is
+  non-negative and saturating addition gives the same total however the spans
+  were grouped by flushes.
 - `aggregate_tokens`: a pruned scan of five columns per part, and the buffers
   (frozen and active together, as one set) grouped by `group_traces`, the same
   routine `list_traces` uses, so a span id seen twice for one trace in the
@@ -278,8 +303,10 @@ from `FlushFrozen` to `Trimmed` through the stage hook. Two kinds of test run it
   start-up stages are run on a directory with leftovers and a log to replay,
   with a buffer small enough that the replay flushes.
 
-`tests/startup_safety.rs` checks that every refusal leaves the directory byte
-for byte as it was and that restoring the lost files lets it open;
+`tests/startup_safety.rs` and `tests/regressions_second_review.rs` check that
+every refusal, including each kind of refused replay with a buffer so small
+that the replay would flush after every record, leaves the directory byte for
+byte as it was and that restoring what was lost lets it open;
 `tests/injected.rs` injects errors and panics through the hook;
 `tests/shutdown_races.rs` runs `flush`, `ingest` and two `shutdown` calls at
 once.
