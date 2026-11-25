@@ -10,7 +10,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use nwdb_core::{Error, SpanColumns, SpanRecord, TraceId, TraceSummary};
 use nwdb_engine::{AggQuery, Engine, ListQuery};
-use nwdb_otlp::{attrs_to_json, encode_spans, events_to_json, links_to_json, resource_to_json};
+use nwdb_otlp::{
+    attrs_to_json, encode_spans, events_to_json, links_to_json, resource_to_json, scope_to_json,
+};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -281,6 +283,8 @@ fn span_json(r: &SpanRecord<'_>) -> nwdb_core::Result<Value> {
         ("service_name", r.service_name),
         ("scope_name", r.scope_name),
         ("scope_version", r.scope_version),
+        ("resource_schema_url", r.resource_schema_url),
+        ("scope_schema_url", r.scope_schema_url),
         ("operation", r.operation),
         ("provider", r.provider),
         ("request_model", r.request_model),
@@ -317,6 +321,14 @@ fn span_json(r: &SpanRecord<'_>) -> nwdb_core::Result<Value> {
     }
     if let Some(res) = r.resource {
         put("resource", resource_to_json(res)?);
+    }
+    if let Some(scope) = r.scope {
+        // Most scopes carry a name and a version only; those are already
+        // fields of their own.
+        let attributes = scope_to_json(scope)?;
+        if attributes.as_object().is_some_and(|a| !a.is_empty()) {
+            put("scope_attributes", attributes);
+        }
     }
     put("attributes", attrs_to_json(r.attrs)?);
     if let Some(e) = r.events {

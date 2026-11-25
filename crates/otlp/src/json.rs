@@ -40,7 +40,15 @@ pub fn attrs_to_json(column: &[u8]) -> Result<Value> {
 /// The `resource` column (a `Resource` message) as an object of its
 /// attributes.
 pub fn resource_to_json(resource: &[u8]) -> Result<Value> {
-    resource_attributes(resource)
+    message_attributes(resource, 1, "resource")
+        .map(Value::Object)
+        .map_err(Into::into)
+}
+
+/// The `scope` column (an `InstrumentationScope` message) as an object of
+/// its attributes.
+pub fn scope_to_json(scope: &[u8]) -> Result<Value> {
+    message_attributes(scope, 3, "scope")
         .map(Value::Object)
         .map_err(Into::into)
 }
@@ -68,17 +76,17 @@ pub fn links_to_json(column: &[u8]) -> Result<Value> {
     Ok(Value::Array(out))
 }
 
-fn resource_attributes(resource: &[u8]) -> R<Map<String, Value>> {
+/// The attributes of a message that keeps them as repeated `KeyValue` in
+/// field number `field`: 1 for `Resource`, 3 for `InstrumentationScope`.
+fn message_attributes(msg: &[u8], field: u32, what: &'static str) -> R<Map<String, Value>> {
     let mut map = Map::new();
-    let mut c = Cur::new(resource);
-    while let Some((n, w)) = c.next_field().at("resource")? {
-        if n == 1 {
-            let kv = c.expect_len(w).at("attributes").at("resource")?;
-            put_key_value(&mut map, kv, 0)
-                .at("attributes")
-                .at("resource")?;
+    let mut c = Cur::new(msg);
+    while let Some((n, w)) = c.next_field().at(what)? {
+        if n == field {
+            let kv = c.expect_len(w).at("attributes").at(what)?;
+            put_key_value(&mut map, kv, 0).at("attributes").at(what)?;
         } else {
-            c.skip(w).at("resource")?;
+            c.skip(w).at(what)?;
         }
     }
     Ok(map)
@@ -243,7 +251,7 @@ fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{
-        AnyValue, ArrayValue, KeyValue, KeyValueList, any_value::Value as V,
+        AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value::Value as V,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
@@ -407,6 +415,16 @@ mod tests {
                 resource_to_json(&res.encode_to_vec()).unwrap(),
                 reference_object(&kvs)
             );
+            let scope = InstrumentationScope {
+                name: "lib".into(),
+                version: "1".into(),
+                attributes: kvs.clone(),
+                dropped_attributes_count: 2,
+            };
+            assert_eq!(
+                scope_to_json(&scope.encode_to_vec()).unwrap(),
+                reference_object(&kvs)
+            );
 
             let events: Vec<Event> = (0..r.random_range(0..3))
                 .map(|_| Event {
@@ -463,6 +481,7 @@ mod tests {
         assert_eq!(attrs_to_json(&prefixed(&kvs)).unwrap(), json!({"a": 2}));
         assert_eq!(attrs_to_json(&[]).unwrap(), json!({}));
         assert_eq!(resource_to_json(&[]).unwrap(), json!({}));
+        assert_eq!(scope_to_json(&[]).unwrap(), json!({}));
         assert_eq!(events_to_json(&[]).unwrap(), json!([]));
         assert_eq!(links_to_json(&[]).unwrap(), json!([]));
     }

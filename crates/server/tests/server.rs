@@ -318,12 +318,13 @@ fn full_request(start: u64) -> Vec<u8> {
                 scope: Some(InstrumentationScope {
                     name: "scope".into(),
                     version: "1.2".into(),
+                    attributes: vec![kv("scope.flavour", V::StringValue("plain".into()))],
                     ..Default::default()
                 }),
                 spans: vec![full_span(start)],
-                schema_url: String::new(),
+                schema_url: "https://example.test/scope/1.2".into(),
             }],
-            schema_url: String::new(),
+            schema_url: "https://example.test/resource/1.2".into(),
         }],
     }
     .encode_to_vec()
@@ -343,6 +344,9 @@ fn full_span_json(start: u64) -> Value {
         "service_name": "svc",
         "scope_name": "scope",
         "scope_version": "1.2",
+        "resource_schema_url": "https://example.test/resource/1.2",
+        "scope_schema_url": "https://example.test/scope/1.2",
+        "scope_attributes": {"scope.flavour": "plain"},
         "operation": "chat",
         "request_model": "m1",
         "input_tokens": 10,

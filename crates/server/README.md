@@ -123,11 +123,13 @@ curl http://127.0.0.1:4320/api/v1/traces/0af7651916cd43dd8448eb211c80319c
 
 A span has `span_id`, `parent_span_id`, `name`, `kind`, `start_ns`, `end_ns`,
 `status_code`, `status_message`, `trace_state`, `service_name`, `scope_name`,
-`scope_version`, the promoted columns (`operation`, `provider`,
+`scope_version`, `resource_schema_url`, `scope_schema_url`, the promoted
+columns (`operation`, `provider`,
 `request_model`, `response_model`, `input_tokens`, `output_tokens`,
 `conversation_id`, `session_id`, `user_id`, `agent_name`, `tool_name`,
 `error_type`), `flags` and the three `dropped_*_count` fields when not zero,
-and `resource` and `attributes` (objects), `events` and `links` (arrays).
+and `resource` and `attributes` (objects), `scope_attributes` (object, only
+when the scope has attributes), `events` and `links` (arrays).
 Attribute values map as follows: strings, bools and ints as themselves;
 doubles as numbers, with NaN and the infinities as the strings `"NaN"`,
 `"Infinity"`, `"-Infinity"`; arrays as arrays; key-value lists as objects;

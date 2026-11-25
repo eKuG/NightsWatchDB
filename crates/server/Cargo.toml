@@ -22,16 +22,15 @@ nwdb-otlp = { path = "../otlp" }
 nwdb-wal = { path = "../wal" }
 arrow-array.workspace = true
 serde_json.workspace = true
-bytes = "=1.12.2"
-tonic = { version = "=0.14.9", default-features = false, features = ["server", "router", "codegen", "transport", "gzip", "zstd"] }
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
-# The version tonic already depends on, so the build has one copy of it.
-axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+bytes.workspace = true
+tonic = { workspace = true, features = ["server", "router", "codegen", "transport", "gzip", "zstd"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+axum = { workspace = true, features = ["http1", "tokio"] }
 
 [dev-dependencies]
-tempfile = "=3.27.0"
-prost = "=0.14.6"
-opentelemetry-proto = { version = "=0.33.1", default-features = false, features = ["gen-tonic-messages", "trace"] }
+tempfile.workspace = true
+prost.workspace = true
+opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
 
 [lints]
 workspace = true
