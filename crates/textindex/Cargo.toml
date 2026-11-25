@@ -1,0 +1,19 @@
+[package]
+name = "nwdb-textindex"
+description = "Inverted text index for NightsWatchDB: tokeniser, index builder and reader, query model, and a compact store of id lists"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nwdb-core = { path = "../core" }
+crc32c.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[lints]
+workspace = true

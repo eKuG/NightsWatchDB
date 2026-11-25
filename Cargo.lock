@@ -851,6 +851,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nwdb-textindex"
+version = "0.0.1"
+dependencies = [
+ "crc32c",
+ "nwdb-core",
+ "rand",
+]
+
+[[package]]
 name = "nwdb-wal"
 version = "0.0.1"
 dependencies = [
