@@ -24,6 +24,7 @@ fn part(id: u64) -> PartMeta {
         files: BTreeMap::from([("spans.parquet".to_string(), id.wrapping_mul(10))]),
         created_unix_ms: 1_700_000_000_000,
         format_version: 1,
+        payload: Default::default(),
     }
 }
 
@@ -105,7 +106,9 @@ fn known_answer_file_content_and_unknown_fields() {
         r#"{"format_version":1,"version":3,"next_part_id":8,"wal_flushed_lsn":77,"#,
         r#""parts":[{"part_id":7,"level":0,"window_start_ns":0,"window_ns":900000000000,"#,
         r#""rows":7,"traces":1,"min_start_ns":1,"max_end_ns":2,"files":{"spans.parquet":70},"#,
-        r#""created_unix_ms":1700000000000,"format_version":1}],"created_unix_ms":1700000000123}"#,
+        r#""created_unix_ms":1700000000000,"format_version":1,"#,
+        r#""payload":{"pieces":0,"logical_bytes":0,"unique_bytes":0,"stored_bytes":0}}],"#,
+        r#""created_unix_ms":1700000000123}"#,
     );
     let bytes = state.encode().unwrap();
     let text = String::from_utf8(bytes.clone()).unwrap();
@@ -115,7 +118,7 @@ fn known_answer_file_content_and_unknown_fields() {
         rest,
         format!("crc32c:{:08x}\n", crc32c_reference(json.as_bytes()))
     );
-    assert_eq!(rest, "crc32c:06d79320\n");
+    assert_eq!(rest, "crc32c:4ecb416e\n");
     assert_eq!(ManifestState::decode("x", &bytes).unwrap(), state);
 
     // A newer writer's extra field is ignored, as long as the checksum

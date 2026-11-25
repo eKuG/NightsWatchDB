@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use nwdb_core::{
-    BatchLimits, DEFAULT_WINDOW_NS, Error, RecordDecoder, Result, SpanColumns, TraceId,
-    TraceSummary,
+    BatchLimits, DEFAULT_WINDOW_NS, Error, PayloadSplitter, RecordDecoder, Result, SpanColumns,
+    TraceId, TraceSummary,
 };
 use nwdb_manifest::{
     Edit, Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id,
@@ -70,6 +70,14 @@ pub struct EngineOptions {
     /// above the position and carries on, **accepting that loss**. A new
     /// database is never refused. Default false.
     pub accept_lost_log: bool,
+    /// Decides which text of the raw columns a part stores once in its piece
+    /// store instead of in every row that holds it (see
+    /// [`PayloadSplitter`]). `None` stores every value inline. Default
+    /// `None`; the server sets the OTLP splitter.
+    pub splitter: Option<Arc<dyn PayloadSplitter>>,
+    /// How many bytes of recent piece blocks a flush keeps in memory to
+    /// recognise repeated text, per part being written. Default 64 MiB.
+    pub dedup_window_bytes: usize,
     /// A test facility, in the manner of the log's `sync_hook`: called at each
     /// [`Stage`] of start-up and of a flush. An error it returns at a stage
     /// before the manifest commit is handled exactly as if that step had
@@ -133,6 +141,8 @@ impl std::fmt::Debug for EngineOptions {
             .field("wal", &self.wal)
             .field("batch_limits", &self.batch_limits)
             .field("accept_lost_log", &self.accept_lost_log)
+            .field("splitter", &self.splitter.as_ref().map(|_| "<splitter>"))
+            .field("dedup_window_bytes", &self.dedup_window_bytes)
             .field("stage_hook", &self.stage_hook.as_ref().map(|_| "<hook>"))
             .finish()
     }
@@ -154,6 +164,8 @@ impl EngineOptions {
             wal: WalOptions::default(),
             batch_limits: BatchLimits::DEFAULT,
             accept_lost_log: false,
+            splitter: None,
+            dedup_window_bytes: nwdb_segment::DEFAULT_DEDUP_WINDOW_BYTES,
             stage_hook: None,
         }
     }
@@ -184,6 +196,12 @@ pub struct EngineStats {
     pub fatal: bool,
     /// The most recent error from a flush, the log or trimming, if any.
     pub last_error: Option<String>,
+    /// Bytes of large text the live parts' rows refer to, counting each use:
+    /// what storing it inside every row would take.
+    pub payload_logical_bytes: u64,
+    /// Bytes the live parts' piece stores take on disk, compressed. The
+    /// distance from `payload_logical_bytes` is what sharing saves.
+    pub payload_stored_bytes: u64,
 }
 
 /// A live part: its metadata and an open reader.
@@ -765,6 +783,18 @@ impl Engine {
             flushing: c.flushing,
             fatal: c.fatal.is_some(),
             last_error: c.last_error.clone(),
+            payload_logical_bytes: c
+                .vis
+                .parts
+                .iter()
+                .map(|p| p.meta.payload.logical_bytes)
+                .sum(),
+            payload_stored_bytes: c
+                .vis
+                .parts
+                .iter()
+                .map(|p| p.meta.payload.stored_bytes)
+                .sum(),
         }
     }
 

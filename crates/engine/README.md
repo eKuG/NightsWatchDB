@@ -150,7 +150,14 @@ runs on a separate thread rather than joining itself.
    trace's window is `window_start` of its earliest span in this buffer.
 3. **Write parts.** Reserve fresh part ids from the manifest. For each window
    write one part through `PartWriter` in `parts/<id>.tmp`, which syncs and
-   renames it to `parts/<id>`. Open a `PartReader` for it.
+   renames it to `parts/<id>`. Open a `PartReader` for it. The part writer is
+   given `EngineOptions::splitter` and `EngineOptions::dedup_window_bytes`:
+   with a splitter, the large text of the raw columns is cut out of the rows
+   and stored once per part in the part's piece store (see `nwdb-segment` and
+   `nwdb-payload`); without one every value stays in its row. Either way a read
+   returns the original bytes, so nothing else here depends on it. The memory
+   of a flush is the buffer being written plus, for the part being written,
+   its row group and its de-duplication window (64 MiB by default).
 4. **Commit.** One manifest commit adds all the parts and sets
    `wal_flushed_lsn` to the frozen position.
 5. **Publish.** Under the core lock, replace the part list and clear the frozen
@@ -189,6 +196,16 @@ A panic while writing or committing (after the freeze) is caught and treated
 as `Fatal`: the frozen buffer stays visible, no later flush can freeze over it
 and commit a position that covers records not in a part, and a restart recovers
 from the log. A panic in the stage hook after the commit is ignored.
+
+## Stored text
+
+`EngineStats::payload_logical_bytes` and `payload_stored_bytes` are the sums,
+over the live parts, of what the parts' rows refer to in their piece stores
+counting every use, and of what the piece stores take on disk, compressed. They
+come from the part's `PartMeta::payload`, which the manifest records, so they
+survive a restart. Text still in the buffer is in neither: it is stored once it
+is flushed. The distance between the two numbers is what sharing and
+compression save.
 
 ## Stage hook
 

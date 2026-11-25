@@ -18,6 +18,7 @@ dependencies = [
  "const-random",
  "getrandom 0.4.3",
  "once_cell",
+ "serde",
  "version_check",
  "zerocopy",
 ]
@@ -829,10 +830,25 @@ version = "0.0.1"
 dependencies = [
  "arrow-array",
  "nwdb-core",
+ "nwdb-payload",
+ "nwdb-segment",
  "opentelemetry-proto",
  "prost",
  "rand",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "nwdb-payload"
+version = "0.0.1"
+dependencies = [
+ "ahash",
+ "crc32c",
+ "nwdb-core",
+ "rand",
+ "tempfile",
+ "zstd",
 ]
 
 [[package]]
@@ -845,6 +861,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "nwdb-core",
+ "nwdb-payload",
  "parquet",
  "rand",
  "tempfile",

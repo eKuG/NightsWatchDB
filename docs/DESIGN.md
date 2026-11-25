@@ -67,7 +67,7 @@ unaffected.
     spans.parquet            span rows; a trace's spans are adjacent
     traces.idx               trace id -> row range, for one-lookup trace open
     summary.parquet          one row per trace, in start-time order
-    payload.*                large text, each distinct piece stored once
+    pieces.blk, pieces.idx   large text, each distinct piece stored once
     text.*                   inverted index over the distinct pieces
 ```
 

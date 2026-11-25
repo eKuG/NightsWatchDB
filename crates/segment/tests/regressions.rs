@@ -136,7 +136,13 @@ fn damaged_parquet_bytes_never_panic() {
                 let scratch = tempfile::tempdir().unwrap();
                 let dir = scratch.path().join("p");
                 std::fs::create_dir(&dir).unwrap();
-                for f in [SPANS_FILE, SUMMARY_FILE, "traces.idx"] {
+                for f in [
+                    SPANS_FILE,
+                    SUMMARY_FILE,
+                    "traces.idx",
+                    "pieces.blk",
+                    "pieces.idx",
+                ] {
                     std::fs::copy(good.join(f), dir.join(f)).unwrap();
                 }
                 let mut bytes = original.clone();
@@ -181,7 +187,13 @@ fn write_simple(
 
 fn copy_dir(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
-    for f in [SPANS_FILE, SUMMARY_FILE, INDEX_FILE] {
+    for f in [
+        SPANS_FILE,
+        SUMMARY_FILE,
+        INDEX_FILE,
+        "pieces.blk",
+        "pieces.idx",
+    ] {
         std::fs::copy(src.join(f), dst.join(f)).unwrap();
     }
 }

@@ -1,14 +1,16 @@
 //! Writing one part.
 
 use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
-use crate::{SPANS_FILE, SUMMARY_FILE};
+use crate::{PIECES_BLK, PIECES_IDX, SPANS_FILE, SUMMARY_FILE};
+use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
 use nwdb_core::{
-    Error, PartMeta, Result, SpanColumns, SummaryBatchBuilder, SummaryBuilder, TraceId,
-    TraceSummary, part_dir_name, span_schema, summary_schema,
+    Error, PartMeta, PayloadSplitter, RawColumn, Result, SpanColumns, SummaryBatchBuilder,
+    SummaryBuilder, TraceId, TraceSummary, col, part_dir_name, span_schema, summary_schema,
 };
+use nwdb_payload::{MAX_PIECE_BYTES, PieceWriter, PieceWriterOptions, rope};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -27,8 +29,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// the Parquet files, their types or order, or the meaning of the raw
 /// encodings in them. Version 2 added the length and CRC-32C of both Parquet
 /// files to `traces.idx`; version 3 made the origin columns dictionary
-/// columns.
-pub const FORMAT_VERSION: u32 = 3;
+/// columns; version 4 stores `attrs`, `events` and `links` as ropes and adds
+/// the piece store, `pieces.blk` and `pieces.idx`, whose length and CRC-32C
+/// are in `traces.idx` too.
+pub const FORMAT_VERSION: u32 = 4;
+
+/// The default for [`WriterOptions::dedup_window_bytes`]: 64 MiB.
+pub const DEFAULT_DEDUP_WINDOW_BYTES: usize = 64 << 20;
+
+/// The default for [`WriterOptions::piece_block_bytes`]: 1 MiB.
+pub const DEFAULT_PIECE_BLOCK_BYTES: usize = 1 << 20;
 
 /// Refuses a part written with another format version, saying so plainly.
 /// There is no migration: the project has had no release, so parts written by
@@ -62,7 +72,7 @@ const IO_BUFFER: usize = 1 << 20;
 
 /// Tuning of how a part is written. The defaults are the production values;
 /// smaller ones exist so tests can produce many row groups cheaply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct WriterOptions {
     /// A span row group is closed at this many rows. Default 16,384.
     pub row_group_rows: usize,
@@ -74,6 +84,31 @@ pub struct WriterOptions {
     pub row_group_bytes: usize,
     /// A summary row group is closed at this many rows. Default 16,384.
     pub summary_row_group_rows: usize,
+    /// Decides which bytes of `attrs`, `events` and `links` are stored once in
+    /// the piece store instead of in the row. `None` stores every value
+    /// inline. Default `None`.
+    pub splitter: Option<Arc<dyn PayloadSplitter>>,
+    /// How many uncompressed bytes of recent piece blocks the writer keeps in
+    /// memory to recognise repeated pieces (see
+    /// [`PieceWriterOptions::dedup_window_bytes`]). Default 64 MiB. A smaller
+    /// window never loses data; a repeat that falls outside it is stored
+    /// again.
+    pub dedup_window_bytes: usize,
+    /// Uncompressed size at which a piece block is closed. Default 1 MiB.
+    pub piece_block_bytes: usize,
+}
+
+impl std::fmt::Debug for WriterOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterOptions")
+            .field("row_group_rows", &self.row_group_rows)
+            .field("row_group_bytes", &self.row_group_bytes)
+            .field("summary_row_group_rows", &self.summary_row_group_rows)
+            .field("splitter", &self.splitter.as_ref().map(|_| "<splitter>"))
+            .field("dedup_window_bytes", &self.dedup_window_bytes)
+            .field("piece_block_bytes", &self.piece_block_bytes)
+            .finish()
+    }
 }
 
 impl Default for WriterOptions {
@@ -82,13 +117,19 @@ impl Default for WriterOptions {
             row_group_rows: 16_384,
             row_group_bytes: 64 * 1024 * 1024,
             summary_row_group_rows: 16_384,
+            splitter: None,
+            dedup_window_bytes: DEFAULT_DEDUP_WINDOW_BYTES,
+            piece_block_bytes: DEFAULT_PIECE_BLOCK_BYTES,
         }
     }
 }
 
 impl WriterOptions {
     fn validate(&self) -> Result<()> {
-        if self.row_group_rows == 0 || self.row_group_bytes == 0 || self.summary_row_group_rows == 0
+        if self.row_group_rows == 0
+            || self.row_group_bytes == 0
+            || self.summary_row_group_rows == 0
+            || self.piece_block_bytes == 0
         {
             return Err(Error::invalid_argument(
                 "writer options must all be greater than zero",
@@ -214,14 +255,17 @@ struct Current {
     rows: u64,
 }
 
-/// Writes one immutable part: `spans.parquet`, `traces.idx` and
-/// `summary.parquet` in a directory that appears under its final name only
-/// when [`finish`](Self::finish) has made all three durable.
+/// Writes one immutable part: `spans.parquet`, `traces.idx`, `summary.parquet`,
+/// `pieces.blk` and `pieces.idx` in a directory that appears under its final
+/// name only when [`finish`](Self::finish) has made all of them durable.
 ///
 /// Memory use while writing is the Parquet writer's row group (at most
-/// [`WriterOptions::row_group_bytes`] of values, plus one row) plus one
-/// [`TraceEntry`] and one [`TraceSummary`] per trace so far. It does not grow
-/// with the number of spans.
+/// [`WriterOptions::row_group_bytes`] of stored value bytes, plus one row), the
+/// de-duplication window ([`WriterOptions::dedup_window_bytes`]) with the open
+/// piece block and the hash map over its pieces, the piece table (12 bytes per
+/// distinct piece), and one [`TraceEntry`] and one [`TraceSummary`] per trace
+/// so far. It does not grow with the number of spans or with the amount of
+/// unique text.
 ///
 /// Dropping a writer that was not finished removes the temporary directory.
 pub struct PartWriter {
@@ -233,6 +277,7 @@ pub struct PartWriter {
     options: WriterOptions,
 
     spans: Option<FileWriter>,
+    sink: Option<PayloadSink>,
     spans_file: Arc<File>,
     spans_digest: Arc<Digest>,
     /// Rows and value bytes in the span row group being filled.
@@ -310,6 +355,13 @@ impl PartWriter {
                 return Err(e);
             }
         };
+        let sink = match PayloadSink::create(&tmp_dir, &options) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&tmp_dir);
+                return Err(e);
+            }
+        };
         Ok(Self {
             tmp_dir,
             final_dir,
@@ -318,6 +370,7 @@ impl PartWriter {
             window_ns,
             options,
             spans: Some(spans),
+            sink: Some(sink),
             spans_file,
             spans_digest,
             group_rows: 0,
@@ -426,8 +479,12 @@ impl PartWriter {
     /// Hands rows to the Parquet writer in pieces that close each row group
     /// at the row or byte bound.
     fn write_rows(&mut self, batch: &RecordBatch) -> Result<()> {
+        // The raw columns become ropes first, so that the row group bound
+        // counts what is stored.
+        let stored = self.sink.as_mut().expect("writer is open").store(batch)?;
+        let batch = &stored;
         let row_bytes = row_value_bytes(batch);
-        let options = self.options;
+        let options = self.options.clone();
         let spans = self.spans.as_mut().expect("writer is open");
         let mut start = 0;
         while start < row_bytes.len() {
@@ -505,9 +562,20 @@ impl PartWriter {
         spans.close().map_err(pq)?;
         self.spans_file.sync_all()?;
 
+        let store = self.sink.take().expect("writer is open").pieces.finish()?;
         let spans_sum = self.spans_digest.get();
         let summary_sum = self.write_summary()?;
-        for (name, sum) in [(SPANS_FILE, spans_sum), (SUMMARY_FILE, summary_sum)] {
+        let sum_of = |s: nwdb_payload::FileSum| FileChecksum {
+            len: s.len,
+            crc32c: s.crc32c,
+        };
+        let (blk_sum, idx_sum) = (sum_of(store.blocks), sum_of(store.index));
+        for (name, sum) in [
+            (SPANS_FILE, spans_sum),
+            (SUMMARY_FILE, summary_sum),
+            (PIECES_BLK, blk_sum),
+            (PIECES_IDX, idx_sum),
+        ] {
             let on_disk = fs::metadata(self.tmp_dir.join(name))?.len();
             if on_disk != sum.len {
                 return Err(Error::other(format!(
@@ -521,6 +589,8 @@ impl PartWriter {
         let checksums = FileChecksums {
             spans: spans_sum,
             summary: summary_sum,
+            pieces_blk: blk_sum,
+            pieces_idx: idx_sum,
         };
         write_synced(
             &self.tmp_dir.join(INDEX_FILE),
@@ -528,7 +598,7 @@ impl PartWriter {
         )?;
 
         let mut files = BTreeMap::new();
-        for name in [SPANS_FILE, INDEX_FILE, SUMMARY_FILE] {
+        for name in [SPANS_FILE, INDEX_FILE, SUMMARY_FILE, PIECES_BLK, PIECES_IDX] {
             files.insert(
                 name.to_string(),
                 fs::metadata(self.tmp_dir.join(name))?.len(),
@@ -572,6 +642,7 @@ impl PartWriter {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64),
             format_version: FORMAT_VERSION,
+            payload: store.totals,
         })
     }
 
@@ -606,6 +677,84 @@ impl Drop for PartWriter {
             // Best effort: the directory may already be gone.
             let _ = fs::remove_dir_all(&self.tmp_dir);
         }
+    }
+}
+
+/// The three raw columns, in schema terms.
+const RAW_COLUMNS: [(&str, RawColumn); 3] = [
+    (col::ATTRS, RawColumn::Attrs),
+    (col::EVENTS, RawColumn::Events),
+    (col::LINKS, RawColumn::Links),
+];
+
+/// Turns the raw columns of a batch into ropes, storing the cut-out pieces.
+struct PayloadSink {
+    splitter: Option<Arc<dyn PayloadSplitter>>,
+    pieces: PieceWriter,
+    cuts: Vec<Range<usize>>,
+    ids: Vec<u32>,
+    rope: Vec<u8>,
+}
+
+impl PayloadSink {
+    fn create(dir: &Path, options: &WriterOptions) -> Result<Self> {
+        Ok(Self {
+            splitter: options.splitter.clone(),
+            pieces: PieceWriter::create(
+                dir,
+                PieceWriterOptions {
+                    block_bytes: options.piece_block_bytes,
+                    dedup_window_bytes: options.dedup_window_bytes,
+                },
+            )?,
+            cuts: Vec::new(),
+            ids: Vec::new(),
+            rope: Vec::new(),
+        })
+    }
+
+    /// The batch with `attrs`, `events` and `links` replaced by their ropes.
+    fn store(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        for (name, raw) in RAW_COLUMNS {
+            let at = schema.index_of(name).map_err(Error::other)?;
+            let source = batch.column(at).as_binary::<i64>();
+            let mut out = LargeBinaryBuilder::with_capacity(source.len(), 0);
+            for row in 0..source.len() {
+                if source.is_null(row) {
+                    out.append_null();
+                    continue;
+                }
+                self.rope.clear();
+                self.encode(raw, source.value(row))?;
+                out.append_value(&self.rope);
+            }
+            columns[at] = Arc::new(out.finish());
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
+    }
+
+    /// Appends the rope of one value to `self.rope`. A splitter whose ranges
+    /// break the contract gets its value stored whole.
+    fn encode(&mut self, raw: RawColumn, value: &[u8]) -> Result<()> {
+        self.cuts.clear();
+        if let Some(splitter) = &self.splitter
+            && !value.is_empty()
+        {
+            splitter.cuts(raw, value, &mut self.cuts);
+            if !rope::cuts_are_valid(value.len(), &self.cuts)
+                || self.cuts.iter().any(|c| c.len() > MAX_PIECE_BYTES)
+            {
+                self.cuts.clear();
+            }
+        }
+        self.ids.clear();
+        for cut in &self.cuts {
+            self.ids.push(self.pieces.add(&value[cut.clone()])?);
+        }
+        rope::encode_cut(value, &self.cuts, &self.ids, &mut self.rope);
+        Ok(())
     }
 }
 
@@ -677,7 +826,7 @@ fn dictionary_value_bytes(values: &ArrayRef) -> u64 {
 /// Per-row sum of the lengths of every string and binary value, the same
 /// measure as [`BatchLimits`](nwdb_core::BatchLimits) uses: a dictionary
 /// column counts its 4-byte key in every row and its values once.
-fn row_value_bytes(batch: &RecordBatch) -> Vec<u64> {
+pub(crate) fn row_value_bytes(batch: &RecordBatch) -> Vec<u64> {
     fn add<O: Copy + Into<i64>>(out: &mut [u64], offsets: &[O]) {
         for (sum, w) in out.iter_mut().zip(offsets.windows(2)) {
             *sum += (w[1].into() - w[0].into()) as u64;

@@ -6,20 +6,26 @@ contiguous read.
 
 - `PartWriter` builds a part in `<parts dir>/<id>.tmp` and renames it to
   `<parts dir>/<id>` once every file is synced.
-- `PartReader` opens a finished part and keeps both Parquet files open. Reads
-  are positioned reads (`read_at`) that never use a shared file offset, so one
+- `PartReader` opens a finished part and keeps its files open. Reads are
+  positioned reads (`read_at`) that never use a shared file offset, so one
   reader can be shared by many threads, and on Unix it keeps reading after the
   part directory has been deleted (by compaction or retention).
+- Large text is not stored in the span rows. The raw columns `attrs`, `events`
+  and `links` hold *ropes* that refer to a piece store (`pieces.blk`,
+  `pieces.idx`, see `nwdb-payload`) in which each distinct piece of text is
+  stored once per part. Reads rebuild the original bytes, so what comes back is
+  exactly what was written.
 
 ## Files of a part
 
-All integers are little-endian. A part directory holds exactly these three
+All integers are little-endian. A part directory holds exactly these five
 files.
 
 ### `spans.parquet`
 
 One row per span with exactly `nwdb_core::span_schema()`, in the order the
-writer was given them. The spans of a trace are adjacent (the writer rejects
+writer was given them. The columns `attrs`, `events` and `links` hold ropes
+(see below) instead of the raw values. The spans of a trace are adjacent (the writer rejects
 input that interleaves traces), so a trace is a contiguous row range and
 repeated text between its spans compresses well.
 
@@ -32,19 +38,44 @@ Parquet settings:
 | Dictionary encoding | on, except off for `attrs`, `events` and `links` | `resource` and `scope` repeat heavily across spans; the other three are close to unique per row |
 | Offset index | on, for every column (also those without statistics) | lets a row selection skip pages; a test pins that `read_trace` does not fetch other traces' pages |
 | Bloom filters | off | the trace index replaces them |
-| Row group size | 16,384 rows or 64 MiB of value bytes, whichever first | rows range from 1 KB to several MB, so a row bound alone is unsafe; the row that crosses the byte bound stays in the group |
+| Row group size | 16,384 rows or 64 MiB of stored value bytes, whichever first | rows range from 1 KB to several MB, so a row bound alone is unsafe; the row that crosses the byte bound stays in the group; the rope of a raw value, not the value, is what is counted |
 | Data page size | 1 MiB | |
 | Data page rows | 4,096 | a trace lookup should not decode a page of tens of thousands of unrelated small rows |
 | Dictionary page | 1 MiB | |
 | Write batch | 256 values | the Parquet writer checks page limits between batches of this many values |
 
 Value bytes are the lengths of all string and binary values of a row, the
-measure `nwdb_core::BatchLimits` uses. The seven origin columns (`resource`,
+measure `nwdb_core::BatchLimits` uses; for the writer's row group bound the
+raw columns count as stored, that is as ropes. The seven origin columns (`resource`,
 `service_name`, `resource_schema_url`, `scope`, `scope_name`, `scope_version`,
 `scope_schema_url`) are Arrow dictionary columns, `Dictionary(Int32, Utf8)` or
 `Dictionary(Int32, LargeBinary)`. For the row group bound a row counts its
 4-byte key in each of them, and the values of a batch's dictionaries are
 counted once, on the first row of the batch.
+
+### Ropes and the piece store
+
+A raw value is stored as a *rope*: a sequence of segments, each inline bytes or
+a reference to a piece of the store. The encoding is documented in
+`nwdb-payload`: an empty value is zero bytes, a value with no cuts is `0x00`
+and the value, and a value with cuts is `0x01` followed by
+`varint(len << 1)` and inline bytes, or `varint(id << 1 | 1)` for piece `id`.
+A null `events` or `links` stays null. The cuts are made in the value's original
+bytes and nothing is re-encoded, so reading concatenates the segments and
+gets the original back byte for byte.
+
+Which bytes become pieces is decided by the `PayloadSplitter` in
+`WriterOptions::splitter` (`nwdb_otlp::OtlpSplitter` for OTLP); with none every
+value is stored inline, as a rope with no references. The writer checks the
+splitter's ranges (ascending, not overlapping, not empty, inside the value, no
+piece over 1 GiB) and stores a value whole if they break the contract.
+
+`pieces.blk` and `pieces.idx` are written by `nwdb_payload::PieceWriter` and
+described in that crate's README: blocks of about 1 MiB of uncompressed pieces,
+each compressed with zstd level 3, a block table and a piece table with its own
+magic, version and checksum, and exact de-duplication within a window of recent
+blocks. Both files exist in every part; a part with no pieces has an empty
+`pieces.blk` and a header-only `pieces.idx`.
 
 ### Dictionary columns in Parquet
 
@@ -89,29 +120,34 @@ them; a test pins this for 1 MiB values.
 ```
 offset  size   field
 0       4      magic "NWTI"
-4       4      version, u32 = 3, the part format version
+4       4      version, u32 = 4, the part format version
 8       8      trace count N, u64
 16      8      length of spans.parquet in bytes, u64
 24      4      CRC-32C of every byte of spans.parquet, u32
 28      8      length of summary.parquet in bytes, u64
 36      4      CRC-32C of every byte of summary.parquet, u32
-40      44*N   records, sorted by trace_id (bytes compared in order)
-40+44N  4      CRC-32C (Castagnoli) of every byte before it
+40      8      length of pieces.blk in bytes, u64
+48      4      CRC-32C of every byte of pieces.blk, u32
+52      8      length of pieces.idx in bytes, u64
+60      4      CRC-32C of every byte of pieces.idx, u32
+64      44*N   records, sorted by trace_id (bytes compared in order)
+64+44N  4      CRC-32C (Castagnoli) of every byte before it
 ```
 
 The version is the first thing checked when a part is opened, before the
 lengths, the checksum or the Parquet schema. An index with any other version
 is refused with an error that gives the version the part has and the one this
 build reads, and says that parts from development versions cannot be read.
-Version 2 had the same header with the origin columns stored plain; there is
-no migration, since the project has had no release.
+Versions 2 and 3 had shorter headers; there is no migration, since the project
+has had no release.
 
 Parquet 60.2.0 writes no page checksums and zstd's frame checksum is off, so
 damage that leaves the file structure intact would otherwise be returned as
 data. The writer therefore keeps a running length and CRC-32C of everything
-it writes to each Parquet file and records them here, once the files are
-complete (the summary is written before the index). `PartReader::open`
-checks the lengths; `PartReader::verify` checks the CRCs.
+it writes to each Parquet file and to the two piece files and records them
+here, once the files are complete (the piece store and the summary are written
+before the index). `PartReader::open` checks the lengths; `PartReader::verify`
+checks the CRCs and every block of the piece store.
 
 A record:
 
@@ -138,17 +174,35 @@ listing reads only the groups that overlap the range.
 ## Reading
 
 `PartReader::open` fails with `Error::Corrupt`, naming the file, when a file is
-missing, `traces.idx` fails a check, a Parquet file's length differs from the
-length recorded in a version 2 index, a file does not have the expected
-columns, the index's ranges do not match the number of rows, or the summary's
-row count differs from the trace count. It does not read the data pages.
+missing, `traces.idx` fails a check, the length of a file differs from the one
+recorded in the index, `pieces.idx` fails its own checks (magic, version,
+checksum, tables that do not fill the blocks), a Parquet file does not have the
+expected columns, the index's ranges do not match the number of rows, or the
+summary's row count differs from the trace count. It does not read the data
+pages or the blocks of the piece store.
 
-- `PartReader::verify` re-reads both Parquet files and compares their length
+- `PartReader::verify` re-reads all four data files and compares their length
   and CRC-32C with the recorded values (`Corrupt` naming the file on a
-  mismatch). It is meant for compaction and a future scrubber and is not
-  called on open. `spans_checksum()` and `summary_checksum()` return the
-  recorded values. Without `verify`, a damaged data page can still be returned
-  as data.
+  mismatch), and reads every block of the piece store. It is meant for
+  compaction and a future scrubber and is not called on open.
+  `spans_checksum()` and `summary_checksum()` return the recorded values.
+  Without `verify`, a damaged Parquet data page can still be returned as data;
+  a damaged piece block cannot, since a block's checksum is checked every
+  time it is decompressed.
+- A read whose projection includes none of `attrs`, `events` and `links` does
+  not touch the piece files at all (a test pins this: `payload_blocks_loaded()`
+  stays zero, and damaged blocks are not noticed). A read that includes one
+  rebuilds the original bytes of all the raw values it returns. The blocks it
+  decompresses are kept for the duration of one call (at most 32 MiB; a
+  `Scan` keeps them for the scan), so the pieces of one block cost one
+  decompression.
+- Because a rebuilt value can be thousands of times larger than its rope, the
+  reader measures every batch it reads from Parquet in rebuilt bytes (from the
+  piece lengths in the table, without reading any piece) and divides it so that
+  every returned batch respects `BatchLimits::DEFAULT` in rebuilt value bytes.
+  One row larger than the limit is a batch of its own. It then rebuilds one
+  returned batch at a time. This holds for `read_trace`, `read_rows` and
+  `scan`.
 - Every call into the Parquet library, at open and on every read including
   each `Scan::next`, runs inside `std::panic::catch_unwind`. A panic (the
   library asserts and unwraps on damaged files) becomes `Error::Corrupt`
@@ -177,9 +231,16 @@ row count differs from the trace count. It does not read the data pages.
 
 Traces must arrive contiguously, though a trace may continue across batches,
 and a trace that has ended must not come back (`Error::InvalidArgument`; the
-rejected batch is not written and the writer stays usable). Memory is one row
-group plus 44 bytes of index entry, a trace summary, and a 16-byte finished-id
-entry per trace. A part with no rows is refused, `window_ns` must be positive
+rejected batch is not written and the writer stays usable). `write` takes
+batches of raw values; for each row it asks the splitter for cuts, stores the
+pieces and writes the ropes. Memory is one row group of ropes (bounded in
+stored bytes), the de-duplication window (`WriterOptions::dedup_window_bytes`,
+default 64 MiB) with the open piece block and the map over its pieces, 16 bytes
+(12 on disk and 4 of chain) per distinct piece, plus 44 bytes of index entry, a
+trace summary, and a 16-byte finished-id entry per trace. It does not grow with
+the amount of unique text: a test writes 120 MiB of text that never repeats
+through a 4 MiB window and shows the peak resident memory stays within a few MiB
+of what 24 MiB of such text took. A part with no rows is refused, `window_ns` must be positive
 (`InvalidArgument`), and dropping an unfinished writer removes its temporary
 directory.
 
@@ -199,7 +260,7 @@ Failure rules for the caller:
 
 ## Format version
 
-`FORMAT_VERSION` (3) is recorded in `PartMeta.format_version`, which the
+`FORMAT_VERSION` (4) is recorded in `PartMeta.format_version`, which the
 manifest stores for every part, and in the header of `traces.idx`. The engine
 checks the manifest's value and `PartReader::open` the index's, both before
 looking at any Parquet file. It covers the columns of `spans.parquet` and
@@ -208,4 +269,5 @@ inside them (`attrs`, `events`, `links`, `resource`, `scope`), and the layout of
 `traces.idx`. It must be raised on any change to those. A part with another
 version is refused; there is no migration. History: 2 added the file lengths
 and checksums to the index; 3 made the seven origin columns dictionary
-columns.
+columns; 4 stores `attrs`, `events` and `links` as ropes, adds `pieces.blk` and
+`pieces.idx`, and records their lengths and checksums in the index header.

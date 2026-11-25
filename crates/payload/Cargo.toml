@@ -1,0 +1,22 @@
+[package]
+name = "nwdb-payload"
+description = "Large-text storage for NightsWatchDB parts: ropes, a JSON array scanner and a de-duplicating piece store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nwdb-core = { path = "../core" }
+ahash.workspace = true
+crc32c.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

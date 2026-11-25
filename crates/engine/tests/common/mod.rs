@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use nwdb_core::{
-    BatchLimits, Error, RecordDecoder, Result, SpanBatchBuilder, SpanColumns, SpanId, SpanRecord,
-    TraceId, TraceSummary,
+    BatchLimits, Error, PayloadSplitter, RawColumn, RecordDecoder, Result, SpanBatchBuilder,
+    SpanColumns, SpanId, SpanRecord, TraceId, TraceSummary,
 };
 use nwdb_engine::{AggQuery, Engine, EngineOptions, ListQuery, TokenAgg};
 use nwdb_wal::{SyncMode, WalOptions};
@@ -300,6 +300,22 @@ pub fn decoders() -> Vec<(u8, Arc<dyn RecordDecoder>)> {
     vec![(TAG, Arc::new(TestDecoder))]
 }
 
+/// The splitter the tests use: it cuts every raw value into pieces of up to
+/// 64 bytes, so repeated values share pieces and a restart, a flush or a crash
+/// has real pieces to lose or to keep.
+pub struct ChunkSplitter;
+
+impl PayloadSplitter for ChunkSplitter {
+    fn cuts(&self, _: RawColumn, value: &[u8], cuts: &mut Vec<std::ops::Range<usize>>) {
+        let mut at = 0;
+        while at < value.len() {
+            let end = (at + 64).min(value.len());
+            cuts.push(at..end);
+            at = end;
+        }
+    }
+}
+
 /// Options for tests: the log does not sync (a test that needs real syncs
 /// says so) and its group interval is short.
 pub fn opts(dir: &Path) -> EngineOptions {
@@ -314,6 +330,7 @@ pub fn opts(dir: &Path) -> EngineOptions {
     o.buffer_bytes = 1 << 30;
     o.max_buffered_bytes = 2 << 30;
     o.flush_interval = Duration::from_secs(3600);
+    o.splitter = Some(Arc::new(ChunkSplitter));
     o
 }
 

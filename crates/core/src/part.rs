@@ -1,3 +1,4 @@
+use crate::PayloadTotals;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -31,6 +32,10 @@ pub struct PartMeta {
     pub created_unix_ms: u64,
     /// Version of the part's file format.
     pub format_version: u32,
+    /// What the part's piece store holds. Absent in manifests written before
+    /// the store existed, where it reads as all zeros.
+    #[serde(default)]
+    pub payload: PayloadTotals,
 }
 
 /// Directory name of a part: the id zero-padded to 20 digits, the width of
@@ -59,6 +64,7 @@ mod tests {
             ]),
             created_unix_ms: 1_700_000_000_000,
             format_version: 1,
+            payload: PayloadTotals::default(),
         }
     }
 
@@ -80,6 +86,7 @@ mod tests {
                 "max_end_ns",
                 "min_start_ns",
                 "part_id",
+                "payload",
                 "rows",
                 "traces",
                 "window_ns",
@@ -93,6 +100,17 @@ mod tests {
         let mut v = serde_json::to_value(sample()).unwrap();
         v["added_by_a_newer_writer"] = serde_json::json!({"x": 1});
         assert_eq!(serde_json::from_value::<PartMeta>(v).unwrap(), sample());
+    }
+
+    #[test]
+    fn a_manifest_without_payload_totals_reads_as_zeros() {
+        let mut v = serde_json::to_value(sample()).unwrap();
+        v.as_object_mut().unwrap().remove("payload");
+        assert_eq!(serde_json::from_value::<PartMeta>(v).unwrap(), sample());
+        let mut m = sample();
+        m.payload.pieces = 3;
+        let back: PartMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.payload.pieces, 3);
     }
 
     #[test]

@@ -623,6 +623,8 @@ async fn list_and_token_endpoints_with_filters() {
         "flushes",
         "flushing",
         "last_error",
+        "payload_logical_bytes",
+        "payload_stored_bytes",
     ] {
         assert!(stats.get(k).is_some(), "stats lacks {k}");
     }
@@ -1214,4 +1216,109 @@ async fn a_fatal_error_in_a_background_flush_is_noticed() {
     assert!(r.json()["error"].is_string());
     assert_eq!(http(api, "/api/v1/stats").await.json()["fatal"], true);
     let _ = server.shutdown().await;
+}
+
+/// Text that looks like words and does not repeat by chance, from a small
+/// generator so that the test needs no random-number crate.
+fn words(seed: &mut u64, len: usize) -> String {
+    let mut out = String::with_capacity(len + 8);
+    while out.len() < len {
+        for _ in 0..4 {
+            *seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push(char::from(b'a' + ((*seed >> 33) % 26) as u8));
+        }
+        out.push(' ');
+    }
+    out.truncate(len);
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_growing_conversation_is_stored_once_and_reads_back_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = started(dir.path()).await;
+    let api = server.api_addr();
+    let ch = channel(server.otlp_grpc_addr()).await;
+    let start = now_ns() - 60_000_000_000;
+
+    // Every call re-sends the system prompt, the tool definitions and all
+    // earlier messages, and adds a user message, an answer and a tool result.
+    let mut seed = 42;
+    let system = words(&mut seed, 3_000);
+    let tools = format!(
+        "[{}]",
+        (0..5)
+            .map(|i| format!(
+                r#"{{"name":"tool_{i}","description":"{}"}}"#,
+                words(&mut seed, 800)
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut history: Vec<String> = Vec::new();
+    for call in 0..24u8 {
+        let msg = |role: &str, len: usize, seed: &mut u64| {
+            format!(r#"{{"role":"{role}","content":"{}"}}"#, words(seed, len))
+        };
+        history.push(msg("user", 1_200, &mut seed));
+        let mut span = llm_span(
+            0x77,
+            call + 1,
+            None,
+            start + u64::from(call),
+            "m",
+            "chat",
+            (1, 1),
+            false,
+        );
+        span.attributes.extend([
+            kv("gen_ai.system_instructions", V::StringValue(system.clone())),
+            kv("gen_ai.tool.definitions", V::StringValue(tools.clone())),
+            kv(
+                "gen_ai.input.messages",
+                V::StringValue(format!("[{}]", history.join(","))),
+            ),
+        ]);
+        history.push(msg("assistant", 1_500, &mut seed));
+        history.push(msg("tool", 4_000, &mut seed));
+        export(&ch, request("agent", vec![span]), None)
+            .await
+            .unwrap();
+    }
+
+    let path = format!("/api/v1/traces/{}", hex(&tid(0x77)));
+    let before = http(api, &path).await;
+    assert_eq!(before.status, 200);
+    // Nothing is flushed yet: no part, so no stored payload.
+    let stats = http(api, "/api/v1/stats").await.json();
+    assert_eq!(stats["payload_logical_bytes"], 0);
+    assert_eq!(stats["payload_stored_bytes"], 0);
+
+    server.engine().flush().unwrap();
+    let stats = http(api, "/api/v1/stats").await.json();
+    let logical = stats["payload_logical_bytes"].as_u64().unwrap();
+    let stored = stats["payload_stored_bytes"].as_u64().unwrap();
+    eprintln!("payload logical {logical} stored {stored}");
+    assert!(logical > 1_000_000, "{logical}");
+    assert!(stored > 0 && stored * 10 < logical, "{stored} of {logical}");
+    let after = http(api, &path).await;
+    assert_eq!(
+        after.body, before.body,
+        "the trace changed by being flushed"
+    );
+    server.shutdown().await.unwrap();
+
+    // The same bytes after a restart, from the part on disk.
+    let server = started(dir.path()).await;
+    let api = server.api_addr();
+    let restarted = http(api, &path).await;
+    assert_eq!(
+        restarted.body, before.body,
+        "the trace changed by a restart"
+    );
+    let stats = http(api, "/api/v1/stats").await.json();
+    assert_eq!(stats["payload_logical_bytes"].as_u64().unwrap(), logical);
+    server.shutdown().await.unwrap();
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::*;
 use nwdb_engine::{AggQuery, ListQuery};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 
 const SEED: u64 = 0x4e57_4442;
 const STEPS: usize = 200;
@@ -17,6 +17,9 @@ const TRACES: u128 = 40;
 const TIME: i64 = 8_000;
 
 struct Gen {
+    /// Large values that spans reuse, whole or in part, so that parts hold
+    /// repeated pieces.
+    docs: Vec<Vec<u8>>,
     next_span: u64,
     rooted: HashSet<u128>,
     /// The id each trace's spans mostly carry, so most traces agree.
@@ -71,7 +74,20 @@ impl Gen {
                 if rng.random_bool(0.05) {
                     s.error_type = Some("e".into());
                 }
-                s.attrs = vec![7; rng.random_range(0..64)];
+                // Mostly a prefix of one of a few large documents, sometimes
+                // with a tail of its own, sometimes small or empty.
+                s.attrs = match rng.random_range(0..10) {
+                    0 => Vec::new(),
+                    1 => vec![7; rng.random_range(1..64)],
+                    _ => {
+                        let doc = &self.docs[rng.random_range(0..self.docs.len())];
+                        let mut v = doc[..rng.random_range(1..=doc.len())].to_vec();
+                        if rng.random_bool(0.3) {
+                            v.extend(self.next_span.to_le_bytes().repeat(8));
+                        }
+                        v
+                    }
+                };
                 s
             })
             .collect()
@@ -112,6 +128,13 @@ fn random_operations_agree_with_the_model() {
     let (mut e, mut background) = open_random(dir.path(), &mut rng);
     let mut model = Model::default();
     let mut gen_ = Gen {
+        docs: (0..5)
+            .map(|_| {
+                let mut v = vec![0u8; rng.random_range(500..4_000)];
+                rng.fill_bytes(&mut v);
+                v
+            })
+            .collect(),
         next_span: 0,
         rooted: HashSet::new(),
         session: Default::default(),

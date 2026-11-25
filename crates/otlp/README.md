@@ -59,6 +59,39 @@ name with an unusable value does not hide a usable older one. If no name has a
 usable value the column is null. A key that occurs twice takes its last
 occurrence.
 
+## Large text: `OtlpSplitter`
+
+`OtlpSplitter` implements `nwdb_core::PayloadSplitter` for the raw columns. The
+part writer asks it which bytes of an `attrs`, `events` or `links` value to
+store once per part in the piece store instead of in the row. It walks the
+column with the forgiving reader (the one the JSON view uses), so it is total:
+on truncated, damaged or random bytes it stops at the first thing it cannot
+read, proposes cuts only for what it has read, and never panics. Its ranges
+are ascending, not overlapping, not empty and inside the value.
+
+It looks at every string and bytes value of an `AnyValue`, in a span's
+attributes, in the attributes of its events and in the attributes of its
+links, at any nesting depth up to `MAX_DEPTH` (64; deeper content stays
+inline). A value is a cut candidate when it is at least `min_bytes` long
+(default 256, `OtlpSplitter::new` sets another) or when it is not empty and sits
+under a content key. The content keys are the tables `CONTENT_KEYS` (the
+top-level attribute keys `gen_ai.input.messages`, `gen_ai.output.messages`,
+`gen_ai.system_instructions`, `gen_ai.tool.definitions`,
+`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`, `gen_ai.prompt`,
+`gen_ai.completion`, `input.value`, `output.value`) and `CONTENT_PREFIXES` (any
+key starting with `gen_ai.prompt.`, `gen_ai.completion.`, `llm.input_messages.`
+or `llm.output_messages.`), the same keys inside event and link attributes. A
+value nested inside the value of a content key (the messages of an array or a
+key-value list) is under that key; nested keys are not themselves matched.
+
+For a candidate whose bytes are one complete JSON array, each top-level
+element is a cut and the brackets, commas and whitespace between them stay
+inline (the scanner is `nwdb_payload::json_array_elements`); this is what lets
+a conversation that grows by one message per call share every message it has
+already sent. Otherwise the whole content of the string is one cut. The tag and
+length prefix of the string always stay inline. An empty array has no elements
+and so no cuts.
+
 ## Wire rules
 
 - Varints, 64-bit, length-delimited and 32-bit fields are walked directly;

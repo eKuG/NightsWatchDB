@@ -1,5 +1,5 @@
 //! The `traces.idx` file: trace id to row range, and the length and checksum
-//! of the part's two Parquet files.
+//! of the part's files other than itself.
 
 use nwdb_core::{Error, Result, TraceId};
 
@@ -11,12 +11,12 @@ const MAGIC: &[u8; 4] = b"NWTI";
 /// file of a part that is read before any other, so it is where an older part
 /// is recognised.
 const VERSION: u32 = crate::FORMAT_VERSION;
-const HEADER_LEN: usize = 4 + 4 + 8 + 2 * (8 + 4);
+const HEADER_LEN: usize = 4 + 4 + 8 + 4 * (8 + 4);
 const RECORD_LEN: usize = 44;
 const CRC_LEN: usize = 4;
 
-/// Length and CRC-32C (Castagnoli) of one Parquet file of a part, computed
-/// while the file was written.
+/// Length and CRC-32C (Castagnoli) of one file of a part, computed while the
+/// file was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileChecksum {
     /// Length of the file in bytes.
@@ -40,11 +40,13 @@ pub struct TraceEntry {
     pub end_ns: i64,
 }
 
-/// The checksums of the two Parquet files, in the order of the header.
+/// The checksums of the other files of the part, in the order of the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileChecksums {
     pub spans: FileChecksum,
     pub summary: FileChecksum,
+    pub pieces_blk: FileChecksum,
+    pub pieces_idx: FileChecksum,
 }
 
 /// What `traces.idx` holds.
@@ -60,7 +62,12 @@ pub(crate) fn encode(entries: &[TraceEntry], checksums: FileChecksums) -> Vec<u8
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-    for c in [checksums.spans, checksums.summary] {
+    for c in [
+        checksums.spans,
+        checksums.summary,
+        checksums.pieces_blk,
+        checksums.pieces_idx,
+    ] {
         out.extend_from_slice(&c.len.to_le_bytes());
         out.extend_from_slice(&c.crc32c.to_le_bytes());
     }
@@ -123,15 +130,15 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
     let le_u64 = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
     let le_i64 = |b: &[u8]| i64::from_le_bytes(b.try_into().expect("8 bytes"));
     let le_u32 = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes"));
+    let sum_at = |at: usize| FileChecksum {
+        len: le_u64(&body[at..at + 8]),
+        crc32c: le_u32(&body[at + 8..at + 12]),
+    };
     let checksums = FileChecksums {
-        spans: FileChecksum {
-            len: le_u64(&body[16..24]),
-            crc32c: le_u32(&body[24..28]),
-        },
-        summary: FileChecksum {
-            len: le_u64(&body[28..36]),
-            crc32c: le_u32(&body[36..40]),
-        },
+        spans: sum_at(16),
+        summary: sum_at(28),
+        pieces_blk: sum_at(40),
+        pieces_idx: sum_at(52),
     };
     let mut entries: Vec<TraceEntry> = Vec::with_capacity(count as usize);
     for r in body[header_len..].as_chunks::<RECORD_LEN>().0 {
@@ -173,13 +180,15 @@ mod tests {
             len: u64::MAX,
             crc32c: 7,
         },
+        pieces_blk: FileChecksum { len: 5, crc32c: 6 },
+        pieces_idx: FileChecksum { len: 8, crc32c: 9 },
     };
 
     #[test]
     fn round_trip() {
         let all: Vec<_> = (1..50).map(entry).collect();
         let bytes = encode(&all, SUMS);
-        assert_eq!(bytes.len(), 40 + 49 * 44 + 4);
+        assert_eq!(bytes.len(), 64 + 49 * 44 + 4);
         let got = decode(&bytes).unwrap();
         assert_eq!(got.entries, all);
         assert_eq!(got.checksums, SUMS);

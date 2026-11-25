@@ -19,6 +19,9 @@
 //! - The metadata record that describes one immutable part ([`PartMeta`]).
 //! - The interface between ingest doors and the engine for replaying the
 //!   write-ahead log ([`RecordDecoder`]).
+//! - The interface between the part writer and the OTLP crate for storing
+//!   large text out of line ([`PayloadSplitter`], [`RawColumn`],
+//!   [`PayloadTotals`]).
 //!
 //! # What does not belong here
 //!
@@ -40,6 +43,7 @@ mod id;
 mod limits;
 mod origin;
 mod part;
+mod payload;
 mod record;
 mod schema;
 mod summary;
@@ -54,6 +58,7 @@ pub use id::{SpanId, TraceId};
 pub use limits::BatchLimits;
 pub use origin::{Origin, OriginKeys};
 pub use part::{PartMeta, part_dir_name};
+pub use payload::{PayloadSplitter, PayloadTotals, RawColumn};
 pub use record::SpanRecord;
 pub use schema::{col, span_schema};
 pub use summary::{SummaryBuilder, TraceSummary, summary_schema};

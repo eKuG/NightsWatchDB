@@ -13,7 +13,7 @@ pub use door::{DECODE_FACTOR, DECODE_FIXED, MAX_MESSAGE};
 
 use nwdb_core::{Error, RecordDecoder, Result};
 use nwdb_engine::{Engine, EngineOptions};
-use nwdb_otlp::{RECORD_TAG_OTLP_TRACES, TraceDecoder};
+use nwdb_otlp::{OtlpSplitter, RECORD_TAG_OTLP_TRACES, TraceDecoder};
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 
@@ -69,10 +69,13 @@ pub struct ServerOptions {
 }
 
 impl ServerOptions {
-    /// The defaults of the binary: loopback addresses, 512 MiB in flight.
+    /// The defaults of the binary: loopback addresses, 512 MiB in flight, and
+    /// the OTLP splitter, so that repeated text is stored once per part.
     pub fn new(data_dir: impl Into<std::path::PathBuf>) -> Self {
+        let mut engine = EngineOptions::new(data_dir);
+        engine.splitter = Some(Arc::new(OtlpSplitter::default()));
         Self {
-            engine: EngineOptions::new(data_dir),
+            engine,
             otlp_grpc_addr: SocketAddr::from(([127, 0, 0, 1], 4317)),
             api_addr: SocketAddr::from(([127, 0, 0, 1], 4320)),
             max_inflight_bytes: 512 * 1024 * 1024,

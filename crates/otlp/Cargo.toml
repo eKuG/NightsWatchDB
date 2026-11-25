@@ -10,10 +10,13 @@ rust-version.workspace = true
 
 [dependencies]
 nwdb-core = { path = "../core" }
+nwdb-payload = { path = "../payload" }
 arrow-array.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+nwdb-segment = { path = "../segment" }
+tempfile.workspace = true
 prost.workspace = true
 opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
 rand.workspace = true

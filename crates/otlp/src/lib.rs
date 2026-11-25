@@ -7,7 +7,8 @@
 //! raw columns keep the original message bytes. The resource and scope values
 //! that all spans of a message share are not copied per span: the span table
 //! stores them in dictionary columns, once per batch. [`encode_spans`] goes
-//! the other way for the query API.
+//! the other way for the query API. [`OtlpSplitter`] tells the part writer
+//! which text of the raw columns to store out of line.
 //!
 //! # Column mapping
 //!
@@ -74,12 +75,14 @@
 mod decode;
 mod encode;
 mod repair;
+mod splitter;
 mod stream;
 mod walk;
 mod wire;
 
 pub use decode::{DEFAULT_MAX_ORIGIN_BYTES, DecodeStats, RECORD_TAG_OTLP_TRACES, TraceDecoder};
 pub use encode::encode_spans;
+pub use splitter::{CONTENT_KEYS, CONTENT_PREFIXES, DEFAULT_MIN_BYTES, OtlpSplitter};
 pub use stream::{
     MAX_DEPTH, resource_dropped_attributes, scope_dropped_attributes, write_attrs, write_events,
     write_links, write_resource, write_scope_attrs,

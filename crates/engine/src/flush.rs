@@ -194,7 +194,11 @@ impl Inner {
                     id,
                     *w,
                     window_ns,
-                    WriterOptions::default(),
+                    WriterOptions {
+                        splitter: self.opts.splitter.clone(),
+                        dedup_window_bytes: self.opts.dedup_window_bytes,
+                        ..WriterOptions::default()
+                    },
                 )?;
                 let mut builder = SpanBatchBuilder::new(self.opts.batch_limits);
                 for t in &grouped.traces[range.clone()] {

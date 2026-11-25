@@ -29,6 +29,7 @@ fn part(id: u64) -> PartMeta {
         files: BTreeMap::new(),
         created_unix_ms: 0,
         format_version: 1,
+        payload: Default::default(),
     }
 }
 

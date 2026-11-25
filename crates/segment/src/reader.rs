@@ -11,15 +11,29 @@
 //! the build not using `panic = "abort"`. The reader holds no mutable state,
 //! so a caught panic cannot leave anything half-updated; an iterator that
 //! panicked is finished and drops its Parquet reader.
+//!
+//! The raw columns are stored as ropes (see `nwdb_payload::rope`). A read
+//! that returns any of them rebuilds the original bytes from the piece store;
+//! a read that returns none never touches the piece files. Because a rebuilt
+//! value can be thousands of times larger than its rope, each batch read from
+//! Parquet is first measured in rebuilt bytes and divided so that every
+//! returned batch respects [`BatchLimits`], and only then is one part of it
+//! rebuilt at a time.
 
 use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
-use crate::{SPANS_FILE, SUMMARY_FILE};
-use arrow_array::RecordBatch;
+use crate::writer::row_value_bytes;
+use crate::{PIECES_BLK, PIECES_IDX, SPANS_FILE, SUMMARY_FILE};
+use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::cast::AsArray;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::SchemaRef;
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use bytes::Bytes;
-use nwdb_core::{BatchLimits, Error, Result, TraceId, col, span_schema, summary_schema};
+use nwdb_core::{
+    BatchLimits, Error, PayloadTotals, Result, TraceId, col, span_schema, summary_schema,
+};
+use nwdb_payload::rope::{self, RopeError};
+use nwdb_payload::{PieceReader, PieceSession};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
@@ -29,6 +43,7 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::ops::Range;
@@ -153,9 +168,24 @@ fn compact_dictionaries(batch: RecordBatch) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
+/// The raw columns, which are stored as ropes.
+const RAW_NAMES: [&str; 3] = [col::ATTRS, col::EVENTS, col::LINKS];
+
+fn rope_error(e: RopeError) -> Error {
+    match e {
+        RopeError::Malformed(what) => corrupt(
+            SPANS_FILE,
+            format!("a stored value is malformed ({what}): the file is damaged"),
+        ),
+        RopeError::Piece(e) => e,
+    }
+}
+
 /// The columns a read returns and the order the caller asked for them in.
 struct Projection {
     mask: ProjectionMask,
+    /// Whether any of the raw columns is among them.
+    rebuild: bool,
     /// For each requested column, its position among the columns the Parquet
     /// reader returns, which come back in file order. `None` when that is
     /// already the requested order.
@@ -182,6 +212,30 @@ struct Table {
     group_starts: Vec<u64>,
     /// Rows per batch for each row group.
     batch_rows: Vec<usize>,
+    /// The piece store the rows' ropes refer to; `None` for a file without
+    /// ropes (the summary).
+    store: Option<Arc<PieceReader>>,
+}
+
+/// A batch as read from Parquet (raw columns still ropes) and how it is cut
+/// into the batches to return.
+struct Pending {
+    stored: RecordBatch,
+    ranges: VecDeque<Range<usize>>,
+    rebuild: bool,
+}
+
+impl Pending {
+    /// The next batch to return, with its raw columns rebuilt.
+    fn next(&mut self, table: &Table, session: &mut PieceSession) -> Option<Result<RecordBatch>> {
+        let range = self.ranges.pop_front()?;
+        let part = self.stored.slice(range.start, range.len());
+        Some(if self.rebuild {
+            table.rebuild(&part, session)
+        } else {
+            Ok(part)
+        })
+    }
 }
 
 impl Table {
@@ -245,7 +299,107 @@ impl Table {
             meta,
             group_starts,
             batch_rows,
+            store: None,
         })
+    }
+
+    /// Decides how a batch read from Parquet is cut into batches to return,
+    /// from the sizes its values will have once rebuilt, without reading any
+    /// piece. Every batch is within [`BatchLimits::DEFAULT`] in rebuilt value
+    /// bytes, except that a single row larger than that is a batch alone.
+    fn plan(&self, stored: RecordBatch, projection: Option<&Projection>) -> Result<Pending> {
+        let rows = stored.num_rows();
+        let store = match &self.store {
+            Some(store) if projection.is_none_or(|p| p.rebuild) => store,
+            _ => {
+                return Ok(Pending {
+                    ranges: if rows == 0 {
+                        VecDeque::new()
+                    } else {
+                        std::iter::once(0..rows).collect()
+                    },
+                    stored,
+                    rebuild: false,
+                });
+            }
+        };
+        let mut weight = row_value_bytes(&stored);
+        for name in RAW_NAMES {
+            let Ok(at) = stored.schema().index_of(name) else {
+                continue;
+            };
+            let column = stored.column(at).as_binary::<i64>();
+            for (row, w) in weight.iter_mut().enumerate() {
+                if column.is_null(row) {
+                    continue;
+                }
+                let rope_bytes = column.value(row);
+                let rebuilt =
+                    rope::logical_len(rope_bytes, |id| store.piece_len(id)).map_err(rope_error)?;
+                *w = w
+                    .saturating_sub(rope_bytes.len() as u64)
+                    .saturating_add(rebuilt);
+            }
+        }
+        let limits = BatchLimits::DEFAULT;
+        let mut ranges = VecDeque::new();
+        let (mut start, mut sum) = (0usize, 0u64);
+        for (row, &w) in weight.iter().enumerate() {
+            if row > start && (sum + w > limits.max_bytes as u64 || row - start >= limits.max_rows)
+            {
+                ranges.push_back(start..row);
+                (start, sum) = (row, 0);
+            }
+            sum += w;
+        }
+        if start < rows {
+            ranges.push_back(start..rows);
+        }
+        Ok(Pending {
+            stored,
+            ranges,
+            rebuild: true,
+        })
+    }
+
+    /// `part` with the ropes of its raw columns replaced by the values they
+    /// stand for.
+    fn rebuild(&self, part: &RecordBatch, session: &mut PieceSession) -> Result<RecordBatch> {
+        let store = self.store.as_ref().expect("only planned with a store");
+        let schema = part.schema();
+        let mut columns = part.columns().to_vec();
+        let mut value = Vec::new();
+        for name in RAW_NAMES {
+            let Ok(at) = schema.index_of(name) else {
+                continue;
+            };
+            let ropes = part.column(at).as_binary::<i64>();
+            // The exact size, so that the builder never grows by doubling: the
+            // values of one batch can be tens of megabytes.
+            let mut total = 0usize;
+            for row in (0..ropes.len()).filter(|&r| !ropes.is_null(r)) {
+                let len = rope::logical_len(ropes.value(row), |id| store.piece_len(id))
+                    .map_err(rope_error)?;
+                total = total.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+            }
+            let mut out = LargeBinaryBuilder::with_capacity(ropes.len(), total);
+            for row in 0..ropes.len() {
+                if ropes.is_null(row) {
+                    out.append_null();
+                    continue;
+                }
+                value.clear();
+                rope::decode(
+                    ropes.value(row),
+                    |id, to| store.read_piece(session, id, to),
+                    &mut value,
+                )
+                .map_err(rope_error)?;
+                out.append_value(&value);
+            }
+            columns[at] = Arc::new(out.finish());
+        }
+        Ok(RecordBatch::try_new(schema, columns)?)
     }
 
     fn rows(&self) -> u64 {
@@ -291,13 +445,18 @@ impl Table {
             })
             .collect();
         let reorder = (!order.iter().copied().eq(0..order.len())).then_some(order);
+        let rebuild = names.iter().any(|n| RAW_NAMES.contains(n));
         let mask = guard(self.name, || {
             Ok(ProjectionMask::roots(
                 self.meta.parquet_schema(),
                 file_order,
             ))
         })?;
-        Ok(Some(Projection { mask, reorder }))
+        Ok(Some(Projection {
+            mask,
+            rebuild,
+            reorder,
+        }))
     }
 
     /// A reader over `rows` (local to row group `group`), which selects rows
@@ -353,11 +512,15 @@ impl Table {
         group: usize,
         rows: Range<usize>,
         projection: Option<&Projection>,
+        session: &mut PieceSession,
     ) -> Result<Vec<RecordBatch>> {
         let mut reader = self.group_reader(group, rows, projection)?;
         let mut out = Vec::new();
         while let Some(batch) = self.next_batch(&mut reader, projection) {
-            out.push(batch?);
+            let mut pending = self.plan(batch?, projection)?;
+            while let Some(batch) = pending.next(self, session) {
+                out.push(batch?);
+            }
         }
         Ok(out)
     }
@@ -379,6 +542,7 @@ impl Table {
         }
         let end = first + count;
         let mut out = Vec::new();
+        let mut session = PieceSession::default();
         if count == 0 {
             return Ok(out);
         }
@@ -388,7 +552,9 @@ impl Table {
             let start = self.group_starts[group];
             let lo = first.max(start) - start;
             let hi = end.min(self.group_starts[group + 1]) - start;
-            for batch in self.read_group(group, lo as usize..hi as usize, projection)? {
+            for batch in
+                self.read_group(group, lo as usize..hi as usize, projection, &mut session)?
+            {
                 out.push(compact_dictionaries(batch)?);
             }
             group += 1;
@@ -411,21 +577,36 @@ impl Table {
         projection: Option<&Projection>,
     ) -> Result<Vec<RecordBatch>> {
         let mut out = Vec::new();
+        let mut session = PieceSession::default();
         for group in groups {
-            out.extend(self.read_group(group, 0..self.group_rows(group), projection)?);
+            out.extend(self.read_group(
+                group,
+                0..self.group_rows(group),
+                projection,
+                &mut session,
+            )?);
         }
         Ok(out)
     }
 
     /// Re-reads the whole file and compares its length and CRC-32C.
     fn verify(&self, want: FileChecksum) -> Result<()> {
+        check_sum(self.name, self.file.len, self.file_sum()?, want)
+    }
+
+    /// Length and CRC-32C of the file as it is now.
+    fn file_sum(&self) -> Result<FileChecksum> {
+        let want = FileChecksum {
+            len: self.file.len,
+            crc32c: 0,
+        };
         let now = self.file.file.metadata()?.len();
-        if now != want.len || self.file.len != want.len {
+        if now != want.len {
             return Err(corrupt(
                 self.name,
                 format!(
-                    "file has {now} bytes (opened with {}) but {INDEX_FILE} recorded {}",
-                    self.file.len, want.len
+                    "file has {now} bytes but had {} when it was opened",
+                    want.len
                 ),
             ));
         }
@@ -446,17 +627,34 @@ impl Table {
             crc = crc32c::crc32c_append(crc, &buf[..n]);
             pos += n as u64;
         }
-        if crc != want.crc32c {
-            return Err(corrupt(
-                self.name,
-                format!(
-                    "checksum mismatch: CRC-32C is {crc:#010x}, {INDEX_FILE} recorded {:#010x}",
-                    want.crc32c
-                ),
-            ));
-        }
-        Ok(())
+        Ok(FileChecksum {
+            len: want.len,
+            crc32c: crc,
+        })
     }
+}
+
+/// Compares a file's length and CRC-32C with the ones `traces.idx` recorded.
+fn check_sum(name: &str, opened_len: u64, now: FileChecksum, want: FileChecksum) -> Result<()> {
+    if now.len != want.len || opened_len != want.len {
+        return Err(corrupt(
+            name,
+            format!(
+                "file has {} bytes (opened with {opened_len}) but {INDEX_FILE} recorded {}",
+                now.len, want.len
+            ),
+        ));
+    }
+    if now.crc32c != want.crc32c {
+        return Err(corrupt(
+            name,
+            format!(
+                "checksum mismatch: CRC-32C is {:#010x}, {INDEX_FILE} recorded {:#010x}",
+                now.crc32c, want.crc32c
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Row groups whose statistics for the root column named `column` overlap the
@@ -516,6 +714,9 @@ pub struct Scan {
     projection: Option<Projection>,
     groups: std::vec::IntoIter<usize>,
     reader: Option<ParquetRecordBatchReader>,
+    /// The batch read last, while its parts are being rebuilt and returned.
+    pending: Option<Pending>,
+    session: PieceSession,
     read: usize,
     skipped: usize,
 }
@@ -533,6 +734,7 @@ impl Scan {
 
     fn end(&mut self) {
         self.reader = None;
+        self.pending = None;
         self.groups = Vec::new().into_iter();
     }
 }
@@ -542,6 +744,16 @@ impl Iterator for Scan {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if let Some(pending) = self.pending.as_mut() {
+                match pending.next(&self.table, &mut self.session) {
+                    Some(Ok(batch)) => return Some(Ok(batch)),
+                    Some(Err(e)) => {
+                        self.end();
+                        return Some(Err(e));
+                    }
+                    None => self.pending = None,
+                }
+            }
             let Some(reader) = self.reader.as_mut() else {
                 let group = self.groups.next()?;
                 let rows = 0..self.table.group_rows(group);
@@ -559,7 +771,13 @@ impl Iterator for Scan {
             };
             match self.table.next_batch(reader, self.projection.as_ref()) {
                 None => self.reader = None,
-                Some(Ok(batch)) => return Some(Ok(batch)),
+                Some(Ok(batch)) => match self.table.plan(batch, self.projection.as_ref()) {
+                    Ok(pending) => self.pending = Some(pending),
+                    Err(e) => {
+                        self.end();
+                        return Some(Err(e));
+                    }
+                },
                 Some(Err(e)) => {
                     self.end();
                     return Some(Err(e));
@@ -581,6 +799,7 @@ pub struct PartReader {
     checksums: FileChecksums,
     spans: Arc<Table>,
     summary: Arc<Table>,
+    store: Arc<PieceReader>,
 }
 
 impl PartReader {
@@ -602,8 +821,26 @@ impl PartReader {
         })?;
         let decoded = index::decode(&index_bytes)?;
         let (entries, checksums) = (decoded.entries, decoded.checksums);
-        let spans = Table::open(dir, SPANS_FILE, &span_schema(), checksums.spans.len)?;
+        let mut spans = Table::open(dir, SPANS_FILE, &span_schema(), checksums.spans.len)?;
         let summary = Table::open(dir, SUMMARY_FILE, &summary_schema(), checksums.summary.len)?;
+
+        let store = Arc::new(PieceReader::open(dir)?);
+        for (name, found, recorded) in [
+            (
+                PIECES_BLK,
+                store.blocks_file_len(),
+                checksums.pieces_blk.len,
+            ),
+            (PIECES_IDX, store.index_file_len(), checksums.pieces_idx.len),
+        ] {
+            if found != recorded {
+                return Err(corrupt(
+                    name,
+                    format!("file has {found} bytes but {INDEX_FILE} recorded {recorded}"),
+                ));
+            }
+        }
+        spans.store = Some(store.clone());
 
         check_ranges(&entries, spans.rows())?;
         if summary.rows() != entries.len() as u64 {
@@ -621,7 +858,20 @@ impl PartReader {
             checksums,
             spans: Arc::new(spans),
             summary: Arc::new(summary),
+            store,
         })
+    }
+
+    /// What the part's piece store holds.
+    pub fn payload_totals(&self) -> PayloadTotals {
+        self.store.totals()
+    }
+
+    /// How many piece blocks this reader has read and decompressed since it
+    /// was opened. A read that returns none of `attrs`, `events` and `links`
+    /// leaves it unchanged.
+    pub fn payload_blocks_loaded(&self) -> u64 {
+        self.store.blocks_loaded()
     }
 
     /// Length and CRC-32C of `spans.parquet` recorded when the part was
@@ -644,7 +894,19 @@ impl PartReader {
     /// does not do it; compaction and a scrubber should.
     pub fn verify(&self) -> Result<()> {
         self.spans.verify(self.checksums.spans)?;
-        self.summary.verify(self.checksums.summary)
+        self.summary.verify(self.checksums.summary)?;
+        let (blk, idx) = self.store.file_sums()?;
+        for (name, now, recorded) in [
+            (PIECES_BLK, blk, self.checksums.pieces_blk),
+            (PIECES_IDX, idx, self.checksums.pieces_idx),
+        ] {
+            let now = FileChecksum {
+                len: now.len,
+                crc32c: now.crc32c,
+            };
+            check_sum(name, now.len, now, recorded)?;
+        }
+        self.store.verify()
     }
 
     /// Number of span rows.
@@ -749,6 +1011,8 @@ impl PartReader {
             projection,
             groups: groups.into_iter(),
             reader: None,
+            pending: None,
+            session: PieceSession::default(),
             read,
             skipped,
         })
