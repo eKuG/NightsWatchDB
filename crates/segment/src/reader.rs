@@ -571,6 +571,25 @@ impl Table {
         })
     }
 
+    /// The largest value in the statistics of root column `column` in row
+    /// group `group`, or `i64::MAX` if the group has none.
+    fn max_of(&self, column: &str, group: usize) -> Result<i64> {
+        guard(self.name, || {
+            let meta = self.meta.metadata();
+            let idx = meta
+                .file_metadata()
+                .schema_descr()
+                .columns()
+                .iter()
+                .position(|c| c.path().string() == column)
+                .ok_or_else(|| corrupt(self.name, format!("no column `{column}`")))?;
+            Ok(match meta.row_group(group).column(idx).statistics() {
+                Some(Statistics::Int64(s)) => s.max_opt().copied().unwrap_or(i64::MAX),
+                _ => i64::MAX,
+            })
+        })
+    }
+
     fn read_groups(
         &self,
         groups: Vec<usize>,
@@ -1030,6 +1049,73 @@ impl PartReader {
             .summary
             .overlapping("start_ns", start_ns_min, start_ns_max)?;
         self.summary.read_groups(groups, None)
+    }
+
+    /// Like [`scan_summary`](Self::scan_summary), but lazy and newest first:
+    /// the row groups that overlap the inclusive range are read one at a time,
+    /// starting with the group that holds the latest starts.
+    pub fn scan_summary_rev(
+        &self,
+        start_ns_min: Option<i64>,
+        start_ns_max: Option<i64>,
+    ) -> Result<SummaryScanRev> {
+        let groups = self
+            .summary
+            .overlapping("start_ns", start_ns_min, start_ns_max)?;
+        let groups = groups
+            .into_iter()
+            .map(|g| Ok((g, self.summary.max_of("start_ns", g)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(SummaryScanRev {
+            table: self.summary.clone(),
+            groups,
+            read: 0,
+        })
+    }
+}
+
+/// The row groups of a [`PartReader::scan_summary_rev`], read lazily from the
+/// newest to the oldest.
+///
+/// The summary file is sorted by `(start_ns, trace_id)`, so the groups come
+/// in file order from the oldest to the newest, and a group's rows are in
+/// ascending order: a caller that wants descending order reads each returned
+/// group's batches and rows backwards. Like `scan_summary` it prunes by
+/// statistics and does not filter rows.
+pub struct SummaryScanRev {
+    table: Arc<Table>,
+    /// File order; each group with the largest `start_ns` its statistics
+    /// allow. The next group to read is the last one.
+    groups: Vec<(usize, i64)>,
+    read: usize,
+}
+
+impl SummaryScanRev {
+    /// An upper bound on the `start_ns` of every row not yet returned (the
+    /// group's recorded maximum, or `i64::MAX` if it has none), or `None` when
+    /// the scan is finished. It lets a caller that merges several parts decide
+    /// whether this part can matter before paying to read a group.
+    pub fn next_upper_bound(&self) -> Option<i64> {
+        self.groups.last().map(|&(_, max)| max)
+    }
+
+    /// Reads the newest group not yet read, as batches in ascending row
+    /// order; `None` when the scan is finished.
+    pub fn next_group(&mut self) -> Result<Option<Vec<RecordBatch>>> {
+        let Some(&(group, _)) = self.groups.last() else {
+            return Ok(None);
+        };
+        let batches = self.table.read_groups(vec![group], None)?;
+        // Dropped only after a successful read, so a failed read leaves the
+        // scan where it was.
+        self.groups.pop();
+        self.read += 1;
+        Ok(Some(batches))
+    }
+
+    /// Number of row groups returned so far.
+    pub fn row_groups_read(&self) -> usize {
+        self.read
     }
 }
 

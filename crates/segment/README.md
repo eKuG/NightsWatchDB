@@ -224,6 +224,14 @@ pages or the blocks of the piece store.
   not filter rows; the caller filters. `scan` is lazy: it builds one group's
   reader at a time, so file errors surface from the iterator. `Scan` reports
   how many row groups were read and skipped.
+- `scan_summary_rev` is the lazy, newest-first form of `scan_summary`: it
+  yields one row group per call, starting with the group that holds the latest
+  starts (the file is sorted by start, so the groups' order is the file's order
+  reversed), and `next_upper_bound` gives the largest start the next group can
+  hold, from the statistics, without reading it. A caller merging several
+  parts uses it to leave a part unread until it can matter. The rows inside a
+  group are still in ascending order, so a caller wanting descending order
+  walks them backwards.
 - A projection returns the requested columns in the requested order; an
   unknown or repeated column is `Error::InvalidArgument`.
 

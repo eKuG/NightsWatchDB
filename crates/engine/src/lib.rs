@@ -21,9 +21,10 @@ mod engine;
 mod flush;
 mod query;
 mod rows;
+mod split;
 
 pub use engine::{Engine, EngineOptions, EngineStats, Stage, StageHook};
-pub use query::{AggQuery, ListQuery, Snapshot, TokenAgg};
+pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
 
 use std::sync::{Mutex, MutexGuard};
 

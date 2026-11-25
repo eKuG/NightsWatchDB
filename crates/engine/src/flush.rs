@@ -93,19 +93,29 @@ impl Inner {
             });
         match outcome {
             Ok(written) => {
+                // Only a flush changes the part list and flushes run one at
+                // a time, so what is read here is what the new list extends.
+                // The split map is built outside the lock and published with
+                // the list.
+                let (mut parts, old_split) = {
+                    let c = lock(&self.core);
+                    (c.vis.parts.as_ref().clone(), c.vis.split.clone())
+                };
+                let old_len = parts.len();
+                parts.extend(
+                    written
+                        .metas
+                        .into_iter()
+                        .zip(written.readers)
+                        .map(|(meta, reader)| Arc::new(LivePart { meta, reader })),
+                );
+                let split = Arc::new(old_split.extend(&parts, old_len));
                 {
                     let mut c = lock(&self.core);
-                    let mut parts: Vec<Arc<LivePart>> = c.vis.parts.as_ref().clone();
-                    parts.extend(
-                        written
-                            .metas
-                            .into_iter()
-                            .zip(written.readers)
-                            .map(|(meta, reader)| Arc::new(LivePart { meta, reader })),
-                    );
                     // Parts and buffer change in one step, so a snapshot sees
                     // the data exactly once.
                     c.vis.parts = Arc::new(parts);
+                    c.vis.split = split;
                     c.vis.frozen = None;
                     c.frozen_bytes = 0;
                     c.flushed_lsn = lsn;

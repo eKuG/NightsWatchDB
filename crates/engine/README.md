@@ -160,8 +160,10 @@ runs on a separate thread rather than joining itself.
    its row group and its de-duplication window (64 MiB by default).
 4. **Commit.** One manifest commit adds all the parts and sets
    `wal_flushed_lsn` to the frozen position.
-5. **Publish.** Under the core lock, replace the part list and clear the frozen
-   buffer in one step, so a snapshot sees the data exactly once.
+5. **Publish.** Extend the split map for the new parts (outside the lock, see
+   Reads), then under the core lock replace the part list and the split map and
+   clear the frozen buffer in one step, so a snapshot sees the data exactly once
+   and its map matches its parts.
 6. **Trim.** `truncate_before(wal_flushed_lsn + 1)`, only after the commit
    returned `Ok`. A failure is recorded in `stats().last_error` and retried by
    the next flush; the data is safe.
@@ -240,15 +242,42 @@ does not block, and is not blocked by, ingest or flush.
 - `list_traces`: late spans can put one trace in several parts and the buffer,
   each holding a partial summary. A trace's merged start is the smallest
   partial start, so any trace that belongs in the result has a partial whose
-  own start is in range. The candidates are those partials, found with the
-  readers' range-pruned summary scans and in the buffer. For each candidate the
-  other parts that hold it (trace index lookup) and the buffer supply their
-  summary rows, they are merged with `TraceSummary::merge`, and only then are
-  the range, the filters and the order applied. Cost: the summary row groups
-  overlapping the range, plus one trace-index lookup per part per candidate
-  and one summary row-group read per extra part that holds the trace;
-  candidates' summaries are held in memory, and the buffer is summarised on
-  every call.
+  own start is in range. The partials of all parts (each summary file is
+  sorted by start and is read from its newest row group backwards, one group
+  per part at a time, and a part is not read at all until its newest possible
+  start reaches the front) and of the buffer are taken newest first. The first
+  time a trace is seen, its other partials are fetched (the split map names the
+  parts, the buffer is a hash map), merged with `TraceSummary::merge`, and
+  only then are the range and the filters applied; the best `limit` merged
+  summaries are kept (order: start descending, trace id ascending). The scan
+  stops once `limit` results are held and the next partial starts strictly
+  below the worst held start: every trace not yet seen has all its partials
+  at or below that start, so its merged start, the minimum, is below the worst
+  held one and the trace cannot enter. Equal starts keep the scan going,
+  because the tie goes to the smaller trace id. A filter that rejects most
+  traces keeps the scan going back to the range's lower bound. Cost: about
+  `limit` summary rows and one row group per part that can reach the front,
+  one split-map lookup per trace seen, and one trace-index lookup and one row
+  group read per extra part of a split trace. A trace first met in the buffer
+  that is not split has its one part, if any, searched for in the indexes (at
+  most one lookup per part), which only buffered traces pay. Memory: the results, the ids of
+  the traces seen so far, one summary row group per part being read, and the
+  buffer's summaries (the buffer is summarised on every call).
+- The split map: each part's trace index is sorted by trace id, and when the
+  set of parts changes (start-up, a flush publishing parts) the traces that
+  are in more than one part are found with a merge over the sorted indexes of
+  the new parts, then looked up in the old parts with a galloping walk, all
+  outside the core lock. The result is a map from trace id to the parts that
+  hold it, for split traces only, and it is published in the same step as the
+  part list, so a snapshot's map always matches its parts. Memory: about 40
+  bytes per split trace (the id, a small boxed list of part numbers and the
+  table overhead), nothing for the rest; a flush copies the old map, which
+  costs the number of split traces. The cost of building it for a flush is the
+  new parts' traces, plus for each of them a galloping step in every old part's
+  index. `get_trace` uses it too: a trace in the map is read from its parts
+  only, and any other trace is in at most one part, so the search of the
+  indexes ends at the first part that has it. If compaction later removes
+  parts, the part numbers in the map must be rebuilt with the list.
 - Token sums: a negative count in a column (possible from another ingest
   path; the OTLP door never stores one) counts as 0, so every term is
   non-negative and saturating addition gives the same total however the spans

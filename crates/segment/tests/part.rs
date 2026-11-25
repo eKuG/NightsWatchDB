@@ -784,6 +784,59 @@ fn scan_summary_prunes_row_groups() {
 }
 
 #[test]
+fn scan_summary_rev_reads_newest_groups_first_and_lazily() {
+    let tmp = tempfile::tempdir().unwrap();
+    let spans = generate(&Gen {
+        spans_per_trace: 1..=1,
+        ..default_gen(10, 2_000)
+    });
+    write_part(tmp.path(), 1, &spans, 500, small_groups());
+    let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
+    assert_eq!(reader.summary_row_group_count(), 10);
+
+    // Everything: the groups come newest first, their bounds never rise, and
+    // together they hold exactly the rows of the forward scan.
+    let mut scan = reader.scan_summary_rev(None, None).unwrap();
+    let mut last_bound = i64::MAX;
+    let mut got = Vec::new();
+    while let Some(bound) = scan.next_upper_bound() {
+        assert!(bound <= last_bound);
+        last_bound = bound;
+        let group = scan.next_group().unwrap().unwrap();
+        let rows = summaries(&group);
+        assert!(rows.iter().all(|s| s.start_ns <= bound));
+        // Ascending inside the group, newest group first.
+        assert!(rows.windows(2).all(|w| w[0].start_ns <= w[1].start_ns));
+        got.push(rows);
+    }
+    assert_eq!(scan.row_groups_read(), 10);
+    assert!(scan.next_group().unwrap().is_none());
+    for w in got.windows(2) {
+        assert!(w[1].last().unwrap().start_ns <= w[0][0].start_ns);
+    }
+    let mut got: Vec<TraceSummary> = got.into_iter().flatten().collect();
+    let mut want = summaries(&reader.scan_summary(None, None).unwrap());
+    got.sort_by_key(|s| s.trace_id);
+    want.sort_by_key(|s| s.trace_id);
+    assert_eq!(got, want);
+
+    // A bounded range prunes the same groups as the forward scan, and
+    // nothing is read before it is asked for.
+    let (lo, hi) = (1_000_000 + 700_000, 1_000_000 + 900_000);
+    let mut scan = reader.scan_summary_rev(Some(lo), Some(hi)).unwrap();
+    assert_eq!(scan.row_groups_read(), 0);
+    let mut rows = 0;
+    while scan.next_group().unwrap().is_some() {
+        rows += 1;
+    }
+    assert_eq!(rows, reader.scan_summary(Some(lo), Some(hi)).unwrap().len());
+    assert!(rows < 10);
+    let mut scan = reader.scan_summary_rev(Some(i64::MAX - 1), None).unwrap();
+    assert!(scan.next_upper_bound().is_none());
+    assert!(scan.next_group().unwrap().is_none());
+}
+
+#[test]
 fn scan_prunes_row_groups_and_projects() {
     let tmp = tempfile::tempdir().unwrap();
     let spans = generate(&Gen {

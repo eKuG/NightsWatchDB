@@ -23,6 +23,7 @@ use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
 
 use crate::lock;
 use crate::query::{AggQuery, ListQuery, Snapshot, TokenAgg};
+use crate::split::SplitMap;
 
 /// How long the background flusher waits after a failed flush before it tries
 /// again. An explicit [`Engine::flush`] is never delayed by it.
@@ -214,6 +215,9 @@ pub(crate) struct LivePart {
 #[derive(Clone, Default)]
 pub(crate) struct Visible {
     pub parts: Arc<Vec<Arc<LivePart>>>,
+    /// The traces that are in more than one of `parts`. Replaced together
+    /// with `parts` in one step, so the two always agree.
+    pub split: Arc<SplitMap>,
     /// The buffer being written out, until its parts are live.
     pub frozen: Option<Arc<Vec<Arc<RecordBatch>>>>,
     pub active: Arc<Vec<Arc<RecordBatch>>>,
@@ -561,6 +565,7 @@ impl Engine {
                 closing: false,
                 stop_flusher: false,
                 vis: Visible {
+                    split: Arc::new(SplitMap::default().extend(&parts, 0)),
                     parts: Arc::new(parts),
                     frozen: None,
                     active: Arc::default(),
