@@ -530,10 +530,9 @@ impl Inner {
         let options = MergeOptions {
             writer: self.writer_options(),
             level,
-            // WIRE-STOP: once `MergeOptions` has a `stop` field, pass
-            // `stop: Some(self.merge_stop.clone()),` here. Nothing else is
-            // needed on this side: the pass already treats an error that
-            // arrives while the flag is set as no failure.
+            // Set at shutdown: the merge then ends at its next chunk, and
+            // the pass treats the error that arrives as no failure.
+            stop: Some(self.merge_stop.clone()),
             ..MergeOptions::default()
         };
         let (meta, stats) = merge_parts(
