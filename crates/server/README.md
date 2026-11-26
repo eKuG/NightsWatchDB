@@ -237,7 +237,7 @@ of one pool each:
   stated size for compressed messages, the assumed size for zstd frames that
   state none). Decoded batches are the main memory use. The factor comes from
   the heap the decoder holds at its peak, which is more than the finished
-  batches: the worst shape measured is 13.6 times the request (see the README
+  batches: the worst shape measured is 14.0 times the request (see the README
   of the otlp crate), and a compressed message also has its decompressed
   request in this pool, one more time its size. The test
   `decoding_never_needs_more_than_the_door_charges` checks the charge against

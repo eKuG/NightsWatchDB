@@ -110,9 +110,12 @@ the minimum budget, and growing the input twelvefold adds only the documented
 144 bytes per extra segment to the peak. The memory the builder holds does not
 depend on the size of a document: a piece of about 1 KiB holds at most about 512
 tokens, each adding at most about 100 bytes to the estimate, so the open segment
-passes the budget by at most about 50 KiB before it is closed, whatever the
-document (`tests/split_documents.rs` builds documents far over the budget). The caller
-holds the document's text; the builder does not keep it.
+passes the budget by at most about 50 KiB of new terms and ids before it is
+closed, whatever the document, plus one growth step of the term table and of
+the vector of lists when it falls in that piece (both double; the peak bound
+above includes that step). `tests/split_documents.rs` builds documents far over
+the budget; the peak itself is measured by the test of the table above. The
+caller holds the document's text; the builder does not keep it.
 
 ## Index file layout
 

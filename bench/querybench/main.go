@@ -485,10 +485,13 @@ func realMain() error {
 	add("exp_list1", listIn(exp.FromNs, exp.ToNs, url.Values{"service": {exp.Service}}))
 	add("exp_list2", listIn(exp.FromNs, exp.ToNs, url.Values{"model": {exp.Model}, "error": {"true"}}))
 	add("exp_agg", tokensOp(exp.FromNs, exp.ToNs, "chat"))
-	// Search of message text, newest 20 spans over all time. A dataset
-	// without text answers with no spans; the bytes column shows which.
+	// Search of message text, newest 20 spans of the whole range (without
+	// from and to the server searches the last hour only). A dataset without
+	// text answers with no spans; the bytes column shows which.
 	search := func(q string) func(int) (string, url.Values) {
-		return func(int) (string, url.Values) { return "/api/v1/search", url.Values{"q": {q}, "limit": {"20"}} }
+		return func(int) (string, url.Values) {
+			return "/api/v1/search", url.Values{"q": {q}, "from": {ns(*from)}, "to": {ns(*to)}, "limit": {"20"}}
+		}
 	}
 	add("search_word", search("traceback"))
 	add("search_common_word", search("error"))

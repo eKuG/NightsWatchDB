@@ -215,9 +215,12 @@ fn searches_during_flushes_and_merges_see_a_consistent_prefix_of_the_log() {
         }
     }
     e.flush().unwrap();
-    // Let the searchers run against the final state too.
+    // Let the searchers run against the final state too. A searcher ends
+    // early only by failing an assertion: stop waiting then, and the join
+    // below reports it.
     let floor = searches.load(Ordering::SeqCst);
-    while searches.load(Ordering::SeqCst) < floor + 8 {
+    while searches.load(Ordering::SeqCst) < floor + 8 && !searchers.iter().any(|s| s.is_finished())
+    {
         std::thread::yield_now();
     }
     stop.store(true, Ordering::SeqCst);

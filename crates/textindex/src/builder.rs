@@ -38,9 +38,11 @@ pub struct IndexOptions {
     /// The count is an estimate of heap bytes (term bytes, hash table slots,
     /// list headers and the ids of every list, with allocator rounding). It is
     /// checked after every piece of about 1 KiB of a document, cut between
-    /// tokens, so a document of any size overshoots it by at most the 50 KiB
-    /// or so that one piece can add. A document that does not fit is split
-    /// over consecutive segments: its id is then in the range of both.
+    /// tokens, so a document of any size overshoots it by at most what one
+    /// piece can add: about 50 KiB of new terms and ids, and one growth step
+    /// of the term table and of the vector of lists if it falls in that piece
+    /// (both double). A document that does not fit is split over consecutive
+    /// segments: its id is then in the range of both.
     /// Closing a segment needs a further 32 bytes per term for the sorted
     /// order plus the segment's dictionary and sparse index, and each closed
     /// segment keeps a 72 byte directory entry (at most 144 bytes with the
@@ -61,7 +63,9 @@ impl Default for IndexOptions {
 /// cut between tokens, and the budget is checked after each piece. A piece
 /// holds at most half this many tokens, so the memory estimate overshoots the
 /// budget by at most about 100 bytes of estimate for each of them (50 KiB),
-/// whatever the size of the document. A token longer than this stays whole.
+/// plus one doubling of the term table and of the vector of lists when it
+/// falls in that piece, whatever the size of the document. A token longer
+/// than this stays whole.
 const CHUNK_BYTES: usize = 1024;
 
 /// Heap bytes the allocator really uses for a request of `n` bytes: a header
