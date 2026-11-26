@@ -10,7 +10,8 @@ use nwdb_core::{
 };
 use nwdb_segment::textindex::parse;
 use nwdb_segment::{
-    MergeOptions, PartReader, PartWriter, PieceObserver, SearchLimits, WriterOptions, merge_parts,
+    MergeOptions, PartReader, PartWriter, PieceObserver, SPANS_FILE, SearchLimits, WriterOptions,
+    merge_parts,
 };
 use std::ops::Range;
 use std::path::Path;
@@ -198,11 +199,24 @@ fn a_stopped_merge_leaves_no_output_and_the_inputs_untouched() {
 }
 
 /// The flag is read before the first input is verified, not only after every
-/// input has been checked in full.
+/// input has been checked in full: the first input is damaged, which a
+/// verification would report as `Corrupt`.
 #[test]
 fn a_merge_stopped_before_it_starts_returns_unavailable_and_creates_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let (a, b) = inputs(tmp.path());
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(part_dir_name(1)).join(SPANS_FILE))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact_at(&mut byte, 0).unwrap();
+        byte[0] ^= 0x10;
+        f.write_all_at(&byte, 0).unwrap();
+    }
     let before = names(tmp.path());
     let r = merge_parts(
         &[&a, &b],
