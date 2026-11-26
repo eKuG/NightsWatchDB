@@ -10,6 +10,9 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # The registry lives in a volume too so dependencies download once.
 # Two checkouts tested at the same time must not share a target volume:
 # set NWDB_TARGET_VOLUME to a different name for each.
+# A target volume grows to several GB (every test file is its own binary that
+# links the Parquet library), so the build keeps no incremental cache and only
+# line tables for debugging. Remove volumes you no longer use.
 TARGET_VOLUME=${NWDB_TARGET_VOLUME:-nwdb-target}
 CARGO_VOLUME=${NWDB_CARGO_VOLUME:-nwdb-cargo}
 exec docker run --rm \
@@ -21,6 +24,8 @@ exec docker run --rm \
   -e CARGO_TARGET_DIR=/nwdb-target \
   -e CARGO_HOME=/nwdb-cargo \
   -e CARGO_TERM_COLOR=never \
+  -e CARGO_INCREMENTAL=0 \
+  -e CARGO_PROFILE_DEV_DEBUG=line-tables-only \
   -w /src \
   "$IMAGE" \
   sh -eu -c '
