@@ -38,14 +38,15 @@ Parquet settings:
 
 | Setting | Value | Why |
 |---|---|---|
-| Compression | zstd level 3, all columns | |
-| Statistics | page level (so also the column index), except off for `resource`, `scope`, `attrs`, `events` and `links` | row group pruning by `start_ns`; nothing prunes by the raw binary columns, so their statistics are wasted work |
-| Dictionary encoding | on, except off for `attrs`, `events` and `links` | `resource` and `scope` repeat heavily across spans; the other three are close to unique per row |
+| Compression | zstd level 3; level 6 for `attrs` | `attrs` is most of a part's bytes and long repeated text: level 6 makes it 4 to 5 bytes per span smaller than level 3, at about half a microsecond per span of write time; for every other column a higher level gains almost nothing |
+| Statistics | chunk level for every column except the raw ones, which have none; page level (so also the column index) for `start_ns` only | row group pruning reads the chunk statistics of `start_ns`; nothing prunes pages by another column, and the column index of every column cost about a quarter of a byte per span |
+| Dictionary encoding | on, except off for `attrs`, `events` and `links` and for the columns listed under Encodings | `resource` and `scope` repeat heavily across spans; the other three are close to unique per row |
+| Encodings | `trace_id`, `span_id`, `parent_span_id`: plain. `start_ns`: delta binary packed. `end_ns`, `input_tokens`, `output_tokens`: byte stream split. The summary has the same settings for the columns it shares by name | ids are random bytes, so dictionary keys only add to them; the other four are numbers of which only the low bytes vary, and the delta of a sorted value or the bytes split by position are far smaller than dictionary keys over thousands of distinct values (together about 8 bytes per span less) |
 | Offset index | on, for every column (also those without statistics) | lets a row selection skip pages; a test pins that `read_trace` does not fetch other traces' pages |
 | Bloom filters | off | the trace index replaces them |
 | Row group size | 16,384 rows or 64 MiB of stored value bytes, whichever first | rows range from 1 KB to several MB, so a row bound alone is unsafe; the row that crosses the byte bound stays in the group; the rope of a raw value, not the value, is what is counted |
 | Data page size | 1 MiB | |
-| Data page rows | 4,096 | a trace lookup should not decode a page of tens of thousands of unrelated small rows |
+| Data page rows | 4,096 | a trace lookup should not decode a page of tens of thousands of unrelated small rows; 16,384 would make a part 0.4 bytes per span (under 1%) smaller and opening a trace about a quarter slower |
 | Dictionary page | 1 MiB | |
 | Write batch | 256 values | the Parquet writer checks page limits between batches of this many values |
 
@@ -255,10 +256,10 @@ loads the whole file, checks all of the above, and binary-searches the records.
 ### `summary.parquet`
 
 One row per trace with `nwdb_core::summary_schema()`, sorted by
-`(start_ns, trace_id)`, with the same compression, statistics and page index
-settings, and row groups of 16,384 rows. Sorting by start time makes the
-`start_ns` statistics of the row groups nearly disjoint, so a time-range
-listing reads only the groups that overlap the range.
+`(start_ns, trace_id)`, with the same settings (the columns it shares with the
+span table by name are encoded alike), and row groups of 16,384 rows. Sorting
+by start time makes the `start_ns` statistics of the row groups nearly
+disjoint, so a time-range listing reads only the groups that overlap the range.
 
 ## Reading
 

@@ -15,7 +15,7 @@ use nwdb_core::{
 };
 use nwdb_payload::{MAX_PIECE_BYTES, PieceObserver, PieceWriter, PieceWriterOptions, rope};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 use std::collections::{BTreeMap, HashSet};
@@ -68,6 +68,11 @@ pub fn check_format_version(found: u32) -> nwdb_core::Result<()> {
 }
 
 const ZSTD_LEVEL: i32 = 3;
+/// `attrs` is most of the bytes of a part and is long text with many repeats:
+/// from level 6 on zstd finds them, and a part is 4 to 5 bytes per span
+/// smaller than at level 3. Every other column gains almost nothing from a
+/// higher level, so only this one pays the time.
+const ATTRS_ZSTD_LEVEL: i32 = 6;
 /// Size at which a data page is closed. Parquet's default, stated here
 /// because the read path relies on pages being small enough to skip.
 const DATA_PAGE_BYTES: usize = 1 << 20;
@@ -197,8 +202,12 @@ fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(ZSTD_LEVEL).expect("level is within zstd's range"),
         ))
-        // Page-level statistics also produce the column index.
-        .set_statistics_enabled(EnabledStatistics::Page)
+        // Chunk statistics are what row group pruning reads. Page statistics
+        // (the column index) are kept only for `start_ns`, below: nothing
+        // prunes pages by another column and the index costs about a quarter
+        // of a byte per span.
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_column_statistics_enabled(ColumnPath::from("start_ns"), EnabledStatistics::Page)
         // The offset index is on by default; stated so a change of default
         // cannot silently disable page skipping.
         .set_offset_index_disabled(false)
@@ -219,6 +228,31 @@ fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
         for name in ["resource", "scope"] {
             builder = builder.set_column_dictionary_enabled(ColumnPath::from(name), true);
         }
+        builder = builder.set_column_compression(
+            ColumnPath::from("attrs"),
+            Compression::ZSTD(
+                ZstdLevel::try_new(ATTRS_ZSTD_LEVEL).expect("level is within zstd's range"),
+            ),
+        );
+    }
+    // Encodings by column, for both files (the summary has some of the same
+    // columns). Ids are random bytes and a dictionary only adds its keys.
+    // Timestamps and token counts are numbers of which only the low bytes
+    // vary: the delta of a sorted value, or the bytes split by position so
+    // that zstd sees the constant ones together, is far smaller than
+    // dictionary keys over thousands of distinct values.
+    for name in ["trace_id", "span_id", "parent_span_id"] {
+        builder = builder
+            .set_column_dictionary_enabled(ColumnPath::from(name), false)
+            .set_column_encoding(ColumnPath::from(name), Encoding::PLAIN);
+    }
+    builder = builder
+        .set_column_dictionary_enabled(ColumnPath::from("start_ns"), false)
+        .set_column_encoding(ColumnPath::from("start_ns"), Encoding::DELTA_BINARY_PACKED);
+    for name in ["end_ns", "input_tokens", "output_tokens"] {
+        builder = builder
+            .set_column_dictionary_enabled(ColumnPath::from(name), false)
+            .set_column_encoding(ColumnPath::from(name), Encoding::BYTE_STREAM_SPLIT);
     }
     builder.build()
 }
