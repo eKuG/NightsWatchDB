@@ -28,6 +28,11 @@ use std::sync::Arc;
 const MIB: usize = 1 << 20;
 const WINDOW: usize = 4 * MIB;
 
+/// The most the writer's peak may grow for each short piece it holds.
+const BYTES_PER_PIECE: usize = 3;
+/// What the peak may move for reasons that do not follow the pieces.
+const FLAT_ALLOWANCE: usize = 4 * MIB;
+
 struct Chunks(usize);
 
 impl PayloadSplitter for Chunks {
@@ -108,7 +113,7 @@ fn write(
 }
 
 #[test]
-fn writer_and_reader_memory_do_not_follow_the_number_of_short_pieces() {
+fn writer_memory_grows_by_at_most_three_bytes_per_short_piece_and_the_reader_by_less() {
     let tmp = tempfile::tempdir().unwrap();
     let (_, start) = memory();
 
@@ -126,14 +131,18 @@ fn writer_and_reader_memory_do_not_follow_the_number_of_short_pieces() {
         WINDOW / MIB
     );
     assert!(big.payload.pieces > 3_000_000, "{:?}", big.payload);
-    // Five times the pieces, essentially the same peak: at 16 bytes a piece
-    // the writer would have held 45 MiB more.
+    // The writer holds the length of every piece, one byte for a short one,
+    // in a vector that doubles: up to three times its length while it grows,
+    // so 3 bytes a piece (the bound the README states), plus a flat allowance
+    // for what the process does besides. At 16 bytes a piece the writer would
+    // have held 45 MiB more than that.
+    let extra = (big.payload.pieces - small.payload.pieces) as usize;
     assert!(
-        peak_big <= peak_small + 8 * MIB,
+        peak_big <= peak_small + BYTES_PER_PIECE * extra + FLAT_ALLOWANCE,
         "peak grew from {} to {} MiB for {} more pieces",
         peak_small / MIB,
         peak_big / MIB,
-        big.payload.pieces - small.payload.pieces
+        extra
     );
 
     // What an open part holds for 3.5 million pieces: the lengths as they are

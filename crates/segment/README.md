@@ -511,16 +511,20 @@ pieces and writes the ropes. Memory is one row group of ropes (bounded in
 stored bytes), the de-duplication window (`WriterOptions::dedup_window_bytes`,
 default 64 MiB) with the open piece block and the map over its pieces, the
 length of every distinct piece in the compact form it has on disk (one to three
-bytes each, at most `max_pieces` of them: 16 to 32 MB at the default ceiling,
-for pieces under 16 KiB), plus 44 bytes of index entry, a trace summary, and a
+bytes each, at most `max_pieces` of them: 16 to 48 MB at the default ceiling,
+for pieces under 16 KiB), held in a vector that doubles, so that the peak while
+it grows is up to three times its length: **at most 3 bytes for each piece
+under 128 bytes** (50 MiB at the default ceiling of 16,777,216 pieces), and
+`pieces.idx` is written from that vector, not from a copy of it, plus 44 bytes of index entry, a trace summary, and a
 16-byte finished-id entry per trace. It does not grow with the amount of unique
 text: a test writes 120 MiB of text that never repeats through a 4 MiB window
 and shows the peak resident memory stays within a few MiB of what 24 MiB of such
 text took (with the text index and the row lists at 1 MiB; at their defaults
 each adds up to its budget, 32 MiB, to the peak of a part being written), and
-another that 3.5 million pieces of 12 bytes raise it by 6 MiB over
-what 0.7 million took (27 and 33 MiB; before, with 16 bytes a piece for the life
-of the part, 37 and 101 MiB). A part with no rows is refused, `window_ns` must be positive
+another that 3.5 million pieces of 12 bytes raise it by about 5 MiB over
+what 0.7 million took (31 and 36 MiB in one run; before, with 16 bytes a piece for the life
+of the part, 37 and 101 MiB). That test allows 3 bytes for each extra piece and
+4 MiB besides. A part with no rows is refused, `window_ns` must be positive
 (`InvalidArgument`), and dropping an unfinished writer removes its temporary
 directory.
 
