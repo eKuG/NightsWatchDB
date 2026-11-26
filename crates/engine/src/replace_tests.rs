@@ -654,3 +654,61 @@ fn a_flush_that_publishes_while_the_map_is_built_is_accounted_for() {
     assert_eq!(dirs_on_disk(dir.path()), ids);
     e.shutdown().unwrap();
 }
+
+/// A part that a flush publishes after the list was seen cannot be one of the
+/// parts to remove: the map was built for a list without it. The replacement
+/// is refused before the commit and nothing changes.
+#[test]
+fn a_part_published_while_the_map_is_built_cannot_be_removed_by_that_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let pause = Pause::new(Stage::ReplaceMapBuilt);
+    let mut o = opts(dir.path());
+    o.stage_hook = Some(pause.hook());
+    let e = open(o);
+    let mut m = Model::default();
+    populated(&e, &mut m);
+    let mut remove: Vec<u64> = windows_of(&e)
+        .into_iter()
+        .filter(|(_, w)| *w < 4_000)
+        .map(|(id, _)| id)
+        .collect();
+    let new_part = merged(&e, &remove);
+    let new_id = new_part.meta.part_id;
+    // The flush below is the next to take a part id.
+    let flushed_id = new_id + 1;
+    remove.push(flushed_id);
+    let before = part_ids(&e);
+    let version = e.inner().manifest.current().version;
+    let replacer = {
+        let e = e.clone();
+        let remove = remove.clone();
+        std::thread::spawn(move || e.inner().replace_parts(&remove, vec![new_part]))
+    };
+    pause.wait_reached();
+    let late: Vec<TSpan> = (1..=30u128).map(|t| span(t, 7)).collect();
+    ingest(&e, &late).unwrap();
+    m.add(&late);
+    e.flush().unwrap();
+    assert!(
+        part_ids(&e).contains(&flushed_id),
+        "the id was not predicted"
+    );
+    pause.release();
+    let err = replacer.join().unwrap().unwrap_err();
+    assert!(
+        err.to_string().contains("changed while a replacement"),
+        "{err}"
+    );
+    // The flush's part is still there, the old parts too, and the manifest
+    // is as the flush left it.
+    let ids = part_ids(&e);
+    assert!(ids.contains(&flushed_id));
+    assert!(before.iter().all(|id| ids.contains(id)));
+    assert!(!ids.contains(&new_id));
+    assert_eq!(e.inner().manifest.current().version, version + 1);
+    check_split(&e.snapshot(), "after the refusal");
+    m.check(&e, "after the refusal");
+    std::fs::remove_dir_all(dir.path().join("parts").join(part_dir_name(new_id))).unwrap();
+    assert_eq!(manifest_ids(dir.path()), ids);
+    e.shutdown().unwrap();
+}
