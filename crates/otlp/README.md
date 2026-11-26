@@ -186,10 +186,11 @@ request size bound the dictionaries; the keys cost 28 bytes a row.
 
 Spans that carry almost nothing are the exception. A span with only its two
 ids is 30 bytes on the wire (with the field header around it) and takes about
-195 bytes in the table, because every column has a slot per row (offsets,
-fixed-width values, 28 bytes of keys). Arrow's buffers also grow by doubling,
+198 bytes in the table (8,192 spans in one batch measure 198 bytes a row, the
+`arrival` column's 8 included), because every column has a slot per row
+(offsets, fixed-width values, 28 bytes of keys). Arrow's buffers also grow by doubling,
 so a batch whose row count is just past a power of two holds up to twice what
-its rows need. Measured on requests of only such spans, the worst case is 10.1
+its rows need. Measured on requests of only such spans, the worst case is 10.6
 times the request size (4,097 spans in one batch; 6 to 7 times for 8,192
 rows), not counting the 64 KiB per batch. A span with a short
 name and two timestamps is about 60 bytes on the wire and stays under the 8
