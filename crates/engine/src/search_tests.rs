@@ -267,12 +267,7 @@ fn the_budget_for_confirming_a_phrase_is_shared_by_all_parts() {
             .map(|k| {
                 let line = format!("beta alpha {part}-{k:03} filler");
                 bytes += line.len() as u64;
-                span_with(
-                    part + 1,
-                    k + 1,
-                    100 * (part as i64 + 1) + k as i64,
-                    &[&line],
-                )
+                span_with(part + 1, k + 1, 100 * (part as i64 + 1) + k as i64, &line)
             })
             .collect();
         per_part = bytes;

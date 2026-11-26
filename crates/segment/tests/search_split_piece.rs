@@ -74,10 +74,9 @@ fn every_query_kind_sees_a_piece_cut_between_index_segments() {
 
     // the piece really is in several segments
     let idx = tmp.path().join(part_dir_name(1)).join(TEXT_INDEX_FILE);
-    let meta = IndexReader::open(std::fs::File::open(idx).unwrap())
+    let meta = *IndexReader::open(std::fs::File::open(idx).unwrap())
         .unwrap()
-        .meta()
-        .clone();
+        .meta();
     assert!(meta.segments >= 4, "{meta:?}");
     assert_eq!(meta.docs, 3);
 

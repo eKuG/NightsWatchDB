@@ -466,23 +466,23 @@ fn search_matches_a_model_when_spans_are_sent_again_with_other_content() {
         model.add(&spans);
         ingest_flushing(&e, &spans, 11);
         for round in 0..3 {
-            let again: Vec<TSpan> = spans
-                .iter()
-                .filter(|_| rng.random_bool(0.3))
-                .map(|s| {
-                    let mut c = s.clone();
-                    c.name = format!("again-{round}");
-                    if rng.random_bool(0.5) {
-                        c.start = (c.start - rng.random_range(0..=200)).max(0);
-                        c.end = c.start + 10;
-                    }
-                    let lines: Vec<String> = (0..rng.random_range(0..3))
-                        .map(|_| message(&mut rng))
-                        .collect();
-                    c.attrs = lines.join("\n").into_bytes();
-                    c
-                })
-                .collect();
+            let mut again: Vec<TSpan> = Vec::new();
+            for s in &spans {
+                if !rng.random_bool(0.3) {
+                    continue;
+                }
+                let mut c = s.clone();
+                c.name = format!("again-{round}");
+                if rng.random_bool(0.5) {
+                    c.start = (c.start - rng.random_range(0..=200)).max(0);
+                    c.end = c.start + 10;
+                }
+                let lines: Vec<String> = (0..rng.random_range(0..3))
+                    .map(|_| message(&mut rng))
+                    .collect();
+                c.attrs = lines.join("\n").into_bytes();
+                again.push(c);
+            }
             model.add(&again);
             ingest_flushing(&e, &again, 7);
         }
