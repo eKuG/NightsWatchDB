@@ -14,6 +14,7 @@ use nwdb_core::{
     BatchLimits, Error, PayloadSplitter, RawColumn, SpanBatchBuilder, SpanId, SpanRecord, TraceId,
     part_dir_name,
 };
+use nwdb_payload::json_search_text;
 use nwdb_segment::{
     DEFAULT_MIN_PIECE_BYTES, MergeOptions, PartReader, PartWriter, SearchLimits, TEXT_INDEX_FILE,
     TEXT_ROWS_FILE, WriterOptions, merge_parts,
@@ -103,7 +104,7 @@ impl Row {
         {
             for cut in lines(value) {
                 if cut.len() >= DEFAULT_MIN_PIECE_BYTES {
-                    out.push(value[cut].to_vec());
+                    out.push(json_search_text(&value[cut]).into_owned());
                 }
             }
         }

@@ -12,6 +12,7 @@ use arrow_array::RecordBatch;
 use common::*;
 use nwdb_core::{BatchLimits, PayloadSplitter, RawColumn, SpanId, TraceId, part_dir_name};
 use nwdb_otlp::{OtlpSplitter, TraceDecoder};
+use nwdb_payload::json_search_text;
 use nwdb_payload::{MAX_PIECE_BYTES, rope};
 use nwdb_segment::textindex::{Query, contains_token, phrase_matches, tokens};
 use nwdb_segment::{
@@ -237,7 +238,7 @@ fn row_pieces(batches: &[RecordBatch]) -> Vec<(TraceId, SpanId, Vec<Vec<u8>>)> {
                 pieces.extend(
                     cuts.into_iter()
                         .filter(|c| c.len() >= DEFAULT_MIN_PIECE_BYTES)
-                        .map(|c| value[c].to_vec()),
+                        .map(|c| json_search_text(&value[c]).into_owned()),
                 );
             }
             (r.trace_id, r.span_id, pieces)
