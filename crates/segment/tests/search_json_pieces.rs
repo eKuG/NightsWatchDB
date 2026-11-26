@@ -153,15 +153,20 @@ fn the_index_and_the_confirmation_agree_on_every_piece() {
     let mut checked = 0;
     for _ in 0..400 {
         let src = rng.random_range(0..values.len());
-        let toks: Vec<String> = tokens(&texts[src])
-            .filter_map(|t| String::from_utf8(t.raw().to_ascii_lowercase()).ok())
+        // A token that is not UTF-8 cannot be written in a query, but it
+        // still separates its neighbours, so it stays in the list as None.
+        let toks: Vec<Option<String>> = tokens(&texts[src])
+            .map(|t| String::from_utf8(t.raw().to_ascii_lowercase()).ok())
             .collect();
         if toks.len() < 2 {
             continue;
         }
         let at = rng.random_range(0..toks.len() - 1);
         let n = rng.random_range(1..=(toks.len() - at).min(3));
-        let phrase = &toks[at..at + n];
+        let Some(phrase) = toks[at..at + n].iter().cloned().collect::<Option<Vec<_>>>() else {
+            continue;
+        };
+        let phrase = &phrase[..];
         let q = if n == 1 {
             phrase[0].clone()
         } else {
