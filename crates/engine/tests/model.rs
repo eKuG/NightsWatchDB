@@ -110,6 +110,26 @@ impl Gen {
     }
 }
 
+/// The spans sent again with other content: the same trace, span id, start
+/// and end, but another name, model, token counts and text. The engine keeps
+/// the copy that arrived first, and so does the model, so a resend that kept
+/// the wrong copy shows in `get_trace`, and in every summary once the copies
+/// are merged.
+fn conflicting(spans: &[TSpan], tag: u64) -> Vec<TSpan> {
+    spans
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.name = format!("again-{tag}");
+            s.model = Some("m9".into());
+            s.input = Some(tag as i64);
+            s.output = Some(1);
+            s.attrs.extend_from_slice(b"a copy with other content");
+            s
+        })
+        .collect()
+}
+
 fn random_list(rng: &mut StdRng) -> ListQuery {
     let a = rng.random_range(-100..TIME + 100);
     let b = rng.random_range(-100..TIME + 100);
@@ -157,7 +177,8 @@ fn random_operations_agree_with_the_model() {
     };
     // The last request sent, while a retry of it would still land in the same
     // buffers. A flush or restart makes a retry cross into a part, where the
-    // engine documents it is counted twice, so those clear it.
+    // engine documents it is counted twice, so those clear it. A retry carries
+    // other content: the copy that arrived first must stay.
     let mut retryable: Option<Vec<TSpan>> = None;
     let (mut flushes, mut reopens, mut queries) = (0, 0, 0);
 
@@ -169,12 +190,12 @@ fn random_operations_agree_with_the_model() {
                 if rng.random_bool(0.15) {
                     // A retried request: the same spans sent again.
                     if let Some(prev) = retryable.take().filter(|_| !background) {
-                        spans = prev;
+                        spans = conflicting(&prev, step as u64);
                     }
                 } else if rng.random_bool(0.1) {
                     // A duplicate inside one request.
-                    let first = spans[0].clone();
-                    spans.push(first);
+                    let again = conflicting(&spans[..1], step as u64);
+                    spans.extend(again);
                 }
                 ingest(&e, &spans).unwrap();
                 model.add(&spans);
@@ -232,7 +253,9 @@ fn random_operations_agree_with_the_model() {
 /// merges now and then, explicit passes merge at chosen moments, a clock the
 /// test moves expires windows, and spans are sent again after a flush. Until
 /// a window is merged such a span is counted twice by the listing (the known
-/// limit); the model says so exactly: `get_trace` is always right, the
+/// limit), and the resent copy has other content than the first one, which
+/// must be the one every query shows; the model says so exactly: `get_trace`
+/// is always right, the
 /// listing is right for every other trace and not below the model for these,
 /// and after a flush and a merge of everything every query is exact.
 #[test]
@@ -296,11 +319,11 @@ fn random_operations_with_compaction_and_retention_agree_with_the_model() {
                             unmerged.extend(old.iter().map(|s| s.trace));
                             resends += 1;
                         }
-                        spans = old;
+                        spans = conflicting(&old, step as u64);
                     }
                 } else if rng.random_bool(0.1) {
-                    let first = spans[0].clone();
-                    spans.push(first);
+                    let again = conflicting(&spans[..1], step as u64);
+                    spans.extend(again);
                 }
                 ingest(&e, &spans).unwrap();
                 model.add(&spans);

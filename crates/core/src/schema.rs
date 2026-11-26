@@ -16,6 +16,12 @@
 //!    `events`, `links`. `resource` and `scope` are dictionary columns.
 //! 5. `dropped_attributes_count`, `dropped_events_count`,
 //!    `dropped_links_count`.
+//! 6. `arrival` (`UInt64`, never null): the number of the write-ahead-log
+//!    record the row arrived in. The engine sets it when a batch enters its
+//!    buffer and it travels with the row through flush and merge. When a span
+//!    is stored more than once, the copy with the smallest `arrival` is the
+//!    one that is shown. A batch built by a decoder holds 0 here. It is not
+//!    part of any API output and not in the summary.
 //!
 //! # Origin columns
 //!
@@ -119,6 +125,7 @@ pub mod col {
         DROPPED_ATTRIBUTES_COUNT = "dropped_attributes_count",
         DROPPED_EVENTS_COUNT = "dropped_events_count",
         DROPPED_LINKS_COUNT = "dropped_links_count",
+        ARRIVAL = "arrival",
     }
 }
 
@@ -169,6 +176,7 @@ fn build() -> SchemaRef {
         f(col::DROPPED_ATTRIBUTES_COUNT, UInt32, false),
         f(col::DROPPED_EVENTS_COUNT, UInt32, false),
         f(col::DROPPED_LINKS_COUNT, UInt32, false),
+        f(col::ARRIVAL, UInt64, false),
     ]))
 }
 
@@ -229,6 +237,7 @@ mod tests {
             "dropped_attributes_count:UInt32:required",
             "dropped_events_count:UInt32:required",
             "dropped_links_count:UInt32:required",
+            "arrival:UInt64:required",
         ];
         assert_eq!(got, want);
     }

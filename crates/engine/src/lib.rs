@@ -11,11 +11,13 @@
 //! # Duplicates
 //!
 //! A sender that retries after an error whose outcome was unknown can deliver
-//! the same span twice. Within one flush, and in [`Snapshot::get_trace`],
-//! duplicate `(trace id, span id)` pairs are removed. Duplicates that landed
-//! in different parts are not removed from [`Snapshot::list_traces`] counts or
-//! [`Snapshot::aggregate_tokens`] until the window they are in is merged (see
-//! [`CompactionOptions`]); a merge keeps one copy.
+//! the same span twice. Every row records the log record it arrived in (its
+//! `arrival`), and of a span stored more than once the copy with the smallest
+//! `arrival` is the one shown: in a flush, in a merge, in
+//! [`Snapshot::get_trace`] and in [`Snapshot::search`], before and after any
+//! merge. Copies that landed in different parts are still counted by
+//! [`Snapshot::list_traces`] and [`Snapshot::aggregate_tokens`] until the parts
+//! are merged (see [`CompactionOptions`]); a merge keeps one copy.
 
 mod compaction;
 mod engine;
@@ -38,7 +40,8 @@ pub use engine::{Clock, Engine, EngineOptions, EngineStats, Stage, StageHook};
 pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
 pub use search::{SearchHit, SearchQuery, SearchResults, SearchStats};
 
-/// Limits of one search of one part.
+/// Limits of a search. `max_confirm_bytes` is one budget for all the parts of
+/// one engine search.
 pub use nwdb_segment::SearchLimits;
 /// The full-text query model: [`textindex::Query`] and [`textindex::parse`].
 pub use nwdb_textindex as textindex;

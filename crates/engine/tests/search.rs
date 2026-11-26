@@ -402,3 +402,108 @@ fn search_agrees_with_the_model_for_texts_the_parser_accepts() {
             .is_empty()
     );
 }
+
+fn starts(e: &nwdb_engine::Engine, limit: usize) -> Vec<i64> {
+    let q = SearchQuery {
+        query: parse("needle").unwrap(),
+        from_ns: i64::MIN,
+        to_ns: i64::MAX,
+        limit,
+    };
+    e.search(&q)
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| h.start_ns)
+        .collect()
+}
+
+/// The walk visits parts newest bound first and stops once the limit is held
+/// and the next part's bound is below the worst held start. The copy of a
+/// span that arrived first must be the one returned all the same: with a
+/// small limit, with room, and after the window is merged.
+#[test]
+fn a_span_in_two_parts_is_the_earlier_copy_whatever_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = compact_opts(dir.path());
+    o.splitter = Some(Arc::new(Lines));
+    let e = open(o);
+    // The same trace id and span id twice, in two flushes of one window; the
+    // second copy has a later start.
+    let mut first = TSpan::new(1, 1, 100);
+    first.attrs = b"the needle is here".to_vec();
+    let mut again = first.clone();
+    again.start = 500;
+    again.end = 510;
+    ingest(&e, &[first]).unwrap();
+    e.flush().unwrap();
+    ingest(&e, &[again]).unwrap();
+    e.flush().unwrap();
+
+    let with_room = starts(&e, 10);
+    assert_eq!(with_room, [100], "the copy of the earlier arrival");
+    let one = starts(&e, 1);
+    compact_fully(&e);
+    let merged = starts(&e, 1);
+    assert_eq!(merged, [100], "a merge keeps the earlier copy");
+    assert_eq!(one, merged, "the limit changes nothing");
+}
+
+/// Spans sent again with other text and starts, in other flushes and so in
+/// other parts and windows: every search agrees with a model that keeps the
+/// copy that arrived first, with ties, ranges and limits, before and after
+/// the merges and after a restart.
+#[test]
+fn search_matches_a_model_when_spans_are_sent_again_with_other_content() {
+    for seed in 0..3u64 {
+        let mut rng = StdRng::seed_from_u64(100 + seed);
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = compact_opts(dir.path());
+        o.splitter = Some(Arc::new(Lines));
+        let e = open(o);
+        let spans = world(&mut rng, 4, 40, 1);
+        let mut model = Model::default();
+        model.add(&spans);
+        ingest_flushing(&e, &spans, 11);
+        for round in 0..3 {
+            let again: Vec<TSpan> = spans
+                .iter()
+                .filter(|_| rng.random_bool(0.3))
+                .map(|s| {
+                    let mut c = s.clone();
+                    c.name = format!("again-{round}");
+                    if rng.random_bool(0.5) {
+                        c.start = (c.start - rng.random_range(0..=200)).max(0);
+                        c.end = c.start + 10;
+                    }
+                    let lines: Vec<String> = (0..rng.random_range(0..3))
+                        .map(|_| message(&mut rng))
+                        .collect();
+                    c.attrs = lines.join("\n").into_bytes();
+                    c
+                })
+                .collect();
+            model.add(&again);
+            ingest_flushing(&e, &again, 7);
+        }
+        check(&e.snapshot(), &model, &mut rng, 100, "before any merge");
+        e.run_maintenance().unwrap();
+        check(&e.snapshot(), &model, &mut rng, 60, "after one pass");
+        compact_fully(&e);
+        check(
+            &e.snapshot(),
+            &model,
+            &mut rng,
+            60,
+            "after the final merges",
+        );
+
+        e.shutdown().unwrap();
+        drop(e);
+        let mut o = compact_opts(dir.path());
+        o.splitter = Some(Arc::new(Lines));
+        let e = open(o);
+        check(&e.snapshot(), &model, &mut rng, 60, "after a restart");
+        e.shutdown().unwrap();
+    }
+}

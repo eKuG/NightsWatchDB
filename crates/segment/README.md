@@ -29,7 +29,9 @@ files.
 ### `spans.parquet`
 
 One row per span with exactly `nwdb_core::span_schema()`, in the order the
-writer was given them. The columns `attrs`, `events` and `links` hold ropes
+writer was given them. The last column, `arrival`, is the number of the log
+record the row arrived in; of a span stored more than once the copy with the
+smallest value is the one that is shown. It is not in `summary.parquet`. The columns `attrs`, `events` and `links` hold ropes
 (see below) instead of the raw values. The spans of a trace are adjacent (the writer rejects
 input that interleaves traces), so a trace is a contiguous row range and
 repeated text between its spans compresses well.
@@ -41,7 +43,7 @@ Parquet settings:
 | Compression | zstd level 3; level 6 for `attrs` | `attrs` is most of a part's bytes and long repeated text: level 6 makes it 4 to 5 bytes per span smaller than level 3, at about half a microsecond per span of write time; for every other column a higher level gains almost nothing |
 | Statistics | chunk level for every column except the raw ones, which have none; page level (so also the column index) for `start_ns` only | row group pruning reads the chunk statistics of `start_ns`; nothing prunes pages by another column, and the column index of every column cost about a quarter of a byte per span |
 | Dictionary encoding | on, except off for `attrs`, `events` and `links` and for the columns listed under Encodings | `resource` and `scope` repeat heavily across spans; the other three are close to unique per row |
-| Encodings | `trace_id`, `span_id`, `parent_span_id`: plain. `start_ns`: delta binary packed. `end_ns`, `input_tokens`, `output_tokens`: byte stream split. The summary has the same settings for the columns it shares by name | ids are random bytes, so dictionary keys only add to them; the other four are numbers of which only the low bytes vary, and the delta of a sorted value or the bytes split by position are far smaller than dictionary keys over thousands of distinct values (together about 8 bytes per span less) |
+| Encodings | `trace_id`, `span_id`, `parent_span_id`: plain. `start_ns` and `arrival`: delta binary packed. `end_ns`, `input_tokens`, `output_tokens`: byte stream split. The summary has the same settings for the columns it shares by name | ids are random bytes, so dictionary keys only add to them; the other four are numbers of which only the low bytes vary, and the delta of a sorted value or the bytes split by position are far smaller than dictionary keys over thousands of distinct values (together about 8 bytes per span less) |
 | Offset index | on, for every column (also those without statistics) | lets a row selection skip pages; a test pins that `read_trace` does not fetch other traces' pages |
 | Bloom filters | off | the trace index replaces them |
 | Row group size | 16,384 rows or 64 MiB of stored value bytes, whichever first | rows range from 1 KB to several MB, so a row bound alone is unsafe; the row that crosses the byte bound stays in the group; the rope of a raw value, not the value, is what is counted |
@@ -193,7 +195,7 @@ them; a test pins this for 1 MiB values.
 ```
 offset  size   field
 0       4      magic "NWTI"
-4       4      version, u32 = 6, the part format version
+4       4      version, u32 = 7, the part format version
 8       8      trace count N, u64
 16      8      length of spans.parquet in bytes, u64
 24      4      CRC-32C of every byte of spans.parquet, u32
@@ -501,10 +503,13 @@ What the output is:
   trace with rows in several inputs is one run. The trace index and the summary
   are built by the writer a flush uses; the summary of a trace is computed from
   its merged rows.
-- A `(trace_id, span_id)` that occurs more than once is kept once: the row of
-  the earliest input, and within one input its first row. The others are
+- A `(trace_id, span_id)` that occurs more than once is kept once: the row with
+  the smallest `arrival`; among equal values the row of the earlier input, and
+  within one input its first row. So the order of the inputs matters only for
+  rows with the same `arrival`. The others are
   `MergeStats::duplicates_dropped`. A row that differs in content but shares
-  the ids of an earlier one loses to it.
+  the ids of a row that arrived earlier loses to it, and the kept row keeps its
+  own `arrival`.
 - Every value of every kept row reads back byte for byte as the input returns
   it, including nulls, origins and ropes.
 - The ordering of traces looks at the earliest start of any row of the trace in
@@ -561,8 +566,8 @@ How it works:
   (default 32 MiB), or 524,288 rows; one trace is never split between chunks
   unless a chunk is only that trace. The size of a row is estimated from the
   average of its row group, so a group that mixes tiny and huge rows can make a
-  chunk larger than the bound. For a chunk: (1) the keys (`span_id`, `start_ns`)
-  of its rows are read, 32 bytes a row, each input's rows in coalesced runs;
+  chunk larger than the bound. For a chunk: (1) the keys (`span_id`, `start_ns`,
+  `arrival`) of its rows are read, 40 bytes a row, each input's rows in coalesced runs;
   (2) duplicates are dropped and the rows are ordered as a flush orders them;
   (3) the rows are cut into units of about `chunk_bytes` (this is what bounds a
   trace larger than a chunk: it is processed in several units, in order) and for
@@ -599,7 +604,7 @@ An input of another format version is refused there too (`open` checks the
 version first); a merge is only given open readers.
 
 Memory, besides the chunk: 24 bytes per distinct trace for the order, 4 bytes
-per piece of every input for the translation table, 32 bytes per row of the
+per piece of every input for the translation table, 40 bytes per row of the
 chunk for its keys (at most 16 MiB unless one trace has more rows than that), the
 output batch (the chunk size, between 1 and 16 MiB), and what the writer
 itself holds, which is what a flush holds: a row group, the de-duplication
@@ -628,7 +633,7 @@ prompt and tools in each part, conversations that grow across them) became
 
 ## Format version
 
-`FORMAT_VERSION` (6) is recorded in `PartMeta.format_version`, which the
+`FORMAT_VERSION` (7) is recorded in `PartMeta.format_version`, which the
 manifest stores for every part, and in the header of `traces.idx`. The engine
 checks the manifest's value and `PartReader::open` the index's, both before
 looking at any Parquet file. It covers the columns of `spans.parquet` and
@@ -646,4 +651,5 @@ CRC-32C of `pieces.idx` with the one in the index; 6 adds the length of the
 rebuilt value to every rope that has a reference, after its checksum, and adds
 the text index and the piece-to-rows lists, `text.idx` and `text.rows`, and
 records their lengths and checksums in the index header (the header grows from
-64 to 88 bytes).
+64 to 88 bytes); 7 adds the `arrival` column (`UInt64`, the last column) to
+`spans.parquet`.

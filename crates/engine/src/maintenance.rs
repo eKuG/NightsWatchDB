@@ -506,7 +506,8 @@ impl Inner {
     /// directory is gone (except after `Fatal`, where whether the commit
     /// happened is not known and a restart decides).
     fn merge_one(&self, live: &[Arc<LivePart>], plan: &MergePlan) -> Result<Replaced> {
-        // Oldest first: ids grow with time.
+        // Oldest first: ids grow with time. Which copy of a span a merge keeps
+        // does not depend on this order; it matters only for equal arrivals.
         let mut inputs: Vec<&Arc<LivePart>> = live
             .iter()
             .filter(|p| plan.parts.contains(&p.meta.part_id))

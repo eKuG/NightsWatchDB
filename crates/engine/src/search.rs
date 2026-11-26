@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, ArrayAccessor, DictionaryArray, FixedSizeBinaryArray, Int64Array, RecordBatch,
-    StringArray,
+    StringArray, UInt64Array,
 };
 use nwdb_core::{Error, Result, SpanId, TraceId, col};
 use nwdb_segment::{PartReader, SearchLimits};
@@ -78,10 +78,18 @@ pub struct SearchStats {
     pub rows_read: u64,
     /// Calls that read a range of rows.
     pub row_ranges_read: u64,
+    /// Lookups of a split trace in another part to see whether a copy of a
+    /// matching span there arrived earlier: one per other part that holds
+    /// the trace, for each split trace that has a matching span in the time
+    /// range.
+    pub winner_lookups: u64,
+    /// Bytes of piece text read to confirm phrases and long words, all parts
+    /// together; the one budget [`SearchLimits::max_confirm_bytes`] limits.
+    pub confirm_bytes: u64,
 }
 
 /// The columns a hit needs. None of the raw columns, so no piece is read.
-const PROJECTION: [&str; 8] = [
+const PROJECTION: [&str; 9] = [
     col::TRACE_ID,
     col::SPAN_ID,
     col::START_NS,
@@ -90,6 +98,7 @@ const PROJECTION: [&str; 8] = [
     col::SERVICE_NAME,
     col::OPERATION,
     col::REQUEST_MODEL,
+    col::ARRIVAL,
 ];
 
 /// Matching rows closer than this are read in one range, the rows between
@@ -106,10 +115,8 @@ type Key = (Reverse<i64>, TraceId, SpanId);
 /// The best spans found so far.
 struct Held {
     limit: usize,
-    /// In key order, so the worst is last. The part is the index of the part
-    /// the copy was read from.
-    hits: BTreeMap<Key, (usize, SearchHit)>,
-    by_id: HashMap<(TraceId, SpanId), Key>,
+    /// In key order, so the worst is last.
+    hits: BTreeMap<Key, SearchHit>,
 }
 
 impl Held {
@@ -134,31 +141,80 @@ impl Held {
                 .is_some_and(|(worst, _)| key < worst)
     }
 
-    /// Adds a span read from part `part`. A span that is already held, seen in
-    /// two parts, is kept once, from the older part (a merge keeps the row of
-    /// the earliest input, so the answer does not change when the parts are
-    /// merged).
-    fn insert(&mut self, part: usize, hit: SearchHit) {
+    /// Adds a span. Only the winning copy of a span is ever offered (see
+    /// [`Rivals`]), so a span is never held twice.
+    fn insert(&mut self, hit: SearchHit) {
         let key: Key = (Reverse(hit.start_ns), hit.trace_id, hit.span_id);
-        let id = (hit.trace_id, hit.span_id);
-        if let Some(old_key) = self.by_id.get(&id).copied() {
-            let old_part = self.hits[&old_key].0;
-            if old_part <= part {
-                return;
-            }
-            self.hits.remove(&old_key);
-            self.by_id.remove(&id);
-        }
         if !self.admits(&key) {
             return;
         }
-        if self.is_full()
-            && let Some((_, (_, gone))) = self.hits.pop_last()
-        {
-            self.by_id.remove(&(gone.trace_id, gone.span_id));
+        if self.is_full() {
+            self.hits.pop_last();
         }
-        self.by_id.insert(id, key);
-        self.hits.insert(key, (part, hit));
+        self.hits.insert(key, hit);
+    }
+}
+
+/// For each span id, the smallest `(arrival, part)` among its copies.
+type Earliest = HashMap<[u8; 8], (u64, usize)>;
+
+/// Decides whether a row of one part is the copy of its span that is shown.
+///
+/// A span stored in several parts is shown from the row with the smallest
+/// `arrival`; among equal values, from the part that is first in the list. A
+/// trace that is not in the split map is in one part, which never holds a
+/// span twice, so its rows win without a lookup. For a trace that is in the
+/// map, the span ids and `arrival` of the trace's rows in every other holder
+/// are read once, and kept until a row of another trace is asked about; the
+/// rows of one part come out in trace order, so each split trace is looked up
+/// once per part searched.
+struct Rivals<'a> {
+    snapshot: &'a Snapshot,
+    /// The part being searched.
+    part: usize,
+    /// The last split trace looked up: for each span id in its other holders,
+    /// the smallest `(arrival, part)`.
+    last: Option<(TraceId, Earliest)>,
+    lookups: u64,
+}
+
+impl Rivals<'_> {
+    /// True if another part holds a copy of the span that wins over this one.
+    /// The time range and the query play no part: a copy that does not match
+    /// still hides the ones that arrived after it.
+    fn beaten(&mut self, trace: TraceId, span: SpanId, arrival: u64) -> Result<bool> {
+        let Some(holders) = self.snapshot.vis.split.holders(&trace) else {
+            return Ok(false);
+        };
+        if self.last.as_ref().is_none_or(|(t, _)| *t != trace) {
+            let mut best = Earliest::new();
+            for &h in holders {
+                let h = h as usize;
+                if h == self.part {
+                    continue;
+                }
+                self.lookups += 1;
+                let reader = &self.snapshot.vis.parts[h].reader;
+                let batches = reader.read_trace(trace, Some(&[col::SPAN_ID, col::ARRIVAL]))?;
+                for batch in batches.into_iter().flatten() {
+                    let spans: &FixedSizeBinaryArray = column(&batch, col::SPAN_ID)?;
+                    let arrivals: &UInt64Array = column(&batch, col::ARRIVAL)?;
+                    for r in 0..batch.num_rows() {
+                        let id = SpanId::from_slice(spans.value(r))?.0;
+                        let rank = (arrivals.value(r), h);
+                        best.entry(id)
+                            .and_modify(|b| *b = (*b).min(rank))
+                            .or_insert(rank);
+                    }
+                }
+            }
+            self.last = Some((trace, best));
+        }
+        Ok(self
+            .last
+            .as_ref()
+            .and_then(|(_, best)| best.get(&span.0))
+            .is_some_and(|&rival| rival < (arrival, self.part)))
     }
 }
 
@@ -191,8 +247,20 @@ impl Snapshot {
     /// # Duplicates
     ///
     /// The same `(trace id, span id)` can be in two parts (a retry that
-    /// crossed a flush, until compaction merges the window). It is returned
-    /// once, the copy of the older part, as a merge would keep it.
+    /// crossed a flush, until compaction merges the parts). Only the copy with
+    /// the smallest `arrival` is a hit, the one [`get_trace`](Self::get_trace)
+    /// returns and a merge keeps; among equal values the copy of the part that
+    /// is first in the list. This holds whatever the limit, the time range and
+    /// the query: a copy that is not the earliest is never returned, even when
+    /// the earliest does not match the query or starts outside the range.
+    ///
+    /// The check happens for each matching row in the time range before it is
+    /// held, so it does not disturb the early stop below. It costs one lookup
+    /// of the trace in each other part that holds it, reading only the span id
+    /// and `arrival` of the trace's rows, and only for a hit whose trace is
+    /// in the split map; a hit whose trace is in one part costs nothing.
+    /// Spans in the memory buffer are not searched, and they always arrived
+    /// later than the ones in parts, so they cannot hide a hit.
     ///
     /// # How the walk stops early
     ///
@@ -218,13 +286,23 @@ impl Snapshot {
     /// rows and the `limit` best hits.
     ///
     /// A query over a limit of [`SearchLimits`] is
-    /// [`Error::InvalidArgument`] saying which.
+    /// [`Error::InvalidArgument`] saying which. The limit on the bytes read to
+    /// confirm phrases and long words is one budget for the whole search, not
+    /// one per part: each part gets what the earlier parts left.
     pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>> {
         self.search_with_stats(query).map(|(hits, _)| hits)
     }
 
     /// [`search`](Self::search) and a count of the work it did.
     pub fn search_with_stats(&self, query: &SearchQuery) -> Result<(Vec<SearchHit>, SearchStats)> {
+        self.search_limited(query, SearchLimits::default())
+    }
+
+    pub(crate) fn search_limited(
+        &self,
+        query: &SearchQuery,
+        limits: SearchLimits,
+    ) -> Result<(Vec<SearchHit>, SearchStats)> {
         let parts = &self.vis.parts;
         let mut stats = SearchStats {
             parts: parts.len() as u64,
@@ -250,11 +328,9 @@ impl Snapshot {
         }
         order.sort_unstable_by_key(|&(upper, i)| (Reverse(upper), i));
 
-        let limits = SearchLimits::default();
         let mut held = Held {
             limit: query.limit,
             hits: BTreeMap::new(),
-            by_id: HashMap::new(),
         };
         for (n, &(upper, i)) in order.iter().enumerate() {
             // Stop: see the comment on `search`.
@@ -263,12 +339,24 @@ impl Snapshot {
                 break;
             }
             let reader = &parts[i].reader;
-            let rows = reader.search(&query.query, &limits)?;
+            let left = SearchLimits {
+                max_confirm_bytes: limits.max_confirm_bytes.saturating_sub(stats.confirm_bytes),
+                ..limits
+            };
+            let (rows, spent) = reader.search_counted(&query.query, &left)?;
+            stats.confirm_bytes += spent;
             stats.parts_searched += 1;
             stats.rows_matched += rows.len() as u64;
-            collect(reader, i, &rows, query, &mut held, &mut stats)?;
+            let mut rivals = Rivals {
+                snapshot: self,
+                part: i,
+                last: None,
+                lookups: 0,
+            };
+            collect(reader, &rows, query, &mut held, &mut rivals, &mut stats)?;
+            stats.winner_lookups += rivals.lookups;
         }
-        let hits = held.hits.into_values().map(|(_, hit)| hit).collect();
+        let hits = held.hits.into_values().collect();
         Ok((hits, stats))
     }
 }
@@ -277,10 +365,10 @@ impl Snapshot {
 /// to `held`.
 fn collect(
     reader: &PartReader,
-    part: usize,
     rows: &[u32],
     query: &SearchQuery,
     held: &mut Held,
+    rivals: &mut Rivals<'_>,
     stats: &mut SearchStats,
 ) -> Result<()> {
     let mut i = 0;
@@ -309,7 +397,7 @@ fn collect(
                     next += 1;
                 }
                 if next < wanted.len() && u64::from(wanted[next]) == row {
-                    cols.consider(r, part, query, held)?;
+                    cols.consider(r, query, held, rivals)?;
                 }
                 row += 1;
             }
@@ -329,6 +417,7 @@ struct HitColumns<'a> {
     service_name: &'a DictionaryArray<Int32Type>,
     operation: &'a StringArray,
     request_model: &'a StringArray,
+    arrival: &'a UInt64Array,
 }
 
 impl<'a> HitColumns<'a> {
@@ -342,21 +431,29 @@ impl<'a> HitColumns<'a> {
             service_name: column(batch, col::SERVICE_NAME)?,
             operation: column(batch, col::OPERATION)?,
             request_model: column(batch, col::REQUEST_MODEL)?,
+            arrival: column(batch, col::ARRIVAL)?,
         })
     }
 
-    fn consider(&self, r: usize, part: usize, query: &SearchQuery, held: &mut Held) -> Result<()> {
+    fn consider(
+        &self,
+        r: usize,
+        query: &SearchQuery,
+        held: &mut Held,
+        rivals: &mut Rivals<'_>,
+    ) -> Result<()> {
         let start = self.start_ns.value(r);
         if start < query.from_ns || start >= query.to_ns {
             return Ok(());
         }
         let trace_id = TraceId::from_slice(self.trace_id.value(r))?;
         let span_id = SpanId::from_slice(self.span_id.value(r))?;
-        // Skipped before the strings are copied; `insert` decides again,
-        // because it also has to look at duplicates.
-        if !held.by_id.contains_key(&(trace_id, span_id))
-            && !held.admits(&(Reverse(start), trace_id, span_id))
-        {
+        // A row that could not enter the answer is skipped before anything
+        // more is done for it.
+        if !held.admits(&(Reverse(start), trace_id, span_id)) {
+            return Ok(());
+        }
+        if rivals.beaten(trace_id, span_id, self.arrival.value(r))? {
             return Ok(());
         }
         let service_name = match self.service_name.downcast_dict::<StringArray>() {
@@ -368,19 +465,16 @@ impl<'a> HitColumns<'a> {
                 ));
             }
         };
-        held.insert(
-            part,
-            SearchHit {
-                trace_id,
-                span_id,
-                start_ns: start,
-                end_ns: self.end_ns.value(r),
-                name: self.name.value(r).to_owned(),
-                service_name,
-                operation: optional(self.operation, r),
-                request_model: optional(self.request_model, r),
-            },
-        );
+        held.insert(SearchHit {
+            trace_id,
+            span_id,
+            start_ns: start,
+            end_ns: self.end_ns.value(r),
+            name: self.name.value(r).to_owned(),
+            service_name,
+            operation: optional(self.operation, r),
+            request_model: optional(self.request_model, r),
+        });
         Ok(())
     }
 }

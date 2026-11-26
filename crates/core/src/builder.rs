@@ -2,7 +2,7 @@ use crate::origin::{ORIGIN_COLUMNS, slot};
 use crate::{BatchLimits, Origin, OriginKeys, SpanColumns, SpanRecord, span_schema};
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, Int32Builder, Int64Builder, LargeBinaryBuilder, StringBuilder,
-    UInt32Builder,
+    UInt32Builder, UInt64Builder,
 };
 use arrow_array::types::Int32Type;
 use arrow_array::{ArrayRef, DictionaryArray, RecordBatch};
@@ -210,6 +210,7 @@ pub struct SpanBatchBuilder {
     dropped_attributes_count: UInt32Builder,
     dropped_events_count: UInt32Builder,
     dropped_links_count: UInt32Builder,
+    arrival: UInt64Builder,
 }
 
 fn put_str(b: &mut StringBuilder, v: Option<&str>, fullest: &mut usize) -> usize {
@@ -278,6 +279,7 @@ impl SpanBatchBuilder {
             dropped_attributes_count: UInt32Builder::with_capacity(n),
             dropped_events_count: UInt32Builder::with_capacity(n),
             dropped_links_count: UInt32Builder::with_capacity(n),
+            arrival: UInt64Builder::with_capacity(n),
         }
     }
 
@@ -356,6 +358,7 @@ impl SpanBatchBuilder {
         self.dropped_events_count
             .append_value(r.dropped_events_count);
         self.dropped_links_count.append_value(r.dropped_links_count);
+        self.arrival.append_value(r.arrival);
         for (column, key) in self.origin.iter_mut().zip(origin.keys) {
             // The key was handed out by this batch's dictionary, so it fits.
             column.keys.append_option(key.map(|k| k as i32));
@@ -548,6 +551,7 @@ impl SpanBatchBuilder {
             Arc::new(self.dropped_attributes_count.finish()),
             Arc::new(self.dropped_events_count.finish()),
             Arc::new(self.dropped_links_count.finish()),
+            Arc::new(self.arrival.finish()),
         ];
         // The column order above is the schema order, which the schema's
         // golden test and the round-trip tests pin.

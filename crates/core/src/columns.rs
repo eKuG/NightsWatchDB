@@ -3,7 +3,7 @@ use crate::{Error, Origin, Result, SpanId, SpanRecord, TraceId, span_schema};
 use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, DictionaryArray, FixedSizeBinaryArray, Int32Array, Int64Array, LargeBinaryArray,
-    RecordBatch, StringArray, UInt32Array,
+    RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 
 /// A dictionary column: the keys of the rows and the array they point into.
@@ -88,6 +88,7 @@ pub struct SpanColumns<'a> {
     dropped_attributes_count: &'a UInt32Array,
     dropped_events_count: &'a UInt32Array,
     dropped_links_count: &'a UInt32Array,
+    arrival: &'a UInt64Array,
 }
 
 fn string(a: &StringArray, row: usize) -> Option<&str> {
@@ -213,6 +214,7 @@ impl<'a> SpanColumns<'a> {
             dropped_attributes_count: get(batch, col::DROPPED_ATTRIBUTES_COUNT)?,
             dropped_events_count: get(batch, col::DROPPED_EVENTS_COUNT)?,
             dropped_links_count: get(batch, col::DROPPED_LINKS_COUNT)?,
+            arrival: get(batch, col::ARRIVAL)?,
         })
     }
 
@@ -317,6 +319,7 @@ impl<'a> SpanColumns<'a> {
             dropped_attributes_count: self.dropped_attributes_count.value(row),
             dropped_events_count: self.dropped_events_count.value(row),
             dropped_links_count: self.dropped_links_count.value(row),
+            arrival: self.arrival.value(row),
         }
     }
 }
@@ -372,6 +375,7 @@ mod tests {
             dropped_attributes_count: 1,
             dropped_events_count: 2,
             dropped_links_count: 3,
+            arrival: 77,
         }
     }
 

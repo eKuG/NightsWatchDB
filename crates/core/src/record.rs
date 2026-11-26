@@ -85,4 +85,7 @@ pub struct SpanRecord<'a> {
     pub dropped_events_count: u32,
     /// `dropped_links_count` column.
     pub dropped_links_count: u32,
+    /// `arrival` column: the log record the row arrived in. 0 until the
+    /// engine sets it.
+    pub arrival: u64,
 }

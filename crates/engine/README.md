@@ -173,7 +173,8 @@ for queries or for a flush's writing of parts.
    position up to `applied_lsn` is in the frozen buffer or in a part, and the
    position is always a contiguous prefix.
 2. **Group.** Sort the frozen rows by trace and span id, drop duplicate
-   `(trace, span)` pairs (the first arrival stays), order each trace's spans by
+   `(trace, span)` pairs (the row with the smallest `arrival` stays, then the
+   first in batch order), order each trace's spans by
    `(start_ns, span_id)` and the traces by `(earliest start, trace id)`. A
    trace's window is `window_start` of its earliest span in this buffer.
 3. **Write parts.** Reserve fresh part ids from the manifest. For each window
@@ -489,7 +490,8 @@ stop (retention and the retry of deletions run again before a merge once
 `maintenance_interval` has passed since they last ran; see Retention):
 
 1. the policy chooses a merge; an id is reserved;
-2. `merge_parts` is called with the inputs oldest first (by part id), the
+2. `merge_parts` is called with the inputs oldest first (by part id; the order
+   decides only between copies of a span with the same `arrival`), the
    window of the inputs, the writer options a flush uses (`splitter`,
    `dedup_window_bytes`) and a level one above the highest input level;
 3. a reader is opened on the result and the stage `MergeWritten` is called;
@@ -557,10 +559,12 @@ both.
 **What a merge changes for queries.** A trace that was split over parts is one
 run in one part and leaves the split map; a duplicate span (a sender's retry
 that crossed a flush) is counted once by `list_traces` and `aggregate_tokens`
-from then on (`get_trace` removed it all along). The spans of a trace are
+from then on; `get_trace` and `search` showed one copy all along, and it is the
+same copy as after the merge. The spans of a trace are
 grouped into a part by the window of the trace's earliest span in one flush, so
 a trace whose spans reached the engine in different windows can have copies of
-one span in different windows; those are not in one merge and stay duplicates.
+one span in different windows; those are not in one merge and stay duplicates
+for the summaries, while `get_trace` and `search` still show one.
 
 Statistics (`EngineStats`, `/api/v1/stats`): `merges_done`,
 `parts_merged_away`, `duplicate_spans_dropped`, `merge_input_bytes` and
@@ -624,7 +628,7 @@ does not block, and is not blocked by, ingest or flush.
 
 - `get_trace`: the trace's rows from every part (through the part reader's
   byte-bounded batches) and from the buffers, duplicates by span id removed
-  (first found kept), ordered by `(start_ns, span_id)`, returned in
+  (the copy with the smallest `arrival` kept, then the first found), ordered by `(start_ns, span_id)`, returned in
   byte-bounded batches. A trace in a single part that is already in order is
   returned untouched.
 - `list_traces`: late spans can put one trace in several parts and the buffer,
@@ -723,38 +727,50 @@ win on trace id. The worst held hit only gets better as hits are added, so a par
 that was ruled out stays ruled out. Parts whose time bounds cannot reach the
 range (`min_start_ns >= to`, or `U < from`) are not looked at. `search_with_stats`
 returns `SearchStats` (parts searched, skipped early and out of range, rows
-matched and read) and tests pin them.
+matched and read, winner lookups, confirm bytes) and tests pin them.
 
 Per part, `PartReader::search` gives the matching rows. They are read in ranges
 (rows less than 64 apart are read together, at most 16,384 rows a call) with a
-projection of eight columns that has none of the raw columns, so no piece is read
+projection of nine columns that has none of the raw columns, so no piece is read
 and no rope rebuilt (a test checks that a search of words reads no piece block;
 only a phrase, which has to be confirmed against its text, reads pieces). Only the
 `limit` best hits are held, so memory is one range of rows, the matching row
 numbers of one part and the hits.
 
 The same span (trace id and span id) can be in two parts: a retry that crossed a
-flush, until a merge of the window. It is returned once, the copy of the older part
-(the one a merge would keep). The limit counts spans.
+flush, until a merge. Only its winning copy is a hit: the one with the smallest
+`arrival` (the log record the row arrived in), and among equal values the part
+that is first in the list. This is the copy `get_trace` returns and a merge
+keeps, so the answer does not change when parts are merged. A row that matches
+is checked before it is held or counted toward the limit, whatever the limit,
+the time range and the query: a losing copy is never returned, whether or not
+the winner matches or lies in the time range, and the early stop above stays
+valid. The check costs one lookup of the trace in each other part that holds
+it (the span ids and `arrival` of its rows are read, nothing else), and only for
+a hit whose trace is in the split map; a trace in one part is not checked.
+Spans in the buffers are not searched and always arrived later than the spans in
+parts, so they need no check. The limit counts spans.
 
-Limits of one search of one part are those of `SearchLimits` (1,024 terms for a
-prefix, 256 MiB of piece text read to confirm, 10 million rows a leaf); a query
-over one is `Error::InvalidArgument` saying which. The text index and the row
+Limits of a search are those of `SearchLimits` (1,024 terms for a prefix, 256 MiB
+of piece text read to confirm, 10 million rows a leaf); a query over one is
+`Error::InvalidArgument` saying which. The terms and rows limits apply to each
+part. The confirm limit is one budget for the whole search: each part is given
+what the parts before it left, so a phrase of common words that occurs nowhere
+reads at most 256 MiB in all, not in each part (the message then names the part's
+remaining budget). The text index and the row
 lists of the parts a flush writes have the budgets
 `EngineOptions::text_index_budget_bytes` and `EngineOptions::row_list_budget_bytes`
 (32 MiB each by default, per part being written).
 
 ## Known limits
 
-- Duplicate spans (same trace id and span id) are removed only among the rows
-  that are in the buffers (the frozen and the active one together) at the
-  moment of a query, and within one flush. A duplicate that landed in a part and
-  again in the buffers, or in two different parts (a sender retry that crossed
-  a flush), is removed by `get_trace` but still counted by `list_traces`
-  (`span_count`, token sums) and `aggregate_tokens` until the window is merged
-  (the merge keeps one copy), and, if the two copies are in the buffer and a
-  part, until that flush has happened too. Copies in parts of different
-  windows (see Compaction) are never merged together.
+- `list_traces` and `aggregate_tokens` read per-trace summaries and count a
+  span that is stored in two parts, or in a part and the buffers, twice until
+  the parts are merged (the merge keeps one copy) or, for the buffers, until the
+  flush has happened. This holds for any span stored twice, not only for
+  identical copies. Copies in parts of different windows (see Compaction) are
+  never merged together. `get_trace` and `search` always show exactly one copy of
+  a span, the one with the smallest `arrival`, before and after any merge.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few

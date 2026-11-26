@@ -43,6 +43,7 @@ struct Span {
     links: Option<Vec<u8>>,
     flags: u32,
     dropped: [u32; 3],
+    arrival: u64,
 }
 
 impl Span {
@@ -89,6 +90,7 @@ impl Span {
             dropped_attributes_count: self.dropped[0],
             dropped_events_count: self.dropped[1],
             dropped_links_count: self.dropped[2],
+            arrival: self.arrival,
         }
     }
 }
@@ -172,6 +174,7 @@ fn generate(g: &Gen) -> Vec<Span> {
                 links: opt(&mut rng, |_| Vec::new()),
                 flags: rng.random(),
                 dropped: [rng.random(), rng.random(), rng.random()],
+                arrival: rng.random(),
             });
         }
     }
@@ -538,6 +541,7 @@ fn index_file_known_answer() {
         links: None,
         flags: 0,
         dropped: [0; 3],
+        arrival: 0,
     };
     // Trace 0x11 first in the file, then trace 0x05; the index sorts by id.
     let spans = [

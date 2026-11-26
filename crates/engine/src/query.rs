@@ -243,9 +243,11 @@ impl Snapshot {
 
     /// Every span of one trace, from the buffers and from every part that
     /// holds it, ordered by `(start_ns, span_id)`; a span id that appears
-    /// twice is returned once, the first copy found (parts in id order, then
-    /// the buffer being flushed, then the active buffer). `None` if the trace
-    /// is unknown.
+    /// twice is returned once, the copy with the smallest `arrival` (the
+    /// earliest arrival), and among equal ones the first found (parts in list
+    /// order, then the buffer being flushed, then the active buffer). The
+    /// answer is the same before and after any merge. `None` if the trace is
+    /// unknown.
     ///
     /// Part rows are read through the part reader's byte-bounded batches, one
     /// trace at a time. The result holds the whole trace in memory, and while
@@ -295,10 +297,12 @@ impl Snapshot {
         struct Row {
             start_ns: i64,
             span: SpanId,
+            arrival: u64,
             source: u32,
             row: u32,
         }
-        let mut seen: HashSet<SpanId> = HashSet::new();
+        // Where each span id's row is in `rows`.
+        let mut at: HashMap<SpanId, usize> = HashMap::new();
         let mut rows: Vec<Row> = Vec::new();
         let mut dropped = false;
         for (i, (_, only)) in sources.iter().enumerate() {
@@ -312,15 +316,24 @@ impl Snapshot {
             };
             for &row in wanted {
                 let r = cols[i].record(row as usize);
-                if seen.insert(r.span_id) {
-                    rows.push(Row {
-                        start_ns: r.start_ns,
-                        span: r.span_id,
-                        source: i as u32,
-                        row,
-                    });
-                } else {
-                    dropped = true;
+                let this = Row {
+                    start_ns: r.start_ns,
+                    span: r.span_id,
+                    arrival: r.arrival,
+                    source: i as u32,
+                    row,
+                };
+                match at.get(&r.span_id) {
+                    None => {
+                        at.insert(r.span_id, rows.len());
+                        rows.push(this);
+                    }
+                    Some(&k) => {
+                        dropped = true;
+                        if this.arrival < rows[k].arrival {
+                            rows[k] = this;
+                        }
+                    }
                 }
             }
         }
@@ -455,8 +468,8 @@ impl Snapshot {
     /// part's place in the heap before it is read is the largest start its
     /// row group statistics allow.
     ///
-    /// A span delivered twice into different parts, or into a part and the
-    /// buffers, is counted twice.
+    /// A span stored in two parts, or in a part and the buffers, is counted
+    /// twice until the parts are merged.
     pub fn list_traces(&self, query: &ListQuery) -> Result<Vec<TraceSummary>> {
         self.list_traces_with_stats(query).map(|(rows, _)| rows)
     }
@@ -667,10 +680,9 @@ impl Snapshot {
     /// the range using their statistics and returns only the five columns
     /// needed. The buffers (the frozen one and the active one together) go
     /// through the same grouping as `list_traces`, so a span id that appears
-    /// twice for one trace in the buffers is counted once, and the three
-    /// queries agree inside one snapshot. A span delivered twice into
-    /// different parts, or into a part and the buffers, is still counted
-    /// twice until compaction exists.
+    /// twice for one trace in the buffers is counted once. A span stored in
+    /// two parts, or in a part and the buffers, is counted twice until the
+    /// parts are merged.
     pub fn aggregate_tokens(&self, query: &AggQuery) -> Result<Vec<TokenAgg>> {
         let mut acc: BTreeMap<Option<String>, TokenAgg> = BTreeMap::new();
         if query.to_ns <= query.from_ns {

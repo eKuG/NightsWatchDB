@@ -44,6 +44,8 @@ fn columns_have_the_encodings_statistics_and_compression_that_keep_parts_small()
             input_tokens: Some(100 + i64::from(i % 17) * 13),
             output_tokens: Some(i64::from(i % 11)),
             attrs: &attrs,
+            // Rows of one trace mostly arrived together.
+            arrival: 1 + u64::from(i / 10),
             ..SpanRecord::default()
         })
         .collect();
@@ -67,6 +69,12 @@ fn columns_have_the_encodings_statistics_and_compression_that_keep_parts_small()
                         assert!(has(Encoding::PLAIN), "{what}");
                     }
                     "start_ns" => {
+                        assert!(!dictionary, "{what}");
+                        assert!(has(Encoding::DELTA_BINARY_PACKED), "{what}");
+                    }
+                    "arrival" => {
+                        // Only the span table has it.
+                        assert_eq!(file, SPANS_FILE, "{what}");
                         assert!(!dictionary, "{what}");
                         assert!(has(Encoding::DELTA_BINARY_PACKED), "{what}");
                     }

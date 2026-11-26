@@ -67,6 +67,9 @@ struct Row {
     opt: [Option<String>; 12],
     tokens: [Option<i64>; 2],
     dropped: [u32; 3],
+    /// The `arrival` column. The generated rows all have 0, so the earlier
+    /// input wins; the tests of `arrival` set it.
+    arrival: u64,
     org: Org,
     attrs: Vec<u8>,
     events: Option<Vec<u8>>,
@@ -126,6 +129,7 @@ impl Row {
             dropped_attributes_count: self.dropped[0],
             dropped_events_count: self.dropped[1],
             dropped_links_count: self.dropped[2],
+            arrival: self.arrival,
         }
     }
 
@@ -260,6 +264,7 @@ impl Pool {
             attrs: self.blob(rng),
             events: rng.random_bool(0.6).then(|| self.blob(rng)),
             links: rng.random_bool(0.3).then(|| self.blob(rng)),
+            arrival: 0,
         }
     }
 }
@@ -308,7 +313,10 @@ fn generate(seed: u64, k: usize, dups: bool) -> Vec<Vec<Row>> {
                 _ => base + rng.random_range(0..1000),
             };
             let parent = (j > 0 && !rng.random_bool(0.1)).then(|| rng.random_range(0..j));
-            let row = pool.row(&mut rng, t, j, parent, start);
+            let mut row = pool.row(&mut rng, t, j, parent, start);
+            // Small values, so that copies often tie, and a copy is as
+            // likely to be older as newer than the row it repeats.
+            row.arrival = u64::from((t * 7 + j * 3) % 4);
             let target = match place {
                 0 => whole,
                 1 => pair[rng.random_range(0..2)],
@@ -317,6 +325,7 @@ fn generate(seed: u64, k: usize, dups: bool) -> Vec<Vec<Row>> {
             inputs[target].push(row.clone());
             if dups && rng.random_bool(0.12) {
                 let mut dup = row;
+                dup.arrival = u64::from((t * 5 + j * 11 + 1) % 4);
                 if rng.random_bool(0.6) {
                     dup.name = format!("variant-{}", rng.random_range(0..100));
                     dup.attrs = pool.blob(&mut rng);
@@ -333,18 +342,24 @@ fn generate(seed: u64, k: usize, dups: bool) -> Vec<Vec<Row>> {
     inputs.into_iter().map(stored_order).collect()
 }
 
-/// What the merge must produce: the first occurrence of each span (inputs
-/// oldest first, rows in stored order), traces by the earliest start of any of
-/// their rows and then id, spans by start and span id.
+/// What the merge must produce: of each span the occurrence with the smallest
+/// `arrival`, the first of them when several tie (inputs in the order given,
+/// rows in stored order); traces by the earliest start of any of their rows
+/// and then id, spans by start and span id.
 fn expected(inputs: &[Vec<Row>]) -> Vec<Row> {
-    let mut seen = HashSet::new();
+    let mut at: HashMap<([u8; 16], [u8; 8]), usize> = HashMap::new();
     let mut earliest: HashMap<[u8; 16], i64> = HashMap::new();
-    let mut kept = Vec::new();
+    let mut kept: Vec<Row> = Vec::new();
     for row in inputs.iter().flatten() {
         let e = earliest.entry(trace_id(row.trace)).or_insert(row.start);
         *e = (*e).min(row.start);
-        if seen.insert(row.id()) {
-            kept.push(row.clone());
+        match at.get(&row.id()) {
+            None => {
+                at.insert(row.id(), kept.len());
+                kept.push(row.clone());
+            }
+            Some(&k) if row.arrival < kept[k].arrival => kept[k] = row.clone(),
+            Some(_) => {}
         }
     }
     kept.sort_by_key(|r| {
@@ -1224,4 +1239,101 @@ fn bad_arguments_are_refused_and_leave_nothing() {
             .exists()
     );
     readers[0].verify().unwrap();
+}
+
+// -------------------------------------------------------------- arrival ---
+
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in permutations(n - 1) {
+        for at in 0..=rest.len() {
+            let mut p = rest.clone();
+            p.insert(at, n - 1);
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn merged_rows(inputs: &[Vec<Row>], seed: u64) -> (Vec<(String, u64)>, MergeStats) {
+    let tmp = tempfile::tempdir().unwrap();
+    let readers = write_inputs(tmp.path(), inputs, seed);
+    let (_, stats) = merge(&readers, tmp.path(), 100, merge_options(1 << 20)).unwrap();
+    let merged = PartReader::open(part_path(tmp.path(), 100)).unwrap();
+    let batches = merged.read_rows(0, merged.row_count(), None).unwrap();
+    let rows = records(&flat(&batches))
+        .iter()
+        .map(|r| (r.name.to_owned(), r.arrival))
+        .collect();
+    (rows, stats)
+}
+
+#[test]
+fn the_copy_with_the_smallest_arrival_wins_whatever_the_order_of_the_inputs() {
+    let mut rng = StdRng::seed_from_u64(77);
+    let pool = Pool::new(&mut rng);
+    // One span under the same ids in four parts, each copy with its own name.
+    // Two copies share the smallest arrival.
+    let copies = [("late", 9u64), ("earliest", 3), ("middle", 5), ("tie", 3)];
+    let rows: Vec<Row> = copies
+        .iter()
+        .map(|&(name, arrival)| {
+            let mut r = pool.row(&mut rng, 1, 0, None, 100);
+            r.name = name.into();
+            r.arrival = arrival;
+            r
+        })
+        .collect();
+    for order in permutations(copies.len()) {
+        let inputs: Vec<Vec<Row>> = order.iter().map(|&i| vec![rows[i].clone()]).collect();
+        let (got, stats) = merged_rows(&inputs, 0);
+        // The smallest arrival wins; of the two that tie, the earlier input.
+        let winner = order.iter().find(|&&i| copies[i].1 == 3).unwrap();
+        let want = (copies[*winner].0.to_string(), 3);
+        assert_eq!(got, vec![want], "inputs in the order {order:?}");
+        assert_eq!(stats.duplicates_dropped, 3, "{order:?}");
+    }
+}
+
+#[test]
+fn the_copy_with_the_smallest_arrival_wins_inside_one_input_too() {
+    let mut rng = StdRng::seed_from_u64(78);
+    let pool = Pool::new(&mut rng);
+    let mut a = pool.row(&mut rng, 1, 0, None, 100);
+    a.name = "first row, later arrival".into();
+    a.arrival = 8;
+    let mut b = a.clone();
+    b.name = "second row, earlier arrival".into();
+    b.arrival = 2;
+    let (got, _) = merged_rows(&[vec![a, b]], 0);
+    assert_eq!(got, vec![("second row, earlier arrival".to_string(), 2)]);
+}
+
+#[test]
+fn the_order_of_the_inputs_changes_only_which_of_equal_arrivals_wins() {
+    for seed in 0..6u64 {
+        let inputs = generate(seed + 3_000, 3, true);
+        // The smallest arrival of each span among all its copies.
+        let mut smallest: HashMap<([u8; 16], [u8; 8]), u64> = HashMap::new();
+        for r in inputs.iter().flatten() {
+            let e = smallest.entry(r.id()).or_insert(r.arrival);
+            *e = (*e).min(r.arrival);
+        }
+        for order in permutations(inputs.len()) {
+            let ordered: Vec<Vec<Row>> = order.iter().map(|&i| inputs[i].clone()).collect();
+            let tmp = tempfile::tempdir().unwrap();
+            let readers = write_inputs(tmp.path(), &ordered, seed);
+            merge(&readers, tmp.path(), 100, merge_options(900)).unwrap();
+            let merged = PartReader::open(part_path(tmp.path(), 100)).unwrap();
+            let what = format!("seed {seed}, inputs in the order {order:?}");
+            let want = expected(&ordered);
+            assert_holds(&merged, &want, &what);
+            for r in &want {
+                assert_eq!(r.arrival, smallest[&r.id()], "{what}: {:?}", r.id());
+            }
+        }
+    }
 }

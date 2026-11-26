@@ -38,8 +38,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// every rope that has a reference; version 6 adds the length of the rebuilt
 /// value to those ropes, and the text index and the piece-to-rows lists,
 /// `text.idx` and `text.rows`, whose length and CRC-32C are in `traces.idx`
-/// too.
-pub const FORMAT_VERSION: u32 = 6;
+/// too; version 7 adds the `arrival` column to `spans.parquet`.
+pub const FORMAT_VERSION: u32 = 7;
 
 /// The default for [`WriterOptions::dedup_window_bytes`]: 64 MiB.
 pub const DEFAULT_DEDUP_WINDOW_BYTES: usize = 64 << 20;
@@ -254,6 +254,11 @@ fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
             .set_column_dictionary_enabled(ColumnPath::from(name), false)
             .set_column_encoding(ColumnPath::from(name), Encoding::BYTE_STREAM_SPLIT);
     }
+    // Rows of one trace mostly arrived in the same log record, so the deltas
+    // are mostly zero.
+    builder = builder
+        .set_column_dictionary_enabled(ColumnPath::from("arrival"), false)
+        .set_column_encoding(ColumnPath::from("arrival"), Encoding::DELTA_BINARY_PACKED);
     builder.build()
 }
 

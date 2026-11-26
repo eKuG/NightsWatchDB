@@ -12,6 +12,8 @@ pub(crate) struct Entry {
     pub trace: [u8; 16],
     pub span: [u8; 8],
     pub start_ns: i64,
+    /// The log record the row arrived in.
+    pub arrival: u64,
     /// Index of the batch in the slice the rows came from.
     pub batch: u32,
     pub row: u32,
@@ -36,8 +38,8 @@ pub(crate) struct Grouped {
 
 /// Groups the rows of `cols` by trace.
 ///
-/// A span id seen twice in one trace is kept once, the occurrence that comes
-/// first in batch order. This is how a sender's retry after an unknown outcome
+/// A span id seen twice in one trace is kept once: the occurrence with the
+/// smallest `arrival`, and among equal ones the first in batch order. This is how a sender's retry after an unknown outcome
 /// is made harmless within one flush.
 pub(crate) fn group_traces(cols: &[SpanColumns<'_>]) -> Grouped {
     let total: usize = cols.iter().map(SpanColumns::len).sum();
@@ -49,6 +51,7 @@ pub(crate) fn group_traces(cols: &[SpanColumns<'_>]) -> Grouped {
                 trace: r.trace_id.0,
                 span: r.span_id.0,
                 start_ns: r.start_ns,
+                arrival: r.arrival,
                 batch: b as u32,
                 row: row as u32,
             });
@@ -56,7 +59,7 @@ pub(crate) fn group_traces(cols: &[SpanColumns<'_>]) -> Grouped {
     }
     // First sort by identity so duplicates are adjacent and the earliest
     // arrival comes first, then drop all but that one.
-    entries.sort_unstable_by_key(|e| (e.trace, e.span, e.batch, e.row));
+    entries.sort_unstable_by_key(|e| (e.trace, e.span, e.arrival, e.batch, e.row));
     entries.dedup_by(|later, kept| later.trace == kept.trace && later.span == kept.span);
     entries.sort_unstable_by_key(|e| (e.trace, e.start_ns, e.span, e.batch, e.row));
 

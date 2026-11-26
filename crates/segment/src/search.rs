@@ -271,6 +271,14 @@ impl PartReader {
     /// which; a damaged text file is [`Error::Corrupt`] naming it. The reader
     /// is shared: nothing mutable is kept between searches.
     pub fn search(&self, query: &Query, limits: &SearchLimits) -> Result<Vec<u32>> {
+        self.search_counted(query, limits).map(|(rows, _)| rows)
+    }
+
+    /// [`search`](Self::search), and the bytes of piece text it read to
+    /// confirm phrases and long words, counted as `max_confirm_bytes` counts
+    /// them. A caller that searches several parts subtracts this from the
+    /// limit it gives the next part.
+    pub fn search_counted(&self, query: &Query, limits: &SearchLimits) -> Result<(Vec<u32>, u64)> {
         let universe: Vec<u32> = if has_not(query) {
             let rows = self.row_count();
             if rows > limits.max_leaf_rows as u64 {
@@ -288,10 +296,11 @@ impl PartReader {
             Vec::new()
         };
         let mut confirm_spent = 0u64;
-        evaluate(query, &universe, |leaf| {
+        let rows = evaluate(query, &universe, |leaf| {
             let pieces = self.leaf_pieces(leaf, limits, &mut confirm_spent)?;
             self.pieces_to_rows(&pieces, leaf, limits)
-        })
+        })?;
+        Ok((rows, confirm_spent))
     }
 
     /// The pieces that match one leaf, ascending.

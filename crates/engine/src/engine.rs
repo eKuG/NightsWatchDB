@@ -10,10 +10,10 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, UInt64Array};
 use nwdb_core::{
     BatchLimits, DEFAULT_WINDOW_NS, Error, PayloadSplitter, RecordDecoder, Result, SpanColumns,
-    TraceId, TraceSummary,
+    TraceId, TraceSummary, col,
 };
 use nwdb_manifest::{
     Edit, Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id,
@@ -503,6 +503,18 @@ fn decode_record(
         bytes += b.get_array_memory_size();
     }
     Ok((batches, bytes))
+}
+
+/// `batch` with its `arrival` column replaced by `lsn` in every row; the other
+/// columns are shared, not copied.
+fn stamp_arrival(batch: RecordBatch, lsn: Lsn) -> RecordBatch {
+    let at = batch
+        .schema()
+        .index_of(col::ARRIVAL)
+        .expect("decode_record checked the schema");
+    let mut columns = batch.columns().to_vec();
+    columns[at] = Arc::new(UInt64Array::from(vec![lsn; batch.num_rows()]));
+    RecordBatch::try_new(batch.schema(), columns).expect("the same schema and row count")
 }
 
 pub(crate) fn sync_dir(dir: &Path) {
@@ -1062,11 +1074,16 @@ impl Inner {
 
     /// Adds batches to the active buffer. `lsn` is the log position of the
     /// record they came from.
+    ///
+    /// The `arrival` column of every row is set to `lsn` here, for live
+    /// ingest and log replay alike, so a replay gives the values the first
+    /// run gave. The column has the width the decoder's had, so `bytes` is
+    /// still right.
     fn push_active(&self, c: &mut Core, batches: Vec<RecordBatch>, bytes: usize, lsn: Lsn) {
         let batches: Vec<Arc<RecordBatch>> = batches
             .into_iter()
             .filter(|b| b.num_rows() > 0)
-            .map(Arc::new)
+            .map(|b| Arc::new(stamp_arrival(b, lsn)))
             .collect();
         if !batches.is_empty() {
             if c.vis.active.is_empty() {

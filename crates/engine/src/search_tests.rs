@@ -25,7 +25,7 @@ use search_model::*;
 
 use crate::engine::LivePart;
 use crate::lock;
-use crate::{Engine, SearchQuery};
+use crate::{Engine, SearchLimits, SearchQuery};
 
 fn search_opts(dir: &std::path::Path) -> crate::EngineOptions {
     let mut o = opts(dir);
@@ -249,4 +249,64 @@ fn searches_during_flushes_and_merges_see_a_consistent_prefix_of_the_log() {
     drop(e);
     let e = open(search_opts(dir.path()));
     assert_eq!(e.search(&all).unwrap().hits, want);
+}
+
+/// The limit on the bytes read to confirm a phrase is one budget for the
+/// whole search: each part gets what the parts before it left.
+#[test]
+fn the_budget_for_confirming_a_phrase_is_shared_by_all_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(search_opts(dir.path()));
+    // Three parts. Every span has a line with the two words in the wrong
+    // order, so the index names its piece as a candidate for the phrase and
+    // the text must be read to find that it does not match.
+    let mut per_part = 0u64;
+    for part in 0..3u128 {
+        let mut bytes = 0u64;
+        let spans: Vec<TSpan> = (0..20u64)
+            .map(|k| {
+                let line = format!("beta alpha {part}-{k:03} filler");
+                bytes += line.len() as u64;
+                span_with(
+                    part + 1,
+                    k + 1,
+                    100 * (part as i64 + 1) + k as i64,
+                    &[&line],
+                )
+            })
+            .collect();
+        per_part = bytes;
+        ingest(&e, &spans).unwrap();
+        e.flush().unwrap();
+    }
+    let snap = e.snapshot();
+    assert_eq!(snap.vis.parts.len(), 3);
+    let sq = SearchQuery {
+        query: parse("\"alpha beta\"").unwrap(),
+        from_ns: i64::MIN,
+        to_ns: i64::MAX,
+        limit: 10,
+    };
+    let limits = |max_confirm_bytes: u64| SearchLimits {
+        max_confirm_bytes,
+        ..SearchLimits::default()
+    };
+
+    // Room for all three parts: nothing found, and every part's reads counted.
+    let (hits, stats) = snap.search_limited(&sq, limits(3 * per_part)).unwrap();
+    assert!(hits.is_empty());
+    assert_eq!(stats.parts_searched, 3);
+    assert_eq!(stats.confirm_bytes, 3 * per_part);
+
+    // Enough for two parts and not three: a fresh budget for each part would
+    // pass; one budget for the search does not.
+    let err = snap
+        .search_limited(&sq, limits(2 * per_part + 1))
+        .unwrap_err();
+    assert!(matches!(err, nwdb_core::Error::InvalidArgument(_)), "{err}");
+    assert!(
+        snap.search_limited(&sq, limits(per_part)).is_err(),
+        "one part's worth is not enough for three"
+    );
+    e.shutdown().unwrap();
 }

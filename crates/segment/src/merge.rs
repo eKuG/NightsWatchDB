@@ -7,7 +7,7 @@
 //! every piece is copied from an input store once.
 //!
 //! The work goes in chunks of the output order, bounded by bytes. For a chunk
-//! the key columns (`span_id`, `start_ns`) of its traces are read first, the
+//! the key columns (`span_id`, `start_ns`, `arrival`) of its traces are read first, the
 //! duplicates are dropped and the rows are ordered exactly as a flush orders
 //! them; then the rows themselves are read, in runs that are close to
 //! sequential because each input is already nearly in output order, their
@@ -18,7 +18,7 @@ use crate::reader::PartReader;
 use crate::writer::{PartWriter, WriterOptions};
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
+use arrow_array::types::{Int64Type, UInt64Type};
 use nwdb_core::{
     BatchLimits, Error, PartMeta, PayloadTotals, Result, SpanBatchBuilder, SpanColumns, SpanRecord,
     TraceId, col,
@@ -33,7 +33,7 @@ pub const DEFAULT_MERGE_CHUNK_BYTES: usize = 32 << 20;
 
 /// Translation table entry of an input piece not yet carried over.
 const UNSET: u32 = u32::MAX;
-/// The most rows whose keys one chunk holds (32 bytes each), unless a single
+/// The most rows whose keys one chunk holds (40 bytes each), unless a single
 /// trace has more.
 const MAX_CHUNK_ROWS: usize = 1 << 19;
 /// Rows between two wanted rows of one input that are read through rather than
@@ -132,6 +132,8 @@ struct KeyRow {
     input: u16,
     start: i64,
     span: [u8; 8],
+    /// The `arrival` column of the row.
+    arrival: u64,
     row: u64,
 }
 
@@ -180,7 +182,7 @@ fn rope_error(inputs: &[&PartReader], i: usize, e: RopeError) -> Error {
     }
 }
 
-/// Merges `inputs`, oldest first, into one new part, `<parts_dir>/<part_id>`.
+/// Merges `inputs` into one new part, `<parts_dir>/<part_id>`.
 ///
 /// The output is the part a flush would write if it received every row of
 /// every input at once:
@@ -189,8 +191,9 @@ fn rope_error(inputs: &[&PartReader], i: usize, e: RopeError) -> Error {
 ///   traces are ordered by `(the earliest start of the trace in any input,
 ///   trace_id)`. A trace with rows in several inputs is one run.
 /// - A `(trace_id, span_id)` that occurs more than once is kept once: the row
-///   of the earliest input, and within one input its first row. The others are
-///   counted in [`MergeStats::duplicates_dropped`].
+///   with the smallest `arrival`; among equal values the row of the earlier
+///   input, and within one input its first row. So the order of `inputs`
+///   matters only for rows with the same `arrival`. The others are counted in [`MergeStats::duplicates_dropped`].
 /// - The trace index and the summary are those of any part: the summary of a
 ///   trace is computed from its merged rows.
 /// - Every value of every kept row reads back byte for byte as the input
@@ -205,7 +208,7 @@ fn rope_error(inputs: &[&PartReader], i: usize, e: RopeError) -> Error {
 ///
 /// Memory, besides the chunk (see [`MergeOptions::chunk_bytes`]): 24 bytes per
 /// distinct trace for the output order, 4 bytes per piece of every input for
-/// the translation table, 32 bytes per row of the chunk for its keys, and what
+/// the translation table, 40 bytes per row of the chunk for its keys, and what
 /// the part writer and its piece writer hold. It does not grow with the size
 /// of the inputs.
 ///
@@ -413,9 +416,9 @@ impl Merger<'_> {
     fn merge_chunk(&mut self, parts: &[Part], traces: &[OrderKey]) -> Result<()> {
         let mut keys = self.read_keys(parts, traces)?;
         let before = keys.len();
-        // The earliest arrival of a span id wins: inputs are oldest first, and
-        // within an input the first row.
-        keys.sort_unstable_by_key(|k| (k.trace, k.span, k.input, k.row));
+        // The earliest arrival of a span id wins; among equal arrivals the
+        // earlier input, and within an input the first row.
+        keys.sort_unstable_by_key(|k| (k.trace, k.span, k.arrival, k.input, k.row));
         keys.dedup_by(|later, kept| later.trace == kept.trace && later.span == kept.span);
         self.dropped += (before - keys.len()) as u64;
         // The order of a flush: by start, then span id.
@@ -467,16 +470,17 @@ impl Merger<'_> {
                     .read_rows_stored(
                         first,
                         run_end - first,
-                        Some(&[col::SPAN_ID, col::START_NS, col::TRACE_ID]),
+                        Some(&[col::SPAN_ID, col::START_NS, col::TRACE_ID, col::ARRIVAL]),
                     )
                     .map_err(|e| named(inputs, i, e))?;
                 let short = || damaged(inputs, i, "spans.parquet: fewer rows than the index lists");
                 let (mut part, mut left, mut row) = (0, run[0].count, first);
                 for batch in &batches {
-                    let (Some(spans), Some(starts), Some(ids)) = (
+                    let (Some(spans), Some(starts), Some(ids), Some(arrivals)) = (
                         batch.column(0).as_fixed_size_binary_opt(),
                         batch.column(1).as_primitive_opt::<Int64Type>(),
                         batch.column(2).as_fixed_size_binary_opt(),
+                        batch.column(3).as_primitive_opt::<UInt64Type>(),
                     ) else {
                         return Err(damaged(inputs, i, "spans.parquet: unexpected column types"));
                     };
@@ -504,6 +508,7 @@ impl Merger<'_> {
                             input: i as u16,
                             start: starts.value(r),
                             span,
+                            arrival: arrivals.value(r),
                             row,
                         });
                         left -= 1;
