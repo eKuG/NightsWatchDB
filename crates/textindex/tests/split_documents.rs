@@ -157,7 +157,7 @@ fn not_works_over_split_documents() {
     };
     assert_eq!(run("a000010 -a029999"), [4]);
     assert_eq!(run("a000010 -plain"), [3, 4]);
-    assert_eq!(run("-a000010 -b000000"), [5]);
+    assert_eq!(run("plain -a000010 -b000000"), [5]);
     assert_eq!(run("a029999 OR b000000"), [3, 9]);
 }
 

@@ -943,7 +943,11 @@ fn a_rotation_that_cannot_create_the_file_fails_without_poisoning_and_can_be_ret
     assert!(!matches!(err, Error::Fatal(_)), "{err}");
     // The log writes on, into the file it had, and loses nothing.
     wal.append_blocking(b"three").unwrap();
-    assert_eq!(names(dir.path()), [file_name(1)]);
+    // Only the blocker is new: no log file was started.
+    assert_eq!(
+        names(dir.path()),
+        [file_name(1), format!("{}.tmp", file_name(3))]
+    );
     std::fs::remove_dir(&blocker).unwrap();
     assert!(wal.rotate().unwrap());
     wal.append_blocking(b"four").unwrap();
