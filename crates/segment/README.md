@@ -121,7 +121,11 @@ path every piece and every rope of a part passes).
   when the piece is first stored (the same moment `WriterOptions::piece_observer`
   hears of it, in the order of the ids). The builder closes a segment when its
   open postings pass `WriterOptions::text_index_budget_bytes` (default 32 MiB,
-  at least 1 MiB), so its memory does not grow with the part.
+  at least 1 MiB), so its memory does not grow with the part. The builder
+  feeds a piece to the open segment in chunks of about 1 KiB and may close the
+  segment inside a piece, so one piece can be in the lists of several
+  consecutive segments; the reader returns it once (see `nwdb_textindex`).
+  What is indexed for a piece is its **search text**, see below.
 - `text.rows` is an `nwdb_textindex` id-list file with one key per piece id,
   dense from 0 to the number of pieces minus one: the key's list is the
   **ascending numbers of the rows** whose `attrs`, `events` or `links` refer to
@@ -141,6 +145,32 @@ read buffer for each run (the budget divided between the runs, 4 to 64 KiB
 each) and the list of the piece being written, which is as long as the number of
 rows that refer to it (4 bytes a row: a system prompt shared by ten million
 rows is a 40 MB list).
+
+**The search text of a piece.** A JSON string stores a newline as `\n` and an
+accented letter as `\u00e9`, so the bytes of a piece that is JSON would not
+hold the words a reader sees. A piece is therefore indexed, and a phrase is
+confirmed, on `nwdb_payload::json_search_text` of its bytes, the same function
+in both places:
+
+- A piece is JSON text if it is exactly one valid JSON value that is an object,
+  an array or a string, with optional white space around it. A bare number,
+  `true`, `false` or `null`, two values, or anything with a syntax error is not.
+  Bytes of 0x80 and above inside a string are not checked to be UTF-8.
+  Nesting deeper than 256 levels is "not JSON": the check uses a fixed array and
+  no recursion, so it takes no more memory for a hostile piece.
+- Of a JSON text, the escapes inside its strings are decoded: `\n`, `\t`,
+  `\r`, `\b` and `\f` become a space, `\"`, `\\` and `\/` the character itself,
+  `\uXXXX` the UTF-8 of the code point, and a surrogate pair of two `\u`
+  escapes the one code point it stands for. The six bytes of a lone surrogate
+  are left as they are. Object keys are strings and are decoded too; the
+  structure characters are not changed.
+- A piece that is not JSON text, and a JSON text with no backslash, is indexed
+  and confirmed as its stored bytes, without a copy.
+
+The stored piece is never changed; only what the index and the confirmation see.
+So a word that follows `\n` in a JSON string is a word of its own, and a phrase
+may span what was a `\n` (it is a space now), but not a boundary between two
+pieces.
 
 **What is not indexed, by design.** Only text that is in a piece is searchable.
 Text that stays inline in a row is not: a cut shorter than

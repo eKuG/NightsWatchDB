@@ -434,6 +434,20 @@ any message has it, a phrase must lie inside one message, and `AND`, `OR` and `-
 combine spans. A span that was delivered twice into different parts is returned
 once. The search takes a concurrency slot like the other queries.
 
+**Escaped text is searched as it reads.** Messages are often JSON, where a
+newline is written `\n` and `é` may be written `\u00e9`. When a message is one
+JSON object, array or string (a chat history sent as a JSON array, say), it is
+searched with those escapes decoded: a line break or tab is a space, so the last
+word of one line and the first word of the next are separate words, and a
+phrase can run from one line into the next; `\u00e9` is `é`, so `café` finds
+`caf\u00e9`; `\"` is a quote. The same text is used to confirm a phrase, so
+what a phrase finds does not depend on whether the index or a read decided it.
+A message that is not a JSON object, array or string (plain text, a bare number,
+JSON with a syntax error, nesting deeper than 256 levels) is searched exactly as it was sent, so a
+literal backslash-n in plain text stays two bytes. Nothing stored changes: the
+trace still returns the original bytes. The phrase rule is the same as before:
+a phrase must lie inside one message, never across two.
+
 A query that the parser refuses (nothing to search for, an unterminated quote or
 parenthesis, more than 64 operands, nesting deeper than 32, a query longer than
 16 KiB) or that is over a limit of one search of one part (a prefix that expands

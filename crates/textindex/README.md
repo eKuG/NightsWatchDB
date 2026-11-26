@@ -57,10 +57,21 @@ A document becomes tokens in the postings of the **open segment**, held in
 memory. When the memory held for them passes `segment_budget_bytes` (default
 256 MiB, **at least 1 MiB**: a smaller value is raised to `MIN_SEGMENT_BUDGET`),
 the segment is closed: its terms are sorted, its postings, dictionary and
-sparse index are written, and its memory is freed. The next document opens a
-new segment. A segment also closes when it holds `u32::MAX` documents, so its
-document counter never wraps. A segment covers a contiguous range of document
-ids; segments of one file never overlap.
+sparse index are written, and its memory is freed. A segment also closes when
+it holds `u32::MAX` documents, so its document counter never wraps.
+
+A document is fed to the open segment in pieces of about 1 KiB, cut between
+tokens (a token longer than that stays whole), and the budget is checked after
+each piece, not after each document. A segment can therefore close in the middle
+of a document: the rest of the document goes into the next segment, which then
+starts with the same document id. A document of any size is so spread over as
+many consecutive segments as it needs, and a segment may hold nothing but the
+middle of one document. A segment covers a contiguous range of document ids,
+and the range starts at or after the last id of the segment before it: of two
+consecutive segments, at most the one document at the cut is in both. A
+document counts once in `IndexMeta::docs` and `doc_count`, however many
+segments it is in. What this means for the answers is under "Documents that
+span segments".
 
 ### Memory bound
 
@@ -76,7 +87,7 @@ case and far less for ordinary text, where words repeat. With the default
 
 The budget is an estimate of heap bytes (each term's bytes, its hash-table
 slot, its list header and the capacity of its id list, with allocator
-rounding), checked after each document. Closing a segment additionally needs
+rounding), checked after each piece of about 1 KiB of a document. Closing a segment additionally needs
 the sorted order of the terms (32 bytes per term) and the segment's dictionary
 and sparse index (about 14 bytes per term for ordinary text; the sizes are in
 `IndexMeta`).
@@ -96,9 +107,12 @@ buffer and the table's growth step). The test asserts `peak <= 1.5 x budget +
 `tests/regressions_review_memory.rs` builds 60,000 small documents with a
 requested budget of 1 KiB (raised to 1 MiB): the number of segments follows
 the minimum budget, and growing the input twelvefold adds only the documented
-144 bytes per extra segment to the peak. One large document can exceed the
-budget by about 120 bytes for each distinct new token it holds; the check
-happens between documents.
+144 bytes per extra segment to the peak. The memory the builder holds does not
+depend on the size of a document: a piece of about 1 KiB holds at most about 512
+tokens, each adding at most about 100 bytes to the estimate, so the open segment
+passes the budget by at most about 50 KiB before it is closed, whatever the
+document (`tests/split_documents.rs` builds documents far over the budget). The caller
+holds the document's text; the builder does not keep it.
 
 ## Index file layout
 
@@ -126,6 +140,7 @@ footer    = 64 bytes
  40  u64  postings, summed over segments
  48  u64  directory offset
  56  u32  CRC-32C of the directory bytes followed by footer bytes 0..56
+          (`IndexReader::footer_crc`)
  60  4    magic "NWTX"
 ```
 
@@ -150,7 +165,8 @@ The directory lies directly before the footer: its offset must equal
 ```
 
 Segments are contiguous from offset 0 and end where the directory starts;
-their document ranges are ascending and disjoint.
+their document ranges ascend, and a range may start with the last id of the
+range before it (a document cut between two segments).
 
 ### Dictionary
 
@@ -221,7 +237,8 @@ calls and there is no cursor, so one reader serves many threads.
 
 - At `open`: magic, version, reserved bytes, the footer checksum, that the
   directory fits the file, that segments are contiguous and fill the file,
-  document ranges ascend, counts agree with each other and with the segment
+  document ranges ascend (a segment may start with the last document of the one
+  before it, and with no earlier one), counts agree with each other and with the segment
   sizes (a term count that the dictionary could not hold is refused before
   anything is allocated from it), the sparse index checksum and its structure
   (offsets ascend inside the dictionary, first terms ascend).
@@ -316,6 +333,23 @@ in one would silently miss every long token.
 - `ids::intersect`, `union`, `difference` work on ascending slices; each
   allocates only its output.
 
+### Documents that span segments
+
+A document cut between segments has its terms in the lists of each of them. The
+answers are the same as if it had been in one segment:
+
+- `term` and `prefix` return its id once: the lists of consecutive segments
+  follow each other, and the id at the end of one and the start of the next is
+  dropped to one.
+- `intersect` finds a document whose tokens are in different segments: each
+  token's lists are chained across segments, so the document is in every chain.
+  The answer is still exact for tokens of up to 64 bytes.
+- A phrase is a candidate if its tokens are all in the document, wherever the
+  cut fell, so the candidates include a phrase that lies across a cut; the
+  caller's confirmation against the text (as for any phrase) decides.
+- An `Or`, a `Not` and the universe are computed on documents, so they do not
+  see the cut.
+
 ## Query model
 
 ```text
@@ -391,6 +425,7 @@ footer  = 40 bytes:
   16  u64  ids
   24  u64  offset of the group index
   32  u32  CRC-32C of the group index followed by footer bytes 0..32
+           (`IdListMeta::footer_crc`)
   36  4    magic "NWIL"
 ```
 
@@ -448,7 +483,11 @@ reader holds 16 bytes per group (at most 16 bytes per 128 keys).
   of this crate (long words, memory of a search and of the builder, bytes
   read).
 - `tests/size.rs`: the index over a few megabytes of English-like text.
-- `tests/idlist.rs`: round trips and group boundaries of the id-list store.
+- `tests/idlist.rs`: round trips and group boundaries of the id-list store; a
+  flipped byte in one group, or a group of another file, is `Corrupt` when that
+  group is read and the other groups read fine; `for_each` reads a group once.
+- `tests/split_documents.rs`: documents cut between segments are found once by
+  every kind of search, and a tiny and a huge budget answer alike.
 
 Tests that need many segments cheaply use the hidden
 `IndexBuilder::with_max_segment_docs`, because the 1 MiB minimum budget would
