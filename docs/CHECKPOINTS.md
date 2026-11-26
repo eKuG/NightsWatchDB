@@ -5,7 +5,7 @@ its tests pass in a Linux container, it has been through an independent
 review, and it is committed, tagged `checkpoint-NN` and pushed.
 
 ```
-Progress  [█████░░░░░░░░░░░]  5 of 16 checkpoints
+Progress  [███████░░░░░░░░░]  7 of 16 checkpoints
 ```
 
 | # | Checkpoint | State |
@@ -15,8 +15,8 @@ Progress  [█████░░░░░░░░░░░]  5 of 16 checkpoint
 | 2 | Engine: memory buffer, flush, recovery from the log, snapshot reads; open a trace, list traces, aggregate | done |
 | 3 | Server: OTLP door for traces, HTTP query API, container image, end-to-end test with the generator | done |
 | 4 | Large text out of line, each distinct piece stored once | done |
-| 5 | Text index over distinct pieces; search | index library built and reviewed; search not wired in yet |
-| 6 | Compaction, retention, late spans | |
+| 5 | Text index over distinct pieces; search | done |
+| 6 | Compaction, retention, late spans | done |
 | 7 | Scores and annotations | |
 | 8 | Logs | |
 | 9 | Metrics | |
@@ -294,3 +294,163 @@ Known limits at this checkpoint:
 - Verifying a part rebuilds every value in it.
 - Span-only data takes more space than the baseline until parts are
   compacted. Token totals over a long range read every part on one thread.
+
+## Checkpoint 5: full-text search
+
+The text a part stores once is now indexed once, and
+`GET /api/v1/search` returns the newest spans whose messages match a query.
+
+- **An index of our own, over pieces instead of spans.** `nwdb-textindex` is
+  an inverted index with its own file format and no search library under it.
+  A part indexes each distinct piece of text once (`text.idx`) and keeps, per
+  piece, the rows that use it (`text.rows`). A system prompt that ten thousand
+  spans repeat is cut into words once, and a phrase in it is checked once.
+- **The query language.** Words are ANDed; `OR`, a leading `-` for NOT,
+  `"a phrase"`, `prefix*` and parentheses. ASCII case does not matter and any
+  script is a word. The index holds no positions: a phrase finds its
+  candidates by its words and is confirmed against the text of the piece, so
+  a phrase must lie inside one message.
+- **JSON is searched as the text it encodes.** A piece that is a complete JSON
+  value is indexed with its escapes decoded, so a word after `\n` or one
+  written as `\u00e9` is found. The stored bytes are not changed.
+- **Every cost has a limit.** How many terms a prefix may expand to, how many
+  rows one word may match in a part, and how much text one search may read to
+  confirm phrases (one budget for the whole search). Over a limit is an error
+  that says which, not a slow query.
+- **Bounded memory on both sides.** The index is built within a byte budget
+  whatever the input (one very large message is spread over several index
+  segments), and a search reads each group of row lists once however many
+  pieces match.
+- **The part format is version 7.** The index files are bound to their part by
+  checksum when the part is opened, like the text files of checkpoint 4.
+
+Measured with the benchmark harness (2 CPUs, 4 GB; full results in
+[benchmarks](benchmarks/README.md)): on 8.0 GB of agent-trace text, the newest
+20 spans for a word, an AND, an OR or a prefix come back in 0.24 to 0.30 ms at
+the median, a NOT in 0.57 ms and a phrase in 1.5 ms. The part files, text
+index included, take 87.8 MB.
+
+What is searched: the pieces, in flushed parts. Not searched: spans still in
+the memory buffer (at most one flush interval, 30 seconds by default), values
+too short to be pieces, and the promoted columns such as the span name and the
+service, which the list filters cover.
+
+How it was tested: searches over random text compared with a scan of the same
+text, for every operator, through the index alone, through a part, through the
+engine and through the server; index and row files truncated, swapped between
+parts and damaged byte by byte; memory measured while building and searching;
+and the end-to-end run now searches for a word and a phrase before a crash,
+after `kill -9` and after a clean stop.
+
+Two independent examinations of the search path and a second pass over the
+fixes found these defects, each proven with a failing test first and kept as
+a regression:
+
+- Index and row files of another part, of equal length, were accepted, and a
+  search then answered from the wrong part's text.
+- A span stored twice could be returned as either copy depending on `limit`.
+  (The rule that settles this is in checkpoint 6.)
+- A word after a JSON escape was not found: `Hello\nError` was indexed as the
+  word `nerror`.
+- One large message made of distinct words took the index builder far past
+  its memory budget.
+- A common word read the row lists once per matching piece instead of once.
+- An empty AND matched nothing instead of everything.
+- Checking which copy of a duplicated span to show cost a number of reads that
+  grew with the square of the number of parts holding the trace.
+
+Known limits at this checkpoint:
+
+- A value that is not complete, valid JSON (a message array cut off by a
+  sender's length limit, for instance) is indexed as plain text. A word that
+  directly follows an escape in it is not found.
+- No ranking. Results are the newest matching spans.
+- Of a span stored twice, only the copy that arrived first is ever returned,
+  even when only the later copy matches.
+- Damage in one part fails a search that has to read that part, including to
+  decide which copy of a span in a split trace to show.
+
+## Checkpoint 6: compaction, retention, late spans
+
+A flush writes one small part per 15-minute window. A background thread now
+merges them, removes data past its retention, and trims the log.
+
+- **Merging.** Parts of similar size in one window are merged once there are
+  four (so data that keeps arriving is rewritten a logarithmic number of
+  times, about six bytes written per byte ingested in the simulation), and a
+  window that has gone quiet becomes one part. A merge never crosses a window,
+  holds no lock while it works, and runs in bounded memory: it reads a
+  chunk of rows at a time (32 MiB by default) and carries the stored text over
+  without rebuilding it.
+- **Retention.** `--retention 7d` removes parts whose whole window is older
+  than that, all expired parts in one step, so a query sees a part or does
+  not. Retention is not held up by a busy merge.
+- **Late and repeated spans.** Every span row now carries `arrival`, the
+  number of the log record that brought it. Where one span is stored more than
+  once (a sender's retry that crossed a flush), the copy that arrived first is
+  the one shown: by a flush, by a merge, when a trace is opened and in search.
+  The number comes from the log, so a crash, a restart or the order of merges
+  cannot change which copy that is. A merge drops the later copies.
+- **The log is rotated after each flush**, so it no longer keeps records that
+  are already in parts.
+- **Shutdown does not wait for a merge.** A running merge is abandoned and
+  leaves nothing behind; the next start merges again.
+- **Smaller span tables.** Column encodings were chosen per column (deltas for
+  sorted values, bytes split by position for ids).
+
+Measured with the benchmark harness (2 CPUs, 4 GB; full results in
+[benchmarks](benchmarks/README.md)): ten million spans without text take
+431 MB in 95 parts, one per window, down from 560 MB in 125 parts, and less
+than the ClickHouse baseline's 469 MB. The saving came from the column
+encodings, not from merging, which rewrote 143.2 MB into 142.8 MB; what
+merging buys is one part per window for queries and, on text, sharing across
+flushes. The log holds 4 KB after a load instead of 134 MB.
+
+How it was tested: the process is aborted at every stage of a merge and of a
+replacement, and each acknowledged record must be there exactly once after the
+restart; ingest, flushes, queries, retention and merges run concurrently
+against a model; merges with damaged inputs, at the piece ceiling, stopped
+half way, and with resident memory measured; rotation with a file that cannot
+be created and with a directory sync that fails.
+
+Two independent examinations and a second pass over the fixes found these
+defects, each proven with a failing test first:
+
+- Which copy of a repeated span was kept depended on part order: a tiered
+  merge could keep the later one, and the answer changed when another window
+  was merged.
+- A window that kept merging could hold retention back without bound.
+- A failed log rotation left the log unusable until a restart; a failed
+  directory sync during rotation could leave files that a restart refused.
+- Very large option values overflowed and panicked a background thread.
+- A merge whose inputs held more text pieces than one part may hold moved text
+  out of the index, so searches lost hits. Such a merge is now not chosen.
+- A row listed under the wrong trace by a damaged index was merged as data.
+- Shutdown waited for a merge to finish, which could be minutes.
+
+After the fixes, each behaviour the fixes of checkpoints 5 and 6 added was
+taken out again, one at a time, to see a test fail: 53 removals. For 42 a test
+failed as it should. Two were expected to change nothing and changed nothing
+(the order of a merge's inputs and the order in which parts are read no longer
+decide which copy of a span is shown). One could not be reached by any input.
+For the remaining eight no test noticed, among them the comparison of a row's
+trace id in a merge and the arrival term of a flush's sort key; a test was
+added or tightened for each until the removal made it fail.
+
+Known limits at this checkpoint:
+
+- Until a merge has dropped the later copy of a repeated span, token totals
+  count both, and a trace listing can show fields from either. Copies that
+  were flushed into different windows are never in one merge, so for those
+  this lasts until retention removes them. Opening a trace and searching show
+  one copy all along.
+- Late data for a window that was already merged into one part rewrites that
+  window once it is quiet again.
+- Retention goes by the window of a trace's earliest span in a flush, not by
+  each span's own time.
+- A merge does not check free disk space before it starts; it needs about the
+  size of its inputs.
+- Stopping a merge waits for the input being verified or for the final write
+  of the output, whichever is in progress.
+- The fixes of the last pass have had removal checks but no further
+  independent examination.

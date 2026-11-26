@@ -6,10 +6,12 @@ store.
 
 > **Status: early development.** The design has been tested with throwaway
 > experiments and the engine is being built in checkpoints. Today it runs as a
-> single process that accepts traces over OTLP gRPC and reads them back over
-> HTTP. It is not ready for production: there is no authentication, no
-> compaction, and the large-text store that the design rests on is not built
-> yet. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md) for what works today.
+> single process that accepts traces over OTLP gRPC and answers over HTTP:
+> open a trace, list traces, token totals and full-text search of message
+> text. Repeated text is stored once, parts are merged in the background and
+> retention removes old data. It is not ready for production: there is no
+> authentication or TLS, logs and metrics are not accepted yet, and there is
+> no SQL. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md) for what works today.
 
 ## Why another database
 
@@ -76,27 +78,30 @@ caveats are in [docs/benchmarks](docs/benchmarks/README.md).
 
 ## What the server measures today
 
-At checkpoint 4, on a laptop in Docker with 2 CPUs and 4 GB. Method, caveats
+At checkpoint 6, on a laptop in Docker with 2 CPUs and 4 GB. Method, caveats
 and every number: [docs/benchmarks](docs/benchmarks/README.md).
 
 | | NightsWatchDB server | ClickHouse baseline (earlier run) |
 |---|---|---|
-| 8 GB of agent-trace text, stored | 62 MB | 496 MB |
-| ... newest 50 traces with an error and one model, median | 1.4 ms | 586 ms |
-| ... token totals of chat spans by model, median | 3.4 ms | 420 ms |
-| 10M spans without text, stored | 560 MB | 469 MB |
-| ... open a trace, median | 0.9 ms | 11.5 ms |
-| ... newest 50 traces of one service, median | 0.9 ms | 4.9 ms |
-| ... newest 50 traces with an error and one model, median | 1.0 ms | 773 ms |
-| ... token totals of chat spans by model, median | 196 ms | 272 ms |
+| 8 GB of agent-trace text, stored with a text index | 88 MB | 496 MB + 119 MB index |
+| ... newest 50 traces with an error and one model, median | 0.9 ms | 586 ms |
+| ... token totals of chat spans by model, median | 2.2 ms | 420 ms |
+| ... search for a word, newest 20 spans, median | 0.3 ms | not measured on this run |
+| ... search for a phrase, median | 1.5 ms | not measured on this run |
+| 10M spans without text, stored | 431 MB | 469 MB |
+| ... open a trace, median | 0.6 ms | 11.5 ms |
+| ... newest 50 traces of one service, median | 0.8 ms | 4.9 ms |
+| ... newest 50 traces with an error and one model, median | 0.8 ms | 773 ms |
+| ... token totals of chat spans by model, median | 154 ms | 272 ms |
 
-The queries and their parameters are the same on both sides. The runs are
-not: the baseline used the Collector exporter's schema as shipped and was
-measured on another day, and the server is measured over HTTP.
+The list and token queries and their parameters are the same on both sides.
+The runs are not: the baseline used the Collector exporter's schema as shipped
+and was measured on another day, and the server is measured over HTTP. A
+schema tuned for these queries would do much better than the baseline here.
 
-It is behind where the design is not built yet: span-only data is stored in
-many small parts until compaction exists, and takes more space than the
-baseline.
+Where it is behind: token totals over many spans run on one thread, opening a
+very large trace has a slow tail (54 ms at the 99th percentile), and a load
+peaks at about 1 GB of memory.
 
 ## Running it
 
@@ -114,6 +119,7 @@ Send traces to `127.0.0.1:4317` with any OTLP gRPC exporter, then:
 curl 'http://127.0.0.1:4320/api/v1/traces?limit=10'
 curl  http://127.0.0.1:4320/api/v1/traces/<trace id>
 curl  http://127.0.0.1:4320/api/v1/tokens
+curl 'http://127.0.0.1:4320/api/v1/search?q=%22rate+limit%22+-retry*'
 ```
 
 The ports are published on the loopback address on purpose: there is no
