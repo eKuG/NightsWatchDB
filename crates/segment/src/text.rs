@@ -10,6 +10,7 @@ use crate::index::FileChecksum;
 use crate::writer::{Digest, SharedFile};
 use crate::{TEXT_INDEX_FILE, TEXT_ROWS_FILE};
 use nwdb_core::{Error, Result};
+use nwdb_payload::json_search_text;
 use nwdb_textindex::{
     IdListMeta, IdListWriter, IndexBuilder, IndexMeta, IndexOptions, IndexReader,
 };
@@ -72,9 +73,11 @@ impl TextWriter {
     }
 
     /// Piece `id` was stored and holds `bytes`. Ids arrive in ascending order,
-    /// which is what the index builder needs.
+    /// which is what the index builder needs. What is indexed is the piece as
+    /// [`json_search_text`] gives it, which is also what a phrase is confirmed
+    /// against.
     pub fn add_piece(&mut self, id: u32, bytes: &[u8]) -> Result<()> {
-        self.builder.add(id, bytes)
+        self.builder.add(id, &json_search_text(bytes))
     }
 
     /// Records that row `row` refers to the pieces in `pieces` (any order,

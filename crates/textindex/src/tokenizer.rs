@@ -113,6 +113,24 @@ impl<'a> Iterator for Tokens<'a> {
     }
 }
 
+/// Where to cut `text` so that the first part is about `want` bytes and no
+/// token is split: the first position at or after `want` that is not a token
+/// byte, or `text.len()`. A token that is longer than `want` stays whole.
+pub(crate) fn chunk_end(text: &[u8], want: usize) -> usize {
+    let Some(tail) = text.get(want..) else {
+        return text.len();
+    };
+    // `text[want - 1]` may end a token and `text[want]` start another: any
+    // position is a cut if the byte before it or the byte at it is a separator.
+    let inside = want > 0 && IS_TOKEN_BYTE[text[want - 1] as usize];
+    let skip = if inside {
+        tail.iter().position(|&b| !IS_TOKEN_BYTE[b as usize])
+    } else {
+        Some(0)
+    };
+    skip.map_or(text.len(), |k| want + k)
+}
+
 /// The key for a token of any length, as [`Token::key`] builds it.
 pub(crate) fn long_aware_key<'b>(raw: &[u8], buf: &'b mut [u8; MAX_KEY_LEN]) -> &'b [u8] {
     let kept = raw.len().min(MAX_TOKEN_LEN);

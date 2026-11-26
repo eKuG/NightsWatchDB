@@ -18,7 +18,7 @@ use crate::format::{
 };
 use crate::meta::IndexMeta;
 use crate::source::Sink;
-use crate::tokenizer::{MAX_KEY_LEN, tokens};
+use crate::tokenizer::{MAX_KEY_LEN, chunk_end, tokens};
 
 /// The default byte budget of an open segment: 256 MiB.
 pub const DEFAULT_SEGMENT_BUDGET: usize = 256 * 1024 * 1024;
@@ -36,8 +36,11 @@ pub struct IndexOptions {
     /// are raised to it.
     ///
     /// The count is an estimate of heap bytes (term bytes, hash table slots,
-    /// list headers and the ids of every list, with allocator rounding) and is
-    /// checked after each document, so one large document can overshoot it.
+    /// list headers and the ids of every list, with allocator rounding). It is
+    /// checked after every piece of about 1 KiB of a document, cut between
+    /// tokens, so a document of any size overshoots it by at most the 50 KiB
+    /// or so that one piece can add. A document that does not fit is split
+    /// over consecutive segments: its id is then in the range of both.
     /// Closing a segment needs a further 32 bytes per term for the sorted
     /// order plus the segment's dictionary and sparse index, and each closed
     /// segment keeps a 72 byte directory entry (at most 144 bytes with the
@@ -53,6 +56,13 @@ impl Default for IndexOptions {
         }
     }
 }
+
+/// A document is fed to the open segment in pieces of about this many bytes,
+/// cut between tokens, and the budget is checked after each piece. A piece
+/// holds at most half this many tokens, so the memory estimate overshoots the
+/// budget by at most about 100 bytes of estimate for each of them (50 KiB),
+/// whatever the size of the document. A token longer than this stays whole.
+const CHUNK_BYTES: usize = 1024;
 
 /// Heap bytes the allocator really uses for a request of `n` bytes: a header
 /// word and rounding to 16 bytes.
@@ -71,8 +81,8 @@ struct OpenSegment {
     lists: Vec<Vec<u32>>,
     /// Estimated heap bytes held.
     mem: usize,
-    /// Documents added. A segment holds at most `u32::MAX`; the builder closes
-    /// it before that count could wrap.
+    /// Distinct documents added. A segment holds at most `u32::MAX`; the
+    /// builder closes it before that count could wrap.
     docs: u32,
     doc_lo: u32,
     doc_hi: u32,
@@ -81,11 +91,15 @@ struct OpenSegment {
 
 impl OpenSegment {
     fn add(&mut self, doc: u32, text: &[u8]) {
-        if self.docs == 0 {
-            self.doc_lo = doc;
+        // A document cut between two segments arrives here once per piece,
+        // and counts once.
+        if self.docs == 0 || self.doc_hi != doc {
+            if self.docs == 0 {
+                self.doc_lo = doc;
+            }
+            self.docs += 1;
         }
         self.doc_hi = doc;
-        self.docs += 1;
         let table_before = self.terms.capacity();
         let lists_before = self.lists.capacity();
         let mut buf = [0u8; MAX_KEY_LEN];
@@ -164,7 +178,9 @@ impl<W: Write> IndexBuilder<W> {
     }
 
     /// Adds a document. Ids must be strictly ascending; they need not be
-    /// dense. A document with no tokens is allowed and still counts.
+    /// dense. A document with no tokens is allowed and still counts. The
+    /// segment is closed in the middle of a document if the budget is passed
+    /// there; the rest of the document goes to the next segment.
     ///
     /// An id that is not above the previous one is `InvalidArgument` and
     /// changes nothing. If writing a closed segment fails, the builder is
@@ -184,11 +200,18 @@ impl<W: Write> IndexBuilder<W> {
         self.last_doc = Some(doc_id);
         self.docs += 1;
         self.text_bytes += text.len() as u64;
-        self.open.add(doc_id, text);
-        if self.open.mem > self.options.segment_budget_bytes {
-            self.close_segment()?;
+        let mut rest = text;
+        loop {
+            let n = chunk_end(rest, CHUNK_BYTES);
+            self.open.add(doc_id, &rest[..n]);
+            rest = &rest[n..];
+            if self.open.mem > self.options.segment_budget_bytes {
+                self.close_segment()?;
+            }
+            if rest.is_empty() {
+                return Ok(());
+            }
         }
-        Ok(())
     }
 
     /// Closes the open segment, writes the directory and footer, flushes the

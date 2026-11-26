@@ -9,6 +9,8 @@
 //! - [`rope`]: how a value is stored when some of its bytes live in pieces.
 //! - [`json_array_elements`]: finds the elements of a JSON array, so that a
 //!   conversation stored as an array is cut into its messages.
+//! - [`json_search_text`]: the text of a piece as it is searched, with the
+//!   escapes of a JSON piece decoded.
 //! - [`PieceWriter`] and [`PieceReader`]: the piece store, `pieces.blk` and
 //!   `pieces.idx`. The formats are described in the README.
 
@@ -19,6 +21,6 @@ pub mod rope;
 mod writer;
 
 pub use format::{BLOCKS_FILE, INDEX_FILE, MAX_PIECE_BYTES};
-pub use json::{MAX_JSON_DEPTH, json_array_elements};
+pub use json::{MAX_JSON_DEPTH, is_json_text, json_array_elements, json_search_text};
 pub use reader::{PieceReader, PieceSession};
 pub use writer::{Added, FileSum, PieceObserver, PieceWriter, PieceWriterOptions, StoreSummary};

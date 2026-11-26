@@ -718,7 +718,8 @@ impl<S: ReadAt> IndexReader<S> {
             meta.postings_bytes += e.postings_len;
             meta.dictionary_bytes += e.dict_len;
             meta.sparse_bytes += e.sparse_len;
-            docs += u64::from(e.docs);
+            // A document cut between two segments is in both and counts once.
+            docs += u64::from(e.docs) - u64::from(prev_hi == Some(e.doc_lo));
             terms += e.terms;
             postings += e.postings;
             prev_hi = Some(e.doc_hi);
@@ -743,7 +744,9 @@ impl<S: ReadAt> IndexReader<S> {
         if e.docs == 0 || e.doc_lo > e.doc_hi {
             return corrupt("segment has no documents or an inverted id range");
         }
-        if prev_hi.is_some_and(|h| e.doc_lo <= h) {
+        // A segment may start with the document the one before it ended
+        // with, but with no earlier one.
+        if prev_hi.is_some_and(|h| e.doc_lo < h) {
             return corrupt("segment document ranges overlap or are out of order");
         }
         if u64::from(e.docs) > u64::from(e.doc_hi) - u64::from(e.doc_lo) + 1 {
@@ -869,6 +872,10 @@ impl<S: ReadAt> IndexReader<S> {
                 out.extend(Cursor::open(&self.src, seg, &e, READ_AHEAD)?.drain()?);
             }
         }
+        // The lists of consecutive segments follow each other; a document cut
+        // between two segments can be at the end of one and the start of the
+        // next.
+        out.dedup();
         Ok(Matches {
             ids: DocIds::from_ascending(out),
             exact,
@@ -944,6 +951,7 @@ impl<S: ReadAt> IndexReader<S> {
                 .collect::<Result<Vec<_>>>()?;
             out.extend(merge_union(cursors)?);
         }
+        out.dedup();
         Ok(DocIds::from_ascending(out))
     }
 
@@ -987,20 +995,26 @@ impl<S: ReadAt> IndexReader<S> {
         keys.dedup();
         // One list is open only when there is one key; else none reads ahead.
         let ahead = if keys.len() == 1 { READ_AHEAD } else { 0 };
-        let mut out = Vec::new();
-        let mut blocks = 0;
-        'segments: for seg in &self.segments {
+        // A document cut between segments can have one word in one segment
+        // and another in the next, so each key is read as one list over all
+        // the segments, and the lists are intersected after that.
+        let mut chains: Vec<Chain<'_, S>> = keys
+            .iter()
+            .map(|_| Chain::new(&self.src, &self.segments, ahead))
+            .collect();
+        for (seg_no, seg) in self.segments.iter().enumerate() {
             seg.verify(&self.src)?;
-            let mut cursors = Vec::with_capacity(keys.len());
-            for k in &keys {
-                match seg.lookup(&self.src, k)? {
-                    Some(e) => cursors.push(Cursor::open(&self.src, seg, &e, ahead)?),
-                    None => continue 'segments,
+            for (chain, k) in chains.iter_mut().zip(&keys) {
+                if let Some(e) = seg.lookup(&self.src, k)? {
+                    chain.found.push((seg_no, e));
                 }
             }
-            out.extend(leapfrog(&mut cursors)?);
-            blocks += cursors.iter().map(|c| c.blocks_read).sum::<u64>();
         }
+        if chains.iter().any(|c| c.found.is_empty()) {
+            return Ok(none());
+        }
+        let out = leapfrog(&mut chains)?;
+        let blocks = chains.iter().map(Chain::blocks_read).sum();
         Ok((
             Matches {
                 ids: DocIds::from_ascending(out),
@@ -1011,11 +1025,76 @@ impl<S: ReadAt> IndexReader<S> {
     }
 }
 
-/// Ids present in every cursor. It walks the shortest list and asks the
+/// The list of one key over all the segments that have it: their cursors one
+/// after another. Segment ranges ascend and only the end of one can equal the
+/// start of the next, so the ids ascend and `seek` never returns an id twice
+/// when the targets rise. Cursors are opened when reached, so a search holds
+/// one cursor per key, not one per segment.
+struct Chain<'a, S: ReadAt> {
+    src: &'a S,
+    segments: &'a [Segment],
+    /// The segments that have the key (indexes), in order, and its entry.
+    found: Vec<(usize, Entry)>,
+    next: usize,
+    cur: Option<Cursor<'a, S>>,
+    ahead: u64,
+    done_blocks: u64,
+}
+
+impl<'a, S: ReadAt> Chain<'a, S> {
+    fn new(src: &'a S, segments: &'a [Segment], ahead: u64) -> Self {
+        Self {
+            src,
+            segments,
+            found: Vec::new(),
+            next: 0,
+            cur: None,
+            ahead,
+            done_blocks: 0,
+        }
+    }
+
+    /// Upper bound of the length of the list: it counts a document cut
+    /// between segments once for each.
+    fn df(&self) -> u64 {
+        self.found.iter().map(|(_, e)| u64::from(e.df)).sum()
+    }
+
+    fn blocks_read(&self) -> u64 {
+        self.done_blocks + self.cur.as_ref().map_or(0, |c| c.blocks_read)
+    }
+
+    /// The first id that is at least `target`, or `None` at the end. Targets
+    /// must not decrease between calls.
+    fn seek(&mut self, target: u64) -> Result<Option<u32>> {
+        loop {
+            if let Some(c) = &mut self.cur {
+                if let Some(id) = c.seek(target)? {
+                    return Ok(Some(id));
+                }
+                self.done_blocks += c.blocks_read;
+                self.cur = None;
+            }
+            // skip the segments that end before the target without opening
+            let (i, e) = loop {
+                let Some(&(i, e)) = self.found.get(self.next) else {
+                    return Ok(None);
+                };
+                self.next += 1;
+                if u64::from(self.segments[i].e.doc_hi) >= target {
+                    break (i, e);
+                }
+            };
+            self.cur = Some(Cursor::open(self.src, &self.segments[i], &e, self.ahead)?);
+        }
+    }
+}
+
+/// Ids present in every chain. It walks the shortest list and asks the
 /// others to skip to each candidate.
-fn leapfrog<S: ReadAt>(cs: &mut [Cursor<'_, S>]) -> Result<Vec<u32>> {
+fn leapfrog<S: ReadAt>(cs: &mut [Chain<'_, S>]) -> Result<Vec<u32>> {
     let mut out = Vec::new();
-    cs.sort_by_key(|c| c.df);
+    cs.sort_by_key(Chain::df);
     let Some(mut cand) = cs[0].seek(0)? else {
         return Ok(out);
     };

@@ -394,7 +394,8 @@ impl PartReader {
         *spent = total;
         let mut confirmed = Vec::new();
         store.read_sorted(candidates.iter().copied(), |n, bytes| {
-            if holds(bytes) {
+            // the text the index was built from, not the stored bytes
+            if holds(&nwdb_payload::json_search_text(bytes)) {
                 confirmed.push(candidates[n]);
             }
         })?;
