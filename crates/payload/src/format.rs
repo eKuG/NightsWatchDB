@@ -170,10 +170,11 @@ pub(crate) fn corrupt(msg: impl std::fmt::Display) -> Error {
     Error::corrupt(format!("{INDEX_FILE}: {msg}"))
 }
 
-/// Encodes the file from the blocks and the piece lengths, which are already
-/// varints in id order. The pieces must fill the blocks, as the writer's do.
-pub(crate) fn encode(blocks: &[BlockLoc], lens: &[u8], pieces: u64, logical_bytes: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + blocks.len() * BLOCK_LEN + lens.len() + CRC_LEN);
+/// The header and block table of the file: everything before the piece
+/// lengths. The lengths and the checksum follow it (see [`encode`]); a writer
+/// with many pieces writes them from its own table rather than copying them.
+pub(crate) fn encode_head(blocks: &[BlockLoc], pieces: u64, logical_bytes: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + blocks.len() * BLOCK_LEN);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
@@ -185,6 +186,15 @@ pub(crate) fn encode(blocks: &[BlockLoc], lens: &[u8], pieces: u64, logical_byte
         out.extend_from_slice(&b.ulen.to_le_bytes());
         out.extend_from_slice(&b.crc.to_le_bytes());
     }
+    out
+}
+
+/// Encodes the file from the blocks and the piece lengths, which are already
+/// varints in id order: [`encode_head`], the lengths, and the CRC-32C of both.
+/// The pieces must fill the blocks, as the writer's do.
+#[cfg(test)]
+pub(crate) fn encode(blocks: &[BlockLoc], lens: &[u8], pieces: u64, logical_bytes: u64) -> Vec<u8> {
+    let mut out = encode_head(blocks, pieces, logical_bytes);
     out.extend_from_slice(lens);
     let crc = crc32c::crc32c(&out);
     out.extend_from_slice(&crc.to_le_bytes());

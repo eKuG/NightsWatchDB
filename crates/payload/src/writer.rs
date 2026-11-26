@@ -457,9 +457,16 @@ impl PieceWriter {
     pub fn finish(mut self) -> Result<StoreSummary> {
         self.close_block()?;
         self.blk.sync_all()?;
-        let bytes = format::encode(&self.blocks, &self.lens, self.count, self.logical);
-        self.idx.write_all(&bytes)?;
+        // The lengths are written from the table the writer holds, not copied
+        // into a second buffer: that copy cost a byte for every piece at the
+        // moment the writer's memory is highest.
+        let head = format::encode_head(&self.blocks, self.count, self.logical);
+        let crc = crc32c::crc32c_append(crc32c::crc32c(&head), &self.lens);
+        self.idx.write_all(&head)?;
+        self.idx.write_all(&self.lens)?;
+        self.idx.write_all(&crc.to_le_bytes())?;
         self.idx.sync_all()?;
+        let idx_len = (head.len() + self.lens.len() + 4) as u64;
         Ok(StoreSummary {
             totals: PayloadTotals {
                 pieces: self.count,
@@ -472,8 +479,8 @@ impl PieceWriter {
                 crc32c: self.blk_crc,
             },
             index: FileSum {
-                len: bytes.len() as u64,
-                crc32c: crc32c::crc32c(&bytes[..bytes.len() - 4]),
+                len: idx_len,
+                crc32c: crc,
             },
         })
     }
