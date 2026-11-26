@@ -58,7 +58,7 @@ use std::io::{BufReader, Read};
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Upper bound on rows per batch returned by the Parquet reader. The batch
@@ -605,6 +605,19 @@ impl Table {
         self.group_starts.len() - 1
     }
 
+    /// Uncompressed bytes per row of the row group that holds `row`, at least
+    /// 1; 1 for a row past the end.
+    fn estimated_row_bytes(&self, row: u64) -> u64 {
+        let group = self.group_starts.partition_point(|&s| s <= row) - 1;
+        if group >= self.row_group_count() {
+            return 1;
+        }
+        let g = self.meta.metadata().row_group(group);
+        (u64::try_from(g.total_byte_size()).unwrap_or(0)
+            / u64::try_from(g.num_rows()).unwrap_or(1).max(1))
+        .max(1)
+    }
+
     fn group_rows(&self, group: usize) -> usize {
         (self.group_starts[group + 1] - self.group_starts[group]) as usize
     }
@@ -1033,6 +1046,7 @@ impl Iterator for Scan {
 /// `Send + Sync`, one value can serve many threads at once, and reads keep
 /// working (on Unix) after the part directory has been deleted.
 pub struct PartReader {
+    dir: PathBuf,
     entries: Vec<TraceEntry>,
     checksums: FileChecksums,
     spans: Arc<Table>,
@@ -1091,6 +1105,7 @@ impl PartReader {
             ));
         }
         Ok(Self {
+            dir: dir.to_path_buf(),
             entries,
             checksums,
             spans: Arc::new(spans),
@@ -1135,6 +1150,17 @@ impl PartReader {
     /// so [`open`](Self::open) does not do it; compaction and a scrubber
     /// should.
     pub fn verify(&self) -> Result<()> {
+        self.verify_files()?;
+        self.spans.verify_ropes()
+    }
+
+    /// The part of [`verify`](Self::verify) that reads the files and no rope:
+    /// the length and CRC-32C of all four data files against the index, and
+    /// every block of the piece store. Because the checksum of `spans.parquet`
+    /// covers every rope, a part that passes holds the ropes it was written
+    /// with, which is all a caller that carries them over unchanged needs to
+    /// know; it costs a sequential read and no rebuild of values.
+    pub(crate) fn verify_files(&self) -> Result<()> {
         self.spans.verify(self.checksums.spans)?;
         self.summary.verify(self.checksums.summary)?;
         let (blk, idx) = self.store.file_sums()?;
@@ -1148,8 +1174,19 @@ impl PartReader {
             };
             check_sum(name, now.len, now, recorded)?;
         }
-        self.store.verify()?;
-        self.spans.verify_ropes()
+        self.store.verify()
+    }
+
+    /// The directory the part was opened from, to name it in an error.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// About how many bytes row `row` takes as stored (uncompressed, ropes not
+    /// rebuilt): the average of the row group that holds it. The merge sizes
+    /// its chunks with it before it has read anything.
+    pub(crate) fn estimated_row_bytes(&self, row: u64) -> u64 {
+        self.spans.estimated_row_bytes(row)
     }
 
     /// Number of span rows.

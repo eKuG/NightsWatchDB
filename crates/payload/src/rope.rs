@@ -177,6 +177,77 @@ pub fn piece_ids(rope: &[u8]) -> impl Iterator<Item = Result<u32, RopeError>> + 
     })
 }
 
+/// What a reference of a rope becomes when the rope is carried over to
+/// another store (see [`translate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mapped<'a> {
+    /// The piece has this id in the other store.
+    Piece(u32),
+    /// The other store does not hold the piece; its bytes go into the rope.
+    Inline(&'a [u8]),
+}
+
+/// Appends to `out` a rope for the same value as `rope`, in which every
+/// reference is replaced as `map` says. Nothing is rebuilt: the checksum the
+/// rope carries is the CRC-32C of the value, which does not change, so it is
+/// copied as it is, and a reader of the result checks it exactly as it would
+/// for a rope written from the value. A wrong `map` is therefore caught when
+/// the value is read, not trusted.
+///
+/// A rope without references is copied. A rope whose references all became
+/// inline bytes becomes the rope of a value with no cuts. `map` is called once
+/// per reference, in order. Fails with [`RopeError::Malformed`] on a rope that
+/// is not well formed, and with `map`'s error as [`RopeError::Piece`]; `out`
+/// is then unspecified.
+pub fn translate<'m>(
+    rope: &[u8],
+    mut map: impl FnMut(u32) -> Result<Mapped<'m>, Error>,
+    out: &mut Vec<u8>,
+) -> Result<(), RopeError> {
+    let Some(crc) = checksum(rope) else {
+        // No cuts: the value is the rope's own bytes. Walking it reports a
+        // tag that is unknown or a checksum that is cut short.
+        for segment in segments(rope) {
+            segment?;
+        }
+        out.extend_from_slice(rope);
+        return Ok(());
+    };
+    let start = out.len();
+    out.push(TAG_SEGMENTS);
+    out.extend_from_slice(&crc.to_le_bytes());
+    let mut any_piece = false;
+    for segment in segments(rope) {
+        let put_inline = |out: &mut Vec<u8>, b: &[u8]| {
+            if !b.is_empty() {
+                put_varint(out, (b.len() as u64) << 1);
+                out.extend_from_slice(b);
+            }
+        };
+        match segment? {
+            Segment::Inline(b) => put_inline(out, b),
+            Segment::Piece(id) => match map(id).map_err(RopeError::Piece)? {
+                Mapped::Piece(new) => {
+                    put_varint(out, (u64::from(new) << 1) | 1);
+                    any_piece = true;
+                }
+                Mapped::Inline(b) => put_inline(out, b),
+            },
+        }
+    }
+    if !any_piece {
+        let mut value = Vec::new();
+        for segment in segments(&out[start..]) {
+            if let Segment::Inline(b) = segment? {
+                value.extend_from_slice(b);
+            }
+        }
+        out.truncate(start);
+        encode_inline(&value, out);
+    }
+    Ok(())
+}
+
 /// Iterator returned by [`segments`].
 pub struct Segments<'a> {
     rest: &'a [u8],
@@ -475,5 +546,88 @@ mod tests {
         assert!(!cuts_are_valid(10, &[0..11]));
         assert!(!cuts_are_valid(10, &[4..6, 5..7]));
         assert!(!cuts_are_valid(10, &[6..8, 0..2]));
+    }
+
+    #[test]
+    fn translation_keeps_the_value_and_its_checksum() {
+        let value: Vec<u8> = (0..200u8).collect();
+        let cuts = [10..40, 60..90, 150..200];
+        let old_ids = [4u32, 9, 2];
+        let mut rope = Vec::new();
+        encode_cut(&value, &cuts, &old_ids, &mut rope);
+
+        // New store: the same pieces under other ids; one goes inline.
+        let new_store: Vec<Vec<u8>> = vec![value[150..200].to_vec(), value[10..40].to_vec()];
+        let mut out = Vec::new();
+        translate(
+            &rope,
+            |id| match id {
+                4 => Ok(Mapped::Piece(1)),
+                2 => Ok(Mapped::Piece(0)),
+                9 => Ok(Mapped::Inline(&value[60..90])),
+                _ => panic!("unexpected {id}"),
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(checksum(&out), checksum(&rope));
+        assert_eq!(
+            piece_ids(&out).map(Result::unwrap).collect::<Vec<_>>(),
+            [1, 0]
+        );
+        assert_eq!(rebuild(&out, &new_store).unwrap(), value);
+
+        // A wrong translation is not trusted: the checksum catches it.
+        let mut wrong = Vec::new();
+        translate(&rope, |_| Ok(Mapped::Piece(0)), &mut wrong).unwrap();
+        assert!(matches!(
+            rebuild(&wrong, &new_store),
+            Err(RopeError::Checksum)
+        ));
+    }
+
+    #[test]
+    fn translation_of_ropes_without_references() {
+        let never = |_: u32| -> Result<Mapped<'static>, Error> { panic!("no references") };
+        for value in [&b""[..], b"x", b"some inline bytes"] {
+            let mut rope = Vec::new();
+            encode_inline(value, &mut rope);
+            let mut out = Vec::new();
+            translate(&rope, never, &mut out).unwrap();
+            assert_eq!(out, rope);
+        }
+        // Every reference inline: the rope of a value with no cuts.
+        let value = b"0123456789abcdef";
+        let mut rope = Vec::new();
+        encode_cut(value, &[2..6, 8..12], &[0, 1], &mut rope);
+        let mut out = Vec::new();
+        translate(
+            &rope,
+            |id| {
+                let cut = if id == 0 { &value[2..6] } else { &value[8..12] };
+                Ok(Mapped::Inline(cut))
+            },
+            &mut out,
+        )
+        .unwrap();
+        let mut plain = Vec::new();
+        encode_inline(value, &mut plain);
+        assert_eq!(out, plain);
+        // Ropes that are not well formed are errors.
+        for bad in [
+            &[2u8][..],
+            &[3, 0, 0],
+            &[3, 0, 0, 0, 0, 0x80],
+            &[3, 0, 0, 0, 0, 20, 1],
+        ] {
+            let r = translate(bad, |_| Ok(Mapped::Piece(0)), &mut Vec::new());
+            assert!(matches!(r, Err(RopeError::Malformed(_))), "{bad:?}");
+        }
+        let r = translate(
+            &rope,
+            |_| Err(Error::corrupt("no such piece")),
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, Err(RopeError::Piece(_))));
     }
 }

@@ -410,16 +410,53 @@ impl SpanBatchBuilder {
     /// Panics if `row` is out of range for `columns`.
     pub fn append_from(&mut self, columns: &SpanColumns<'_>, source: usize, row: usize) {
         let record = columns.record(row);
+        self.append_record_from(columns, source, row, &record);
+    }
+
+    /// Like [`append_from`](Self::append_from), but the row gets the raw
+    /// columns `attrs`, `events` and `links` given here instead of the ones
+    /// the source row holds, whose other values are copied as they are. For a
+    /// caller that carries rows between parts and has to change how the raw
+    /// columns are stored, not what the rest of the row says.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row` is out of range for `columns`.
+    pub fn append_from_with_raw(
+        &mut self,
+        columns: &SpanColumns<'_>,
+        source: usize,
+        row: usize,
+        attrs: &[u8],
+        events: Option<&[u8]>,
+        links: Option<&[u8]>,
+    ) {
+        let record = SpanRecord {
+            attrs,
+            events,
+            links,
+            ..columns.record(row)
+        };
+        self.append_record_from(columns, source, row, &record);
+    }
+
+    fn append_record_from(
+        &mut self,
+        columns: &SpanColumns<'_>,
+        source: usize,
+        row: usize,
+        record: &SpanRecord<'_>,
+    ) {
         let cache_key = (source, columns.origin_keys(row));
         let keys = match self.copied.get(&cache_key) {
             Some(keys) => *keys,
             None => {
-                let keys = self.intern_origin(&Origin::of(&record));
+                let keys = self.intern_origin(&Origin::of(record));
                 self.copied.insert(cache_key, keys);
                 keys
             }
         };
-        self.append_span(&record, &keys);
+        self.append_span(record, &keys);
     }
 
     /// Number of rows appended since the last [`finish`](Self::finish).

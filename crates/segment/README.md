@@ -15,6 +15,8 @@ contiguous read.
   `pieces.idx`, see `nwdb-payload`) in which each distinct piece of text is
   stored once per part. Reads rebuild the original bytes, so what comes back is
   exactly what was written.
+- `merge_parts` writes one part from several, without rebuilding their text
+  (see [Merging](#merging)).
 
 ## Files of a part
 
@@ -338,6 +340,135 @@ Failure rules for the caller:
 - If anything fails after the rename (the sync of the parts directory),
   `finish` returns `Error::Fatal`: the part may or may not be durable. Do not
   reuse the id; restart.
+
+## Merging
+
+```rust
+let (meta, stats) = merge_parts(&[&oldest, &newer], parts_dir, part_id,
+                                window_start_ns, window_ns, MergeOptions::default())?;
+```
+
+`merge_parts(inputs, parts_dir, part_id, window_start_ns, window_ns, options)`
+takes open readers, oldest first, and writes the part a flush would have written
+had it received all the rows of its inputs at once. It is a function and not a
+type: a merge has no state a caller could use between its start and its end, and
+the engine needs one call that either returns a finished part or leaves nothing.
+It returns the `PartMeta` (with `level` from `MergeOptions::level`, default 1)
+and `MergeStats`.
+
+What the output is:
+
+- The spans of a trace are adjacent, ordered by `(start_ns, span_id)`. Traces
+  are ordered by `(the earliest start of the trace in any input, trace_id)`. A
+  trace with rows in several inputs is one run. The trace index and the summary
+  are built by the writer a flush uses; the summary of a trace is computed from
+  its merged rows.
+- A `(trace_id, span_id)` that occurs more than once is kept once: the row of
+  the earliest input, and within one input its first row. The others are
+  `MergeStats::duplicates_dropped`. A row that differs in content but shares
+  the ids of an earlier one loses to it.
+- Every value of every kept row reads back byte for byte as the input returns
+  it, including nulls, origins and ropes.
+- The ordering of traces looks at the earliest start of any row of the trace in
+  any input, also of a row that is dropped as a duplicate; the index entry and
+  the summary describe the kept rows. A flush orders by the kept rows. The two
+  differ only when a dropped duplicate started before every kept row of its
+  trace, which a sender's retry (the same span again) never does, and the
+  merge cannot know it without a pass over every row before it writes the first
+  trace.
+
+How it works:
+
+- **Text is not rebuilt.** Rows are read as stored (`read_rows_stored`). A rope
+  keeps its checksum (the CRC-32C of the value, which does not change) and has
+  its piece references translated from the numbering of the input's store to the
+  output's (`nwdb_payload::rope::translate`). A piece is read from an input store
+  once per input, in the order of its blocks, and added to the output's store
+  through the same path a flush uses, so text that two inputs hold is stored
+  once and `unique_bytes` of the output is that of a flush of the same rows. The
+  references are counted as the ropes are written, so `verify` finds the part
+  consistent. Because the checksum is carried and not recomputed, a wrong
+  translation is not trusted: a reader finds that the value does not rebuild
+  to its checksum and returns `Corrupt` (`tests/merge.rs` swaps the pieces of a
+  merged part and shows it).
+- If the output cannot take a piece (`max_pieces` was reached and no equal piece
+  exists), the piece's bytes go into the rope of every row that uses it, as
+  inline bytes; the value is unchanged. Such a piece is read from its input
+  again by each unit of work that needs it (see below), the one case where a
+  piece is read more than once per input; the bytes of these pieces are held for
+  the unit and are not counted in its size.
+- The same writer. Rows go through the part writer's row groups, dictionary
+  columns (`SpanBatchBuilder::append_from_with_raw`, the dictionaries of
+  batches are merged by value), summary and index and file checksums. The
+  writer takes batches whose raw columns already are ropes
+  (`PartWriter::write_stored`, crate private); everything else is the code of a
+  flush, and a flush's output did not change. The format version stays 5: a
+  merged part is an ordinary part, and `PieceObserver` hears of the output's
+  pieces exactly as on a flush.
+- **Chunks.** The distinct traces of all inputs are ordered first (24 bytes
+  each; the inputs' indexes are sorted by trace id, so this is a merge of
+  sorted lists). Then traces are taken in output order into a chunk until the
+  estimated stored size of their rows reaches `MergeOptions::chunk_bytes`
+  (default 32 MiB), or 524,288 rows; one trace is never split between chunks
+  unless a chunk is only that trace. The size of a row is estimated from the
+  average of its row group, so a group that mixes tiny and huge rows can make a
+  chunk larger than the bound. For a chunk: (1) the keys (`span_id`, `start_ns`)
+  of its rows are read, 32 bytes a row, each input's rows in coalesced runs;
+  (2) duplicates are dropped and the rows are ordered as a flush orders them;
+  (3) the rows are cut into units of about `chunk_bytes` (this is what bounds a
+  trace larger than a chunk: it is processed in several units, in order) and for
+  each unit the rows are read in full, again in runs (a gap of up to 32 rows is
+  read through rather than skipped), their pieces are carried over and the rows
+  are appended to the writer. The inputs are nearly in output order already
+  (each is sorted by its own traces' starts), so the reading is close to
+  sequential, with a few extra runs for traces that are split.
+
+Durability and failure are those of any part: the part is built in
+`<id>.tmp`, every file is synced, the directory is renamed and the parts
+directory synced; any error removes the temporary directory (a merge that
+returns `Fatal` after the rename is the writer's case, and the id must not be
+reused). The inputs are never modified; a merge only reads them, with
+positioned reads, so other threads keep reading them (a test runs readers
+against merges).
+
+Damage: unless `MergeOptions::verify_inputs` is false, every input is first
+checked in full: the length and CRC-32C of its four data files against its
+index and every block of its piece store (`PartReader::verify` without the walk
+over the ropes, which the checksum of `spans.parquet` makes redundant); the
+cost is a sequential read of each input. Then everything the merge reads is
+checked as it is read, with the reader's own checks. Any damage is
+`Error::Corrupt` naming `merge input N` and the directory; no output is
+produced and nothing is left behind. A damaged part cannot panic the merge.
+`traces.idx` is read when a reader is opened, so damage to it is refused there.
+An input of another format version is refused there too (`open` checks the
+version first); a merge is only given open readers.
+
+Memory, besides the chunk: 24 bytes per distinct trace for the order, 4 bytes
+per piece of every input for the translation table, 32 bytes per row of the
+chunk for its keys (at most 16 MiB unless one trace has more rows than that), the
+output batch (the chunk size, between 1 and 16 MiB), and what the writer
+itself holds, which is what a flush holds: a row group, the de-duplication
+window, one entry per trace written (index entry, summary, finished id) and one
+or two bytes per piece. Nothing depends on the size of the inputs.
+`tests/merge_memory.rs` merges eight inputs of 90 MiB in all (96 KiB of text left in
+the row and 196 KiB cut into pieces per row, 40 rows per part) with a chunk and a
+window of 4 MiB in a child process, once as eight traces stitched from all inputs
+and once as a single trace, and compares the peak resident memory (`VmHWM`) with
+that at the start of the merge. The peak rose by 31 MiB when merging the first four
+inputs (45 MiB) and by 33 MiB when merging all eight, for eight traces; by 33 MiB for
+both with a single trace of 320 spans. That is a few times the chunk, and it does not
+grow with the inputs.
+
+Cost: a merge reads each input once for the keys (two small columns), once for
+the rows, once for the pieces it needs, and once more for the up-front check; it
+writes the output once. In a debug build, which is what the tests run, it
+merged about 16,000 rows per second (spans without text, 40 parts into one, with
+the check of the inputs). The
+size of what it makes is that of a flush of all the rows at once: 40 parts of 48
+spans (1,710,200 bytes in all, 120 row groups) became one part of 97,933 bytes
+(5.7%) with one row group; eight parts of agent-shaped text (the same system
+prompt and tools in each part, conversations that grow across them) became
+13.7% of their size, and their 765,952 unique bytes of text 160,256.
 
 ## Format version
 

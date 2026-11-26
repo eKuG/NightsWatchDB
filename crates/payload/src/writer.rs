@@ -280,13 +280,31 @@ impl PieceWriter {
     /// not found). Counts as a reference to it, like [`add`](Self::add). Never
     /// stores anything, so it works when no new piece may be created.
     pub fn find(&mut self, bytes: &[u8]) -> Option<u32> {
+        let id = self.find_unreferenced(bytes)?;
+        self.logical += bytes.len() as u64;
+        Some(id)
+    }
+
+    /// Like [`find`](Self::find), but the lookup is not counted as a
+    /// reference. For a caller that counts references itself with
+    /// [`add_references`](Self::add_references), such as one that carries the
+    /// references of ropes written elsewhere over to this store.
+    pub fn find_unreferenced(&mut self, bytes: &[u8]) -> Option<u32> {
         if bytes.is_empty() || bytes.len() > MAX_PIECE_BYTES {
             return None;
         }
         let h = self.hash(bytes);
-        let id = self.lookup(h, bytes)?;
-        self.logical += bytes.len() as u64;
-        Some(id)
+        self.lookup(h, bytes)
+    }
+
+    /// Counts `bytes` more bytes of references to pieces of this store, for a
+    /// caller that used [`add_piece_unreferenced`](Self::add_piece_unreferenced)
+    /// or [`find_unreferenced`](Self::find_unreferenced). The total of all
+    /// references is recorded in `pieces.idx` and checked by the part's
+    /// `verify`, so it must equal the length of every reference the ropes
+    /// written against this store hold.
+    pub fn add_references(&mut self, bytes: u64) {
+        self.logical = self.logical.saturating_add(bytes);
     }
 
     /// Stores `bytes` unless an equal piece is already there, and returns the
@@ -298,13 +316,20 @@ impl PieceWriter {
 
     /// Like [`add`](Self::add), and says whether the piece is new.
     pub fn add_piece(&mut self, bytes: &[u8]) -> Result<Added> {
+        let added = self.add_piece_unreferenced(bytes)?;
+        self.logical += bytes.len() as u64;
+        Ok(added)
+    }
+
+    /// Like [`add_piece`](Self::add_piece), but not counted as a reference;
+    /// see [`add_references`](Self::add_references).
+    pub fn add_piece_unreferenced(&mut self, bytes: &[u8]) -> Result<Added> {
         if bytes.is_empty() || bytes.len() > MAX_PIECE_BYTES {
             return Err(Error::invalid_argument(format!(
                 "a piece must have 1 to {MAX_PIECE_BYTES} bytes, got {}",
                 bytes.len()
             )));
         }
-        self.logical += bytes.len() as u64;
         let h = self.hash(bytes);
         if let Some(id) = self.lookup(h, bytes) {
             return Ok(Added { id, new: false });

@@ -15,14 +15,17 @@
 //!   rebuild the original bytes.
 //!
 //! [`PartWriter`] builds a part in a temporary directory and renames it into
-//! place when it is complete; [`PartReader`] reads one. The file formats are
+//! place when it is complete; [`PartReader`] reads one; [`merge_parts`] writes
+//! one part from several without rebuilding their text. The file formats are
 //! described in the crate's `README.md`.
 
 mod index;
+mod merge;
 mod reader;
 mod writer;
 
 pub use index::{FileChecksum, INDEX_FILE, TraceEntry};
+pub use merge::{DEFAULT_MERGE_CHUNK_BYTES, MergeOptions, MergeStats, merge_parts};
 pub use nwdb_payload::{PieceObserver, PieceReader};
 pub use reader::{PartReader, Scan, ScanOptions, SummaryScanRev};
 pub use writer::{

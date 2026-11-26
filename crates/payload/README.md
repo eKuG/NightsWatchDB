@@ -69,6 +69,13 @@ and an empty inline run (`RopeError::Malformed`); `rope::decode` returns
 piece that does not exist is an error from the store. A decoder never allocates
 from a length it has not compared with the bytes it has.
 
+`rope::translate(rope, map, out)` writes a rope for the same value with each
+reference replaced as `map` says: a piece id of another store (`Mapped::Piece`),
+or the piece's bytes (`Mapped::Inline`) when that store cannot take it. The
+value is not rebuilt, so the checksum is copied as it is, and a wrong `map` is
+caught by the reader exactly as a damaged reference is; a rope whose references
+all became inline bytes is written as the rope of a value with no cuts.
+
 `rope::segments` walks a rope, `rope::piece_ids` lists the pieces it refers to,
 `rope::checksum` gives the carried checksum, and `rope::cuts_are_valid` checks
 the contract of a splitter's ranges: ascending, not overlapping, not empty,
@@ -183,6 +190,13 @@ returns the id of a piece the writer still knows without ever storing one, and
 counts as a reference in `logical_bytes`. A `PieceObserver`, which the part
 writer calls from `WriterOptions::piece_observer`, is told about each piece the
 first time it is stored, in the order of the ids.
+
+A caller that carries ropes written against another store over to this one
+(a merge of parts) knows its references itself: `add_piece_unreferenced` and
+`find_unreferenced` do what `add_piece` and `find` do without counting a
+reference, and `add_references(bytes)` counts references. The total must equal
+the length of every reference in the ropes written against the store, since
+that is what `verify` compares the ropes with.
 
 ## De-duplication
 

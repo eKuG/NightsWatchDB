@@ -325,6 +325,7 @@ pub struct PartWriter {
     /// Set when a failure left the files in an unknown state.
     broken: bool,
     committed: bool,
+    level: u8,
 }
 
 impl PartWriter {
@@ -412,6 +413,7 @@ impl PartWriter {
             summaries: Vec::new(),
             broken: false,
             committed: false,
+            level: 0,
         })
     }
 
@@ -424,6 +426,21 @@ impl PartWriter {
     /// [`Error::InvalidArgument`] before any of it is written, and the writer
     /// stays usable.
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch(batch, true)
+    }
+
+    /// Like [`write`](Self::write), for a batch whose `attrs`, `events` and
+    /// `links` already are ropes of this part's piece store (their references
+    /// name pieces this writer holds, and the references are counted with
+    /// [`add_references`](Self::add_references)). The splitter is not asked.
+    pub(crate) fn write_stored(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.write_batch(batch, false)
+    }
+
+    /// `raw` says whether the raw columns of `batch` still have to be turned
+    /// into ropes. Everything else, the contiguity rules, the summary and the
+    /// row groups, is the same for both.
+    fn write_batch(&mut self, batch: &RecordBatch, raw: bool) -> Result<()> {
         self.check_usable()?;
         let columns = SpanColumns::try_new(batch)?;
         if columns.is_empty() {
@@ -456,7 +473,7 @@ impl PartWriter {
         }
         self.rows += batch.num_rows() as u64;
 
-        let written = self.write_rows(batch);
+        let written = self.write_rows(batch, raw);
         if written.is_err() {
             self.broken = true;
         }
@@ -507,10 +524,14 @@ impl PartWriter {
 
     /// Hands rows to the Parquet writer in pieces that close each row group
     /// at the row or byte bound.
-    fn write_rows(&mut self, batch: &RecordBatch) -> Result<()> {
+    fn write_rows(&mut self, batch: &RecordBatch, raw: bool) -> Result<()> {
         // The raw columns become ropes first, so that the row group bound
         // counts what is stored.
-        let stored = self.sink.as_mut().expect("writer is open").store(batch)?;
+        let stored = if raw {
+            self.sink.as_mut().expect("writer is open").store(batch)?
+        } else {
+            batch.clone()
+        };
         let batch = &stored;
         let row_bytes = row_value_bytes(batch);
         let options = self.options.clone();
@@ -558,6 +579,33 @@ impl PartWriter {
         });
         self.finished.insert(current.trace_id);
         self.summaries.push(summary);
+    }
+
+    /// Sets the compaction level recorded in the part's [`PartMeta`]. A flush
+    /// leaves it at 0.
+    pub(crate) fn set_level(&mut self, level: u8) {
+        self.level = level;
+    }
+
+    /// Stores `bytes` as a piece of this part, or finds the piece that holds
+    /// them, under the same rules a splitter's cuts follow: once the part
+    /// holds `max_pieces` pieces only a piece that exists is used, and `None`
+    /// says the bytes must go inline. A new piece is announced to the
+    /// observer. The use is not counted; see
+    /// [`add_references`](Self::add_references).
+    pub(crate) fn intern_piece(&mut self, bytes: &[u8]) -> Result<Option<u32>> {
+        self.sink.as_mut().expect("writer is open").intern(bytes)
+    }
+
+    /// Counts `bytes` more bytes of references to pieces, for ropes written
+    /// with [`write_stored`](Self::write_stored). Every reference in every row
+    /// written must be counted once, or `verify` finds the part inconsistent.
+    pub(crate) fn add_references(&mut self, bytes: u64) {
+        self.sink
+            .as_mut()
+            .expect("writer is open")
+            .pieces
+            .add_references(bytes);
     }
 
     fn check_usable(&self) -> Result<()> {
@@ -649,7 +697,7 @@ impl PartWriter {
 
         Ok(PartMeta {
             part_id: self.part_id,
-            level: 0,
+            level: self.level,
             window_start_ns: self.window_start_ns,
             window_ns: self.window_ns,
             rows: self.rows,
@@ -770,6 +818,22 @@ impl PayloadSink {
         Ok(RecordBatch::try_new(schema, columns)?)
     }
 
+    /// The id of the piece that holds `bytes`, stored now if the part may
+    /// still take a new piece (the observer hears of it) and has no such piece;
+    /// `None` when it may not and has none. The use is not counted.
+    fn intern(&mut self, bytes: &[u8]) -> Result<Option<u32>> {
+        if self.pieces.piece_count() >= self.max_pieces {
+            return Ok(self.pieces.find_unreferenced(bytes));
+        }
+        let added = self.pieces.add_piece_unreferenced(bytes)?;
+        if added.new
+            && let Some(observer) = &self.observer
+        {
+            observer.piece_stored(added.id, bytes);
+        }
+        Ok(Some(added.id))
+    }
+
     /// Appends the rope of one value to `self.rope`. A splitter whose ranges
     /// break the contract gets its value stored whole; a cut that is too short
     /// to be worth a piece, or that would make a new piece in a part that
@@ -794,20 +858,10 @@ impl PayloadSink {
                 continue;
             }
             let bytes = &value[cut.clone()];
-            let id = if self.pieces.piece_count() >= self.max_pieces {
-                match self.pieces.find(bytes) {
-                    Some(id) => id,
-                    None => continue,
-                }
-            } else {
-                let added = self.pieces.add_piece(bytes)?;
-                if added.new
-                    && let Some(observer) = &self.observer
-                {
-                    observer.piece_stored(added.id, bytes);
-                }
-                added.id
+            let Some(id) = self.intern(bytes)? else {
+                continue;
             };
+            self.pieces.add_references(bytes.len() as u64);
             self.cuts[kept] = cut;
             self.ids.push(id);
             kept += 1;
