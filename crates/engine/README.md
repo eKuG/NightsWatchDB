@@ -136,9 +136,10 @@ the order flush gate or maintenance gate first, then the publish gate, then
 the core mutex. No gate is held while parts are written or directories are
 deleted.
 
-`Engine` is a cheap clone. `shutdown()` stops accepting, waits for every
-accepted request to be acknowledged, stops the flusher and the maintenance
-thread, then takes the maintenance gate and the flush gate and holds them while
+`Engine` is a cheap clone. `shutdown()` stops accepting and, in the same step,
+tells maintenance to stop (the pass flag and the merge stop flag), waits for
+every accepted request to be acknowledged, stops the flusher (a request in
+flight may need a flush), waits for the maintenance thread, then takes the maintenance gate and the flush gate and holds them while
 it flushes, shuts the log down, stops the applier and releases the lock; a `flush()` that raced with it finishes before it or finds
 the engine closed, so nothing is written after the lock is gone. A second
 concurrent `shutdown()` waits for the first to finish. Dropping the last handle
@@ -148,14 +149,18 @@ runs on a separate thread rather than joining itself.
 
 **How long shutdown can wait for maintenance.** A pass looks at the stop flag
 between its steps (and compaction between its merges), and shutdown sets it
-first, so shutdown waits for the step in progress and no more. A step is one
+in the same critical section that refuses new requests, before it waits for
+them, so no merge starts or finishes after ingest is refused. Shutdown waits for
+the step in progress and no more. A step is one
 manifest commit together with the publish that follows it (a file write and two
 syncs; the split map is rebuilt before the gate, see Replacing parts), or the
-deletion of one part directory, or **one chunk of a merge**. A merge in
-progress is abandoned: `merge_parts` checks the stop flag before each chunk
+deletion of one part directory, or a stretch of a merge that cannot be
+interrupted. A merge in progress is abandoned: `merge_parts` checks the stop
+flag before it verifies each input and before each chunk
 (`MergeOptions::chunk_bytes`, 32 MiB of rows by default), removes its output and
-returns `Unavailable`, so shutdown waits for the chunk that is running and no
-more. A merge that has already written its output is finished: shutdown then
+returns `Unavailable`. Verifying one input (a sequential read of its files) and
+the writer's `finish` at the end are not interrupted, so shutdown waits for the
+longer of those and one chunk, not for one chunk in all cases. A merge that has already written its output is finished: shutdown then
 waits for one open, one commit and one publish. No further merge is started.
 If shutdown arrives while a replacement is deleting its directories, the ones
 not yet reached stay on disk, unreferenced; the next start-up deletes them. A
@@ -426,7 +431,8 @@ data ends up as many small parts and every query opens all of them, while a
 window that has stopped receiving data should be one part. A merge is
 `nwdb_segment::merge_parts`: the parts of one window become one part in which a
 trace split over the inputs is one run, a span that occurs more than once is
-kept once (the earliest input wins) and text is shared across the inputs and
+kept once (the copy that arrived first, the one with the smallest `arrival`,
+wins; the order of the inputs only breaks a tie) and text is shared across the inputs and
 never rebuilt. `EngineOptions::compaction` (`CompactionOptions`, validated by
 `open`) holds the settings; `compaction.rs` holds the policy.
 
@@ -539,15 +545,19 @@ failure to delete an input directory after the commit is not a failed merge:
 the merge counts, and the pass records the deletion error and retries it.
 
 **The stop flag.** The engine owns an `AtomicBool` (`Inner::merge_stop`) that
-shutdown sets before it waits for the maintenance thread. The merge loop starts
-no further merge once it is set, and a merge that returns an error while it is
+shutdown sets, together with the flag that refuses new requests, before it waits
+for those requests or for the maintenance thread. The merge loop starts no
+further merge once it is set (the flag is tested before each merge, and a merge
+abandoned because of it ends the loop, so the loop cannot spin while the thread
+exits), and a merge that returns an error while it is
 set is not counted as a failure: no backoff, no `last_compaction_error`, and
 the engine is not put in the fatal state (unless the error is `Fatal`). The
 flag is also handed to `merge_parts` (`MergeOptions::stop`), which ends a
-merge that is running at its next chunk with `Unavailable`.
+merge that is running with `Unavailable` at the next place it reads the flag:
+before an input is verified, or before a chunk.
 
-**Shutdown during a merge.** A merge in progress is abandoned at its next
-chunk: its temporary output is removed, no part is added or replaced, and the
+**Shutdown during a merge.** A merge in progress is abandoned at the next
+place it reads the stop flag (before an input is verified, before a chunk): its temporary output is removed, no part is added or replaced, and the
 inputs stay live; the next start merges them again. A merge that has written
 its output when shutdown begins is finished, since only an open and a commit
 are left. A merge that is abandoned for another reason (the stage hook returns
@@ -734,7 +744,8 @@ projection of nine columns that has none of the raw columns, so no piece is read
 and no rope rebuilt (a test checks that a search of words reads no piece block;
 only a phrase, which has to be confirmed against its text, reads pieces). Only the
 `limit` best hits are held, so memory is one range of rows, the matching row
-numbers of one part and the hits.
+numbers of one part, the hits and the winner cache described next (at most
+2^20 span entries, 8 bytes of span id and 16 of winner each plus map overhead).
 
 The same span (trace id and span id) can be in two parts: a retry that crossed a
 flush, until a merge. Only its winning copy is a hit: the one with the smallest
@@ -744,9 +755,16 @@ keeps, so the answer does not change when parts are merged. A row that matches
 is checked before it is held or counted toward the limit, whatever the limit,
 the time range and the query: a losing copy is never returned, whether or not
 the winner matches or lies in the time range, and the early stop above stays
-valid. The check costs one lookup of the trace in each other part that holds
-it (the span ids and `arrival` of its rows are read, nothing else), and only for
-a hit whose trace is in the split map; a trace in one part is not checked.
+valid. The check costs one read of the trace in each part that holds it (the span
+ids and `arrival` of its rows are read, nothing else), once per search however
+many parts have matching rows in it: a trace split over H parts costs H reads,
+not H times H-1. The winner of every span id of the trace among all holders is
+kept in a cache shared by the whole search, bounded at 2^20 span entries in
+total; when adding a trace would pass the bound the cache is emptied first, which
+costs reads again and never changes the answer. The check is only for a hit
+whose trace is in the split map; a trace in one part is not checked. A search
+reads `span_id` and `arrival` of a split trace from every part that holds it, so
+damage in one of those parts fails a search whose hits are in other parts.
 Spans in the buffers are not searched and always arrived later than the spans in
 parts, so they need no check. The limit counts spans.
 
@@ -763,13 +781,25 @@ lists of the parts a flush writes have the budgets
 
 ## Known limits
 
-- `list_traces` and `aggregate_tokens` read per-trace summaries and count a
-  span that is stored in two parts, or in a part and the buffers, twice until
-  the parts are merged (the merge keeps one copy) or, for the buffers, until the
-  flush has happened. This holds for any span stored twice, not only for
-  identical copies. Copies in parts of different windows (see Compaction) are
-  never merged together. `get_trace` and `search` always show exactly one copy of
-  a span, the one with the smallest `arrival`, before and after any merge.
+- `list_traces` combines the per-trace summaries of every part (and of the
+  buffers) that holds the trace (`TraceSummary::merge`, crates/core/src/summary.rs),
+  whatever copy of a span each was built from. A span stored in two parts, or in
+  a part and the buffers, is therefore counted twice (span count, token sums)
+  until the parts are merged (the merge keeps one copy and writes the summary
+  from the rows it kept) or, for the buffers, until the flush has happened. More
+  than the counts is affected: the fields a listing shows and filters on (root
+  name and root service, models, session id, user id, start, end, error) are the
+  smallest, largest or union over all copies, so they can come from a copy that
+  `get_trace` and `search` do not show, for example a later-arriving copy with
+  another root name, model or session, an error, or an earlier start or later
+  end. `aggregate_tokens` does not read summaries: it scans the span rows of the
+  parts, so it counts every stored copy with that copy's own model, tokens and
+  start (the buffers are de-duplicated by span id). This holds for any span
+  stored twice, not only for identical copies. Copies of a span in parts of
+  different windows (see Compaction) are never in one merge, so for those this
+  lasts until retention removes the parts. `get_trace` and `search` always show
+  exactly one copy of a span, the one with the smallest `arrival`, before and
+  after any merge.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few
@@ -789,8 +819,9 @@ lists of the parts a flush writes have the budgets
   small parts, which compaction merges.
 - Retention removes whole parts and nothing else: the buffer and the log are
   not touched by it. There is no object store.
-- A merge is stopped only between chunks, so shutdown waits for the chunk
-  that is running (32 MiB of rows by default). A window that gets a
+- A merge is stopped only between inputs being verified and between chunks,
+  so shutdown waits for the one input being verified, the chunk that is running
+  (32 MiB of rows by default) or the writer's `finish`, whichever is longest. A window that gets a
   small late part more rarely than `quiet` is rewritten whole each time.
 - There is no check of free space before a merge. Its output, up to
   `max_input_bytes` of data, is written while its inputs are still on disk, so

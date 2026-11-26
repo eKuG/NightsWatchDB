@@ -78,11 +78,15 @@ go to the new file. The new file's first number is the number of the next
 record, so numbering stays gapless and the newest file is never removed. A
 failed sync of the file written so far poisons the log, as in a roll, and
 `rotate` returns `Error::Fatal`. A failure to create the new file (a full
-disk, say) poisons nothing: the active file is untouched and still written to,
-`rotate` returns the error (not `Fatal`), no file with the new name is left
-behind, and the caller may call it again. If such a file cannot be removed
-after a failed last step, the log is poisoned, since what is on disk no longer
-matches what is written.
+disk, say, before the rename) poisons nothing: the active file is untouched and
+still written to, `rotate` returns the error (not `Fatal`), no file with the new
+name exists, and the caller may call it again. A failed directory sync after the
+rename poisons the log, like any failed sync: the state on disk is unknown, so
+the new file is left where it is (it is not removed, the removal would not be
+durable either) and `rotate` returns `Error::Fatal`. After the restart the old
+file ends at the number before the new file's first, and the new file holds only
+its header: the files are contiguous and `open` accepts them. The same holds
+for a roll while writing, and for the first file of a log that `open` creates.
 
 A crash leaves a log that opens, whichever step it hit:
 

@@ -218,6 +218,42 @@ fn a_very_long_maintenance_interval_still_runs_passes_after_flushes() {
     assert!(ran, "no maintenance pass ran after start-up and a flush");
 }
 
+/// `open` accepts any `flush_interval`. One too long to add to the time the
+/// buffer's oldest span arrived makes the flusher panic when it computes the
+/// age deadline; the buffer is then never due by age, but a size flush and the
+/// flush at shutdown still happen.
+#[test]
+fn a_very_long_flush_interval_still_flushes_by_size_and_at_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.flush_interval = Duration::MAX;
+    o.buffer_bytes = 2048;
+    let e = open(o);
+    // A first span below the size limit makes the flusher compute the deadline.
+    ingest(&e, &[TSpan::new(1, 1, 100).root()]).unwrap();
+    let mut model = Model::default();
+    model.add(&[TSpan::new(1, 1, 100).root()]);
+    for t in 2..200u128 {
+        let mut s = TSpan::new(t, 1, 100).root();
+        s.attrs = vec![7u8; 512];
+        ingest(&e, std::slice::from_ref(&s)).unwrap();
+        model.add(&[s]);
+        if e.stats().flushes >= 1 {
+            break;
+        }
+    }
+    let flushed = wait_until(Duration::from_secs(10), || e.stats().flushes >= 1);
+    assert!(flushed, "no flush by size");
+    assert!(!e.stats().fatal);
+    let s = TSpan::new(500, 1, 100).root();
+    ingest(&e, std::slice::from_ref(&s)).unwrap();
+    model.add(&[s]);
+    e.shutdown().unwrap();
+    let e = open(opts(dir.path()));
+    model.check(&e, "after the restart");
+    e.shutdown().unwrap();
+}
+
 /// `open` accepts any `retry_backoff`. A long one (meaning: do not retry a
 /// failing window until a restart) overflows when the failure is recorded,
 /// the pass panics, and a merge that failed harmlessly puts the engine in the
@@ -376,6 +412,7 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
     }
     let parts_before = part_dir_names(dir.path());
     assert_eq!(parts_before.len(), 3);
+    let spans_before = model.lock().unwrap().spans.len();
     let outcome = e.run_maintenance();
     shutdown.lock().unwrap().take().unwrap().join().unwrap();
     let s = e.stats();
@@ -385,15 +422,17 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
     assert_eq!(s.merges_done, 0, "{s:?}");
     assert_eq!(s.last_compaction_error, None);
     assert!(!s.fatal);
-    // The shutdown's own flush may have added one part; the merge added none and
-    // left no temporary directory.
+    // The stop flag was set before ingest was first refused, so the merge
+    // started with it set and wrote nothing: the only new part is the one the
+    // shutdown's own flush writes for the spans the hook sent, if it sent any.
+    let accepted = model.lock().unwrap().spans.len() - spans_before;
     let parts_after = part_dir_names(dir.path());
     assert!(
         parts_before.iter().all(|p| parts_after.contains(p)),
         "an input was removed: {parts_after:?}"
     );
     assert!(
-        parts_after.len() <= parts_before.len() + 1
+        parts_after.len() == parts_before.len() + usize::from(accepted > 0)
             && parts_after.iter().all(|p| !p.contains("tmp")),
         "the abandoned merge left a directory: {parts_after:?}"
     );

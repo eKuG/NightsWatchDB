@@ -658,9 +658,12 @@ impl Wal {
     /// Waits for the log thread, so it takes as long as the group being
     /// written plus one file creation. A failure of the sync poisons the log
     /// like the same failure in a roll, and is returned as [`Error::Fatal`].
-    /// A failure to create the file poisons nothing: the log goes on writing
-    /// to the file it had, the error is returned as it is, and `rotate` can
-    /// be called again.
+    /// A failure to create the file poisons nothing if it came before the
+    /// file was renamed into place: the log goes on writing to the file it
+    /// had, the error is returned as it is, and `rotate` can be called again.
+    /// A failure of the directory sync after the rename poisons the log: the
+    /// file stays where it is and the next `open` finds it as the empty
+    /// newest file.
     pub fn rotate(&self) -> Result<bool> {
         let (tx, rx) = mpsc::channel();
         {

@@ -65,11 +65,13 @@ pub struct MergeOptions {
     /// Without it, only what the merge reads is checked, and a damaged
     /// Parquet page that still decodes is carried over as data.
     pub verify_inputs: bool,
-    /// Set by the caller to stop the merge. It is checked before each chunk;
-    /// when it is set, the temporary output is removed and the merge returns
-    /// [`Error::Unavailable`], which says nothing is wrong with the inputs
-    /// or the output and the merge may be run again. A chunk that has begun
-    /// is finished first, so the merge stops within about one chunk of work.
+    /// Set by the caller to stop the merge. It is checked before each input
+    /// is verified and before each chunk; when it is set, the temporary
+    /// output is removed and the merge returns [`Error::Unavailable`], which
+    /// says nothing is wrong with the inputs or the output and the merge may
+    /// be run again. Verifying one input, a chunk that has begun and the
+    /// writer's `finish` are not interrupted, so the merge stops within the
+    /// longest of those.
     /// Default `None`.
     pub stop: Option<Arc<AtomicBool>>,
 }
@@ -256,8 +258,18 @@ pub fn merge_parts(
             options.writer.max_pieces
         )));
     }
+    let stopped = || {
+        options
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Relaxed))
+    };
     if options.verify_inputs {
         for (i, input) in inputs.iter().enumerate() {
+            // Verifying one input cannot be interrupted, so look before each.
+            if stopped() {
+                return Err(Error::unavailable("the merge was stopped"));
+            }
             input.verify_files().map_err(|e| named(inputs, i, e))?;
         }
     }
@@ -291,11 +303,7 @@ pub fn merge_parts(
 
     let mut next = 0;
     while next < order.len() {
-        if options
-            .stop
-            .as_ref()
-            .is_some_and(|s| s.load(Ordering::Relaxed))
-        {
+        if stopped() {
             return Err(Error::unavailable("the merge was stopped"));
         }
         let begin = next;

@@ -1221,17 +1221,23 @@ impl Inner {
                     let now = Instant::now();
                     let mut wake: Option<Instant> = None;
                     if c.fatal.is_none() && !c.vis.active.is_empty() {
-                        let due = c
-                            .active_oldest
-                            .map_or(now, |t| t + self.opts.flush_interval);
+                        // `None`: too far away to represent, so the buffer is
+                        // never due by age (size, flush and shutdown still
+                        // flush it).
+                        let due = match c.active_oldest {
+                            Some(t) => t.checked_add(self.opts.flush_interval),
+                            None => Some(now),
+                        };
                         let size_due = c.active_bytes >= self.opts.buffer_bytes;
                         // After a failed flush the next try waits out the
                         // retry delay, however full or old the buffer is.
-                        let at = if size_due { now } else { due }.max(c.retry_after.unwrap_or(now));
-                        if at <= now {
-                            break;
+                        if let Some(at) = if size_due { Some(now) } else { due } {
+                            let at = at.max(c.retry_after.unwrap_or(now));
+                            if at <= now {
+                                break;
+                            }
+                            wake = Some(at);
                         }
-                        wake = Some(at);
                     }
                     c = match wake {
                         Some(t) => {
@@ -1258,18 +1264,21 @@ impl Inner {
         }
         *done = true;
         // No new request is accepted from here on, so `outstanding` can only
-        // fall.
+        // fall. Maintenance is told to stop in the same critical section, so
+        // no merge starts or finishes after ingest is refused, and the wait
+        // below does not wait for one. The flusher keeps running: a request in
+        // flight may need a flush.
         {
             let mut c = lock(&self.core);
             c.closing = true;
+            self.merge_stop.store(true, Ordering::SeqCst);
+            c.stop_maintenance = true;
+            self.maintenance_cv.notify_all();
             while c.outstanding > 0 {
                 c = self.idle_cv.wait(c).unwrap_or_else(|e| e.into_inner());
             }
             c.stop_flusher = true;
-            c.stop_maintenance = true;
-            self.merge_stop.store(true, Ordering::SeqCst);
             self.flusher_cv.notify_all();
-            self.maintenance_cv.notify_all();
         }
         let Threads {
             applier,

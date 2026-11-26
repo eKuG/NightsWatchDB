@@ -24,6 +24,11 @@ const WRITE_CHUNK: usize = 64 * 1024;
 /// including its directory entry. The header is written and synced under a
 /// temporary name and the file is renamed into place only afterwards, so a
 /// file with a log name never exists with a missing or unsynced header.
+///
+/// A failure before the rename leaves no file with the log name. If the
+/// directory sync after the rename fails, the file stays: what is on disk is
+/// unknown (the rename may or may not be durable), so the caller must treat
+/// the log as failed. After a restart the file is the empty newest file.
 pub(crate) fn create_file(dir: &Path, first: Lsn, mode: SyncMode) -> std::io::Result<File> {
     let tmp = format::tmp_file_path(dir, first);
     // A stale temporary file is never trusted; open removes them, this covers
@@ -48,12 +53,7 @@ pub(crate) fn create_file(dir: &Path, first: Lsn, mode: SyncMode) -> std::io::Re
         ));
     }
     std::fs::rename(&tmp, &path)?;
-    if let Err(e) = sync_dir(dir, mode) {
-        // Not durable, so not to be left in the directory under its name; if
-        // this fails too the caller sees the file and treats it as damage.
-        let _ = std::fs::remove_file(&path);
-        return Err(e);
-    }
+    sync_dir(dir, mode)?;
     Ok(file)
 }
 
@@ -193,9 +193,10 @@ impl Writer {
             if !st.shutdown
                 && let Some(t) = self.last_sync
             {
-                let due = t + self.options.sync_interval;
+                // An interval too large to add means: do not wait.
+                let due = t.checked_add(self.options.sync_interval);
                 let now = Instant::now();
-                if now < due {
+                if let Some(due) = due.filter(|d| now < *d) {
                     // More records may arrive while we wait; they share the sync.
                     st = self
                         .shared
@@ -251,10 +252,11 @@ impl Writer {
     ///
     /// The error says whether the log must be poisoned. A failed sync must.
     /// A failure to create the new file does not, provided that no file with
-    /// the new name is left behind (`create_file` removes the one it made if
-    /// its last step fails): the active file is untouched and the next
-    /// rotation starts again. If one is left, the files on disk no longer
-    /// match what is being written, so it must.
+    /// the new name exists (`create_file` fails before the rename, or the name
+    /// is not there): the active file is untouched and the next rotation
+    /// starts again. If one exists, as after a failed directory sync, or if its
+    /// existence cannot be told, the files on disk no longer match what is
+    /// being written, so it must.
     fn rotate(&mut self) -> std::result::Result<bool, (Error, bool)> {
         if self.file_records == 0 {
             return Ok(false);
@@ -264,7 +266,9 @@ impl Writer {
         match self.start_file(first) {
             Ok(()) => Ok(true),
             Err(e) => {
-                let stuck = format::file_path(&self.shared.dir, first).exists();
+                let stuck = format::file_path(&self.shared.dir, first)
+                    .try_exists()
+                    .unwrap_or(true);
                 Err((e, stuck))
             }
         }

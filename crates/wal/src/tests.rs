@@ -631,6 +631,31 @@ fn empty_records_and_the_size_limit() {
     );
 }
 
+/// A `sync_interval` too long to add to the time of the last sync means: do
+/// not wait. The second append would otherwise panic the log thread.
+#[test]
+fn a_very_long_sync_interval_does_not_wait_or_poison_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(1 << 20);
+    o.sync_interval = Duration::MAX;
+    let (wal, _) = Wal::open(dir.path(), o).unwrap();
+    let results: Results = Arc::default();
+    for i in 0..3u8 {
+        wal.append(&[i], collect(&results));
+        wait_for("the append to be acknowledged", || {
+            results.lock().unwrap().len() == usize::from(i) + 1
+        });
+    }
+    let got: Vec<_> = results
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_ref().ok().copied())
+        .collect();
+    assert_eq!(got, vec![Some(1), Some(2), Some(3)]);
+    wal.shutdown().unwrap();
+}
+
 #[test]
 fn shutdown_writes_everything_queued() {
     let dir = tempfile::tempdir().unwrap();

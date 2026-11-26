@@ -196,3 +196,30 @@ fn a_stopped_merge_leaves_no_output_and_the_inputs_untouched() {
     a.verify().unwrap();
     b.verify().unwrap();
 }
+
+/// The flag is read before the first input is verified, not only after every
+/// input has been checked in full.
+#[test]
+fn a_merge_stopped_before_it_starts_returns_unavailable_and_creates_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b) = inputs(tmp.path());
+    let before = names(tmp.path());
+    let r = merge_parts(
+        &[&a, &b],
+        tmp.path(),
+        3,
+        0,
+        WINDOW_NS,
+        MergeOptions {
+            writer: options(4),
+            stop: Some(Arc::new(AtomicBool::new(true))),
+            ..MergeOptions::default()
+        },
+    );
+    assert!(matches!(r, Err(Error::Unavailable(_))), "{r:?}");
+    assert_eq!(
+        names(tmp.path()),
+        before,
+        "the stopped merge left something"
+    );
+}

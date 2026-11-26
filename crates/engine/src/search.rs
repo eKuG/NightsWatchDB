@@ -78,10 +78,10 @@ pub struct SearchStats {
     pub rows_read: u64,
     /// Calls that read a range of rows.
     pub row_ranges_read: u64,
-    /// Lookups of a split trace in another part to see whether a copy of a
-    /// matching span there arrived earlier: one per other part that holds
-    /// the trace, for each split trace that has a matching span in the time
-    /// range.
+    /// Reads of a split trace in a part that holds it, to find which copy of
+    /// each span arrived first: one per part that holds the trace, once per
+    /// search, for each split trace that has a matching span in the time
+    /// range (more only if the winner cache was emptied at its bound).
     pub winner_lookups: u64,
     /// Bytes of piece text read to confirm phrases and long words, all parts
     /// together; the one budget [`SearchLimits::max_confirm_bytes`] limits.
@@ -158,27 +158,68 @@ impl Held {
 /// For each span id, the smallest `(arrival, part)` among its copies.
 type Earliest = HashMap<[u8; 8], (u64, usize)>;
 
+/// The most span entries the winner cache of one search holds in total.
+const RIVALS_MAX_ENTRIES: usize = 1 << 20;
+
+/// The winners of the split traces a search asked about. When adding a trace
+/// would take the span entries of all traces past `max_entries`, it is emptied
+/// first: that costs reads again later, never a wrong answer.
+struct WinnerCache {
+    traces: HashMap<TraceId, Earliest>,
+    entries: usize,
+    max_entries: usize,
+}
+
+impl WinnerCache {
+    fn new() -> Self {
+        Self {
+            traces: HashMap::new(),
+            entries: 0,
+            max_entries: RIVALS_MAX_ENTRIES,
+        }
+    }
+
+    fn insert(&mut self, trace: TraceId, best: Earliest) {
+        if self.entries + best.len() > self.max_entries {
+            self.traces.clear();
+            self.entries = 0;
+        }
+        self.entries += best.len();
+        self.traces.insert(trace, best);
+    }
+}
+
 /// Decides whether a row of one part is the copy of its span that is shown.
 ///
 /// A span stored in several parts is shown from the row with the smallest
 /// `arrival`; among equal values, from the part that is first in the list. A
 /// trace that is not in the split map is in one part, which never holds a
 /// span twice, so its rows win without a lookup. For a trace that is in the
-/// map, the span ids and `arrival` of the trace's rows in every other holder
-/// are read once, and kept until a row of another trace is asked about; the
-/// rows of one part come out in trace order, so each split trace is looked up
-/// once per part searched.
+/// map, the span ids and `arrival` of the trace's rows are read once from
+/// every part that holds it (the one being searched included) and the winner
+/// of each span id is kept for the rest of the search, so a split trace costs
+/// one read per holder however many parts have matching rows in it.
 struct Rivals<'a> {
     snapshot: &'a Snapshot,
     /// The part being searched.
     part: usize,
-    /// The last split trace looked up: for each span id in its other holders,
-    /// the smallest `(arrival, part)`.
-    last: Option<(TraceId, Earliest)>,
+    /// For each split trace asked about, the smallest `(arrival, part)` of
+    /// each of its span ids among all holders.
+    cache: WinnerCache,
+    /// Reads of a trace in a holder.
     lookups: u64,
 }
 
-impl Rivals<'_> {
+impl<'a> Rivals<'a> {
+    fn new(snapshot: &'a Snapshot) -> Self {
+        Self {
+            snapshot,
+            part: 0,
+            cache: WinnerCache::new(),
+            lookups: 0,
+        }
+    }
+
     /// True if another part holds a copy of the span that wins over this one.
     /// The time range and the query play no part: a copy that does not match
     /// still hides the ones that arrived after it.
@@ -186,13 +227,10 @@ impl Rivals<'_> {
         let Some(holders) = self.snapshot.vis.split.holders(&trace) else {
             return Ok(false);
         };
-        if self.last.as_ref().is_none_or(|(t, _)| *t != trace) {
+        if !self.cache.traces.contains_key(&trace) {
             let mut best = Earliest::new();
             for &h in holders {
                 let h = h as usize;
-                if h == self.part {
-                    continue;
-                }
                 self.lookups += 1;
                 let reader = &self.snapshot.vis.parts[h].reader;
                 let batches = reader.read_trace(trace, Some(&[col::SPAN_ID, col::ARRIVAL]))?;
@@ -208,13 +246,14 @@ impl Rivals<'_> {
                     }
                 }
             }
-            self.last = Some((trace, best));
+            self.cache.insert(trace, best);
         }
         Ok(self
-            .last
-            .as_ref()
-            .and_then(|(_, best)| best.get(&span.0))
-            .is_some_and(|&rival| rival < (arrival, self.part)))
+            .cache
+            .traces
+            .get(&trace)
+            .and_then(|best| best.get(&span.0))
+            .is_some_and(|&winner| winner < (arrival, self.part)))
     }
 }
 
@@ -255,10 +294,11 @@ impl Snapshot {
     /// the earliest does not match the query or starts outside the range.
     ///
     /// The check happens for each matching row in the time range before it is
-    /// held, so it does not disturb the early stop below. It costs one lookup
-    /// of the trace in each other part that holds it, reading only the span id
-    /// and `arrival` of the trace's rows, and only for a hit whose trace is
-    /// in the split map; a hit whose trace is in one part costs nothing.
+    /// held, so it does not disturb the early stop below. It costs one read
+    /// of the trace in each part that holds it, reading only the span id
+    /// and `arrival` of the trace's rows, once per search, and only for a hit
+    /// whose trace is in the split map; a hit whose trace is in one part costs
+    /// nothing.
     /// Spans in the memory buffer are not searched, and they always arrived
     /// later than the ones in parts, so they cannot hide a hit.
     ///
@@ -283,7 +323,8 @@ impl Snapshot {
     /// [`PartReader::search`]) and a read of the matching rows' eight columns,
     /// in ranges of at most 16,384 rows, never the raw columns or the piece
     /// files. Memory is the matching row numbers of one part, one range of
-    /// rows and the `limit` best hits.
+    /// rows, the `limit` best hits and the winner cache of split traces, at most
+    /// 2^20 span entries.
     ///
     /// A query over a limit of [`SearchLimits`] is
     /// [`Error::InvalidArgument`] saying which. The limit on the bytes read to
@@ -332,6 +373,7 @@ impl Snapshot {
             limit: query.limit,
             hits: BTreeMap::new(),
         };
+        let mut rivals = Rivals::new(self);
         for (n, &(upper, i)) in order.iter().enumerate() {
             // Stop: see the comment on `search`.
             if held.worst_start().is_some_and(|worst| upper < worst) {
@@ -347,15 +389,10 @@ impl Snapshot {
             stats.confirm_bytes += spent;
             stats.parts_searched += 1;
             stats.rows_matched += rows.len() as u64;
-            let mut rivals = Rivals {
-                snapshot: self,
-                part: i,
-                last: None,
-                lookups: 0,
-            };
+            rivals.part = i;
             collect(reader, &rows, query, &mut held, &mut rivals, &mut stats)?;
-            stats.winner_lookups += rivals.lookups;
         }
+        stats.winner_lookups = rivals.lookups;
         let hits = held.hits.into_values().collect();
         Ok((hits, stats))
     }
@@ -476,5 +513,33 @@ impl<'a> HitColumns<'a> {
             request_model: optional(self.request_model, r),
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn winners(n: u8) -> Earliest {
+        (0..n).map(|i| ([i; 8], (u64::from(i), 0))).collect()
+    }
+
+    #[test]
+    fn the_winner_cache_is_emptied_when_a_trace_would_pass_its_limit() {
+        let mut c = WinnerCache::new();
+        c.max_entries = 10;
+        c.insert(TraceId([1; 16]), winners(6));
+        c.insert(TraceId([2; 16]), winners(4));
+        assert_eq!((c.traces.len(), c.entries), (2, 10), "at the limit, kept");
+        c.insert(TraceId([3; 16]), winners(1));
+        assert_eq!(
+            (c.traces.len(), c.entries),
+            (1, 1),
+            "past it, emptied first"
+        );
+        assert!(c.traces.contains_key(&TraceId([3; 16])));
+        // One trace larger than the whole limit is still kept.
+        c.insert(TraceId([4; 16]), winners(12));
+        assert_eq!((c.traces.len(), c.entries), (1, 12));
     }
 }

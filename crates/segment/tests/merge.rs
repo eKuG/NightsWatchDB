@@ -1337,3 +1337,68 @@ fn the_order_of_the_inputs_changes_only_which_of_equal_arrivals_wins() {
         }
     }
 }
+
+/// The output's traces are ordered by the earliest start in the inputs' index
+/// entries, which can come from a copy of a span that the merge drops. The
+/// summary and the trace index describe the rows that were kept, and the
+/// summary file is sorted by those, so listing is unaffected.
+#[test]
+fn a_trace_whose_earliest_start_is_in_a_dropped_copy_has_the_kept_rows_times() {
+    let mut rng = StdRng::seed_from_u64(79);
+    let pool = Pool::new(&mut rng);
+    // Trace 1, span 0: the copy in input A starts at 5 and arrived second; the
+    // copy in input B starts at 10 and arrived first, so it is the one kept.
+    let mut in_a = pool.row(&mut rng, 1, 0, None, 5);
+    in_a.end = 6;
+    in_a.name = "copy in a".into();
+    in_a.arrival = 2;
+    let mut in_b = in_a.clone();
+    in_b.start = 10;
+    in_b.end = 11;
+    in_b.name = "copy in b".into();
+    in_b.arrival = 1;
+    // Trace 2 starts at 7, between the two.
+    let mut other = pool.row(&mut rng, 2, 0, None, 7);
+    other.end = 8;
+    other.name = "trace two".into();
+    other.arrival = 3;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let inputs = [stored_order(vec![in_a, other]), stored_order(vec![in_b])];
+    let readers = write_inputs(tmp.path(), &inputs, 0);
+    let (_, stats) = merge(&readers, tmp.path(), 100, merge_options(1 << 20)).unwrap();
+    assert_eq!(stats.duplicates_dropped, 1);
+    let merged = PartReader::open(part_path(tmp.path(), 100)).unwrap();
+    merged.verify().unwrap();
+
+    // spans.parquet: trace 1 first (ordered by the earliest start of the
+    // inputs' entries, 5), with the copy that arrived first; then trace 2.
+    let batches = merged.read_rows(0, merged.row_count(), None).unwrap();
+    let rows: Vec<(String, i64, u64)> = records(&flat(&batches))
+        .iter()
+        .map(|r| (r.name.to_owned(), r.start_ns, r.arrival))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("copy in b".to_string(), 10, 1),
+            ("trace two".to_string(), 7, 3)
+        ]
+    );
+
+    // The summary is sorted by the kept rows' starts: trace 2, then trace 1.
+    let got: Vec<(TraceId, i64, i64)> = summaries(&merged)
+        .iter()
+        .map(|s| (s.trace_id, s.start_ns, s.end_ns))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(TraceId(trace_id(2)), 7, 8), (TraceId(trace_id(1)), 10, 11)]
+    );
+
+    // The trace index carries the kept rows' times too.
+    let t1 = merged.find_trace(TraceId(trace_id(1))).unwrap();
+    assert_eq!((t1.start_ns, t1.end_ns, t1.first_row), (10, 11, 0));
+    let t2 = merged.find_trace(TraceId(trace_id(2))).unwrap();
+    assert_eq!((t2.start_ns, t2.end_ns, t2.first_row), (7, 8, 1));
+}

@@ -347,7 +347,8 @@ fn only_hits_of_a_split_trace_cost_a_lookup() {
     // part once. Trace 2 asks nothing.
     assert_eq!(stats.winner_lookups, 2);
 
-    // Without the first span of trace 1 in the range, one lookup is left.
+    // Without the first span of trace 1 in the range, the trace is still read
+    // from each of its two holders.
     let later = SearchQuery {
         from_ns: 150,
         to_ns: 300,
@@ -355,7 +356,41 @@ fn only_hits_of_a_split_trace_cost_a_lookup() {
     };
     let (hits, stats) = e.snapshot().search_with_stats(&later).unwrap();
     assert_eq!(hits.len(), 2);
-    assert_eq!(stats.winner_lookups, 1, "only span 2 of the split trace");
+    assert_eq!(
+        stats.winner_lookups, 2,
+        "one read per holder of the split trace"
+    );
+    e.shutdown().unwrap();
+}
+
+/// A trace held by six parts with a matching row in each is read once from
+/// each holder in a search, and each span shows its earliest copy.
+#[test]
+fn a_trace_split_over_six_parts_is_read_once_per_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(compact_opts(dir.path()));
+    for k in 0..6 {
+        let mut spans = vec![copy(&format!("one-{k}"), "m", 1, 100)];
+        if k == 3 || k == 5 {
+            let mut two = TSpan::new(1, 2, 200).root();
+            two.name = format!("two-{k}");
+            two.attrs = format!("needle in the two-{k} copy").into_bytes();
+            spans.push(two);
+        }
+        ingest(&e, &spans).unwrap();
+        e.flush().unwrap();
+    }
+    assert_eq!(e.stats().parts, 6);
+    let q = SearchQuery {
+        query: parse("needle").unwrap(),
+        from_ns: i64::MIN,
+        to_ns: i64::MAX,
+        limit: 10,
+    };
+    let (hits, stats) = e.snapshot().search_with_stats(&q).unwrap();
+    let names: Vec<_> = hits.iter().map(|h| h.name.as_str()).collect();
+    assert_eq!(names, vec!["two-3", "one-0"]);
+    assert_eq!(stats.winner_lookups, 6);
     e.shutdown().unwrap();
 }
 

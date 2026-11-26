@@ -563,7 +563,12 @@ What the output is:
   are ordered by `(the earliest start of the trace in any input, trace_id)`. A
   trace with rows in several inputs is one run. The trace index and the summary
   are built by the writer a flush uses; the summary of a trace is computed from
-  its merged rows.
+  its merged rows. The order in `spans.parquet` uses the inputs' index entries,
+  which can count the start of a copy of a span that the merge then drops (the
+  copy that arrived first may start later); such a trace's rows sit where that
+  earlier start puts them, not where the kept rows' start would, while the
+  summary file (sorted by the kept rows' `(start_ns, trace_id)`) and the trace
+  index carry the kept rows' times.
 - A `(trace_id, span_id)` that occurs more than once is kept once: the row with
   the smallest `arrival`; among equal values the row of the earlier input, and
   within one input its first row. So the order of the inputs matters only for
@@ -639,10 +644,11 @@ How it works:
   sequential, with a few extra runs for traces that are split.
 
 **Stopping.** `MergeOptions::stop` is an optional `Arc<AtomicBool>`. The merge
-reads it before each chunk; when it is set, the merge removes its temporary
-directory and returns `Error::Unavailable`, which is not damage: nothing was
-changed and the merge may be run again. A chunk that has begun is finished, so
-a merge stops within about one chunk of work, not at the end of its inputs.
+reads it before it verifies each input and before each chunk; when it is set,
+the merge removes its temporary directory and returns `Error::Unavailable`,
+which is not damage: nothing was changed and the merge may be run again.
+Verifying one input, a chunk that has begun and the writer's `finish` are not
+interrupted, so the wait for a stop is at most the longest of those.
 
 Durability and failure are those of any part: the part is built in
 `<id>.tmp`, every file is synced, the directory is renamed and the parts
@@ -666,7 +672,7 @@ version first); a merge is only given open readers.
 
 Memory, besides the chunk: 24 bytes per distinct trace for the order, 4 bytes
 per piece of every input for the translation table, 40 bytes per row of the
-chunk for its keys (at most 16 MiB unless one trace has more rows than that), the
+chunk for its keys (at most 20 MiB, 2^19 rows, unless one trace has more rows than that), the
 output batch (the chunk size, between 1 and 16 MiB), and what the writer
 itself holds, which is what a flush holds: a row group, the de-duplication
 window, one entry per trace written (index entry, summary, finished id) and one
