@@ -585,3 +585,72 @@ fn an_error_returned_before_the_commit_is_honoured_and_a_fatal_one_stops_the_eng
         }
     }
 }
+
+/// The list and the split map of a replacement are built before the publish
+/// gate is taken, so a flush can publish in between (and is not held up by
+/// the replacement meanwhile). The result accounts for that flush's parts, and
+/// its split map is the one built from scratch.
+#[test]
+fn a_flush_that_publishes_while_the_map_is_built_is_accounted_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let pause = Pause::new(Stage::ReplaceMapBuilt);
+    let mut o = opts(dir.path());
+    o.stage_hook = Some(pause.hook());
+    let e = open(o);
+    let mut m = Model::default();
+    populated(&e, &mut m);
+    let remove: Vec<u64> = windows_of(&e)
+        .into_iter()
+        .filter(|(_, w)| *w < 4_000)
+        .map(|(id, _)| id)
+        .collect();
+    let new_part = merged(&e, &remove);
+    let new_id = new_part.meta.part_id;
+    let replacer = {
+        let e = e.clone();
+        let remove = remove.clone();
+        std::thread::spawn(move || e.inner().replace_parts(&remove, vec![new_part]).unwrap())
+    };
+    pause.wait_reached();
+
+    // The replacement has built its list and is not holding the gate: a flush
+    // goes through, with traces that are in the merged part and in others.
+    let late: Vec<TSpan> = (1..=30u128).map(|t| span(t, 7)).collect();
+    ingest(&e, &late).unwrap();
+    m.add(&late);
+    let flush = {
+        let e = e.clone();
+        std::thread::spawn(move || e.flush().unwrap())
+    };
+    let t = std::time::Instant::now();
+    while !flush.is_finished() {
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "the flush waited for the replacement"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    flush.join().unwrap();
+    let in_between = part_ids(&e);
+    pause.release();
+    replacer.join().unwrap();
+
+    let ids = part_ids(&e);
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    assert!(ids.contains(&new_id));
+    assert!(remove.iter().all(|r| !ids.contains(r)));
+    // Every part the flush published is there.
+    let flushed: Vec<u64> = in_between
+        .iter()
+        .copied()
+        .filter(|id| !remove.contains(id) && *id > new_id)
+        .collect();
+    assert!(!flushed.is_empty());
+    assert!(flushed.iter().all(|id| ids.contains(id)));
+    assert_eq!(ids.len(), in_between.len() - remove.len() + 1);
+    check_split(&e.snapshot(), "after both");
+    m.check(&e, "after both");
+    assert_eq!(manifest_ids(dir.path()), ids);
+    assert_eq!(dirs_on_disk(dir.path()), ids);
+    e.shutdown().unwrap();
+}

@@ -13,8 +13,10 @@
 //!   never about the event time of the data, which may be loaded long after it
 //!   happened.
 //!
-//! A merge never crosses a window and never takes more than a fixed number
-//! of input bytes. At most one merge is chosen at a time.
+//! A merge never crosses a window, never takes more than `max_parts` inputs
+//! or a fixed number of input bytes, and never takes inputs whose pieces of
+//! text add up to more than a part can hold. At most one merge is chosen at a
+//! time.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -110,6 +112,8 @@ pub struct PartInfo {
     pub window_ns: i64,
     /// Bytes on disk.
     pub size_bytes: u64,
+    /// Pieces of text the part holds (`meta.payload.pieces`).
+    pub pieces: u64,
     /// Compaction level: 0 for a flush, one more than the highest input for
     /// a merge.
     pub level: u8,
@@ -148,6 +152,12 @@ pub(crate) type WindowKey = (i64, i64);
 /// be chosen (backing off or damaged). Among the windows that qualify the one
 /// with the most parts goes first, the oldest on a tie.
 ///
+/// `max_pieces` is the most pieces of text one part is written with. A part
+/// holds no more; text past it is stored inline and cannot be searched, so a
+/// merge whose inputs have more pieces than that between them would change
+/// what a search finds. Such inputs are not chosen: the largest are left out
+/// until the rest fit, and a window where no two parts fit stays as it is.
+///
 /// What it does with one huge part and many tiny ones: the tiny ones are
 /// merged among themselves (the tiered rule only joins parts within
 /// `size_ratio` of each other, so the huge one is not in a run with them) and
@@ -160,6 +170,7 @@ pub(crate) type WindowKey = (i64, i64);
 pub fn choose_merge(
     opts: &CompactionOptions,
     parts: &[PartInfo],
+    max_pieces: u64,
     skip: &dyn Fn(i64, i64) -> bool,
 ) -> Option<MergePlan> {
     if !opts.enabled {
@@ -182,21 +193,25 @@ pub fn choose_merge(
         ps.sort_by_key(|p| (p.size_bytes, p.id));
         let quiet = ps.iter().all(|p| p.live_for >= opts.quiet);
         let (rule, mut chosen) = if quiet {
-            // Everything, as far as one merge can take.
+            // The smallest, as many as one merge takes; the window becomes
+            // one part over as many merges as that needs.
             let mut all = ps.clone();
-            all.truncate(usize::from(u16::MAX));
+            all.truncate(opts.max_parts);
             (Rule::Final, all)
         } else if let Some(run) = tiered_run(opts, &ps) {
             (Rule::Tiered, run)
         } else {
             continue;
         };
-        // The byte cap drops the largest first.
+        // The byte cap and the piece ceiling drop the largest first.
         let mut bytes: u64 = chosen.iter().map(|p| p.size_bytes).sum();
-        while bytes > opts.max_input_bytes && chosen.len() >= 2 {
-            bytes -= chosen.pop().map_or(0, |p| p.size_bytes);
+        let mut pieces: u64 = chosen.iter().map(|p| p.pieces).sum();
+        while (bytes > opts.max_input_bytes || pieces > max_pieces) && chosen.len() >= 2 {
+            let last = chosen.pop().expect("two or more parts");
+            bytes -= last.size_bytes;
+            pieces -= last.pieces;
         }
-        if chosen.len() < 2 || bytes > opts.max_input_bytes {
+        if chosen.len() < 2 || bytes > opts.max_input_bytes || pieces > max_pieces {
             continue;
         }
         if best.is_none() || ps.len() > best_count {
@@ -243,6 +258,7 @@ mod tests {
             window_start_ns: window * W,
             window_ns: W,
             size_bytes: size,
+            pieces: 0,
             level: 0,
             live_for: Duration::from_secs(live_secs),
         }
@@ -251,7 +267,8 @@ mod tests {
     type Picked = Option<(Rule, i64, Vec<u64>)>;
 
     fn pick(opts: &CompactionOptions, parts: &[PartInfo]) -> Picked {
-        choose_merge(opts, parts, &|_, _| false).map(|m| (m.rule, m.window_start_ns / W, m.parts))
+        choose_merge(opts, parts, u64::MAX, &|_, _| false)
+            .map(|m| (m.rule, m.window_start_ns / W, m.parts))
     }
 
     #[test]
@@ -358,7 +375,7 @@ mod tests {
             pick(&o, &parts),
             Some((Rule::Tiered, 0, vec![1, 2, 3, 4, 5]))
         );
-        // The final rule is not limited by max_parts: it leaves one part.
+        // The final rule is limited by it too, and takes the smallest.
         let parts: Vec<_> = (1..=9).map(|i| p(i, 0, 10 + i, 99)).collect();
         let m = choose_merge(
             &CompactionOptions {
@@ -366,10 +383,72 @@ mod tests {
                 ..CompactionOptions::default()
             },
             &parts,
+            u64::MAX,
             &|_, _| false,
         )
         .unwrap();
-        assert_eq!((m.rule, m.parts.len()), (Rule::Final, 9));
+        assert_eq!((m.rule, m.parts), (Rule::Final, vec![1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    fn the_final_rule_takes_max_parts_at_a_time_until_one_part_is_left() {
+        let o = CompactionOptions {
+            max_parts: 4,
+            ..CompactionOptions::default()
+        };
+        // 11 quiet parts; larger ids are larger parts. Every merge has at
+        // most 4 inputs, the smallest first, and the window ends as one part.
+        let mut parts: Vec<PartInfo> = (1..=11).map(|i| p(i, 0, 10 * i, 99)).collect();
+        let first = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
+        assert_eq!((first.rule, first.parts), (Rule::Final, vec![1, 2, 3, 4]));
+        let mut merges = 0;
+        while let Some(m) = choose_merge(&o, &parts, u64::MAX, &|_, _| false) {
+            assert!(m.parts.len() <= 4 && m.parts.len() >= 2, "{m:?}");
+            let size = parts
+                .iter()
+                .filter(|x| m.parts.contains(&x.id))
+                .map(|x| x.size_bytes)
+                .sum();
+            let id = parts.iter().map(|x| x.id).max().unwrap() + 1;
+            parts.retain(|x| !m.parts.contains(&x.id));
+            parts.push(p(id, 0, size, 99));
+            merges += 1;
+            assert!(merges < 20, "does not end");
+        }
+        assert_eq!(parts.len(), 1);
+        assert!(merges >= 3);
+    }
+
+    #[test]
+    fn a_merge_never_takes_inputs_with_more_pieces_than_the_ceiling() {
+        let o = CompactionOptions::default();
+        let with = |id, size, pieces, live| PartInfo {
+            pieces,
+            ..p(id, 0, size, live)
+        };
+        // Final rule: the largest part is left out until the rest fit.
+        let parts = [
+            with(1, 10, 40, 99),
+            with(2, 20, 40, 99),
+            with(3, 30, 40, 99),
+        ];
+        let m = choose_merge(&o, &parts, 100, &|_, _| false).unwrap();
+        assert_eq!(m.parts, vec![1, 2]);
+        // Exactly at the ceiling fits.
+        let m = choose_merge(&o, &parts, 80, &|_, _| false).unwrap();
+        assert_eq!(m.parts, vec![1, 2]);
+        // One piece less and no two parts fit: the window is left alone.
+        assert_eq!(choose_merge(&o, &parts, 79, &|_, _| false), None);
+        // Tiered rule: the same.
+        let parts: Vec<_> = (1..=4).map(|i| with(i, 10, 30, 1)).collect();
+        let m = choose_merge(&o, &parts, 100, &|_, _| false).unwrap();
+        assert_eq!((m.rule, m.parts), (Rule::Tiered, vec![1, 2, 3]));
+        assert_eq!(choose_merge(&o, &parts, 59, &|_, _| false), None);
+        // A window that cannot merge does not hold back another one.
+        let mut parts = vec![with(1, 10, 60, 99), with(2, 20, 60, 99)];
+        parts.extend([p(3, 1, 5, 99), p(4, 1, 5, 99)]);
+        let m = choose_merge(&o, &parts, 100, &|_, _| false).unwrap();
+        assert_eq!((m.window_start_ns, m.parts), (W, vec![3, 4]));
     }
 
     #[test]
@@ -386,11 +465,11 @@ mod tests {
         assert_eq!(pick(&o, &parts), None);
         // Three parts: the largest is dropped and two remain.
         let parts = vec![p(1, 0, 30, 99), p(2, 0, 40, 99), p(3, 0, 70, 99)];
-        let m = choose_merge(&o, &parts, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
         assert_eq!((m.parts, m.input_bytes), (vec![1, 2], 70));
         // A tiered run over the cap is cut the same way.
         let parts: Vec<_> = (1..=4).map(|i| p(i, 0, 30, 1)).collect();
-        let m = choose_merge(&o, &parts, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
         assert_eq!((m.rule, m.parts), (Rule::Tiered, vec![1, 2, 3]));
         // A window skipped for its cap does not hold back another window.
         let mut parts = vec![p(1, 0, 40, 99), p(2, 0, 61, 99)];
@@ -406,7 +485,7 @@ mod tests {
         parts.extend((3..=7).map(|i| p(i, 1, 10, 99)));
         parts.extend((8..=10).map(|i| p(i, 2, 10, 99)));
         assert_eq!(pick(&o, &parts).unwrap().1, 1);
-        let m = choose_merge(&o, &parts, &|s, _| s == W).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|s, _| s == W).unwrap();
         assert_eq!(m.window_start_ns, 2 * W);
         // A tie goes to the older window.
         let parts: Vec<_> = [(1, 5), (2, 5), (3, 2), (4, 2)]
@@ -425,6 +504,7 @@ mod tests {
                     ..o
                 },
                 &parts,
+                u64::MAX,
                 &|_, _| false
             )
             .is_none()
@@ -498,6 +578,7 @@ mod tests {
                 window_start_ns: 0,
                 window_ns: W,
                 size_bytes: size,
+                pieces: 0,
                 level: 0,
                 live_for: Duration::ZERO,
             });
@@ -508,7 +589,7 @@ mod tests {
         /// the output id of each merge.
         fn settle(&mut self, o: &CompactionOptions) -> Vec<(Vec<u64>, u64)> {
             let mut done = Vec::new();
-            while let Some(m) = choose_merge(o, &self.parts, &|_, _| false) {
+            while let Some(m) = choose_merge(o, &self.parts, u64::MAX, &|_, _| false) {
                 let level = self
                     .parts
                     .iter()
@@ -522,6 +603,7 @@ mod tests {
                     window_start_ns: 0,
                     window_ns: W,
                     size_bytes: m.input_bytes,
+                    pieces: 0,
                     level: level + 1,
                     live_for: Duration::ZERO,
                 });
@@ -571,6 +653,7 @@ mod tests {
             window_start_ns: 0,
             window_ns: W,
             size_bytes: huge,
+            pieces: 0,
             level: 0,
             live_for: Duration::ZERO,
         }]);
@@ -618,7 +701,7 @@ mod tests {
         for x in &mut parts {
             x.live_for = Duration::from_secs(61);
         }
-        let m = choose_merge(&o, &parts, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
         assert_eq!((m.rule, m.parts.len()), (Rule::Final, 4));
         // After the merge the window is one part and nothing is chosen again.
         let one = [p(5, 0, 1_003_000, 0)];

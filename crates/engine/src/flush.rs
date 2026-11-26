@@ -37,6 +37,7 @@ impl Inner {
             dedup_window_bytes: self.opts.dedup_window_bytes,
             text_index_budget_bytes: self.opts.text_index_budget_bytes,
             row_list_budget_bytes: self.opts.row_list_budget_bytes,
+            max_pieces: self.opts.max_pieces,
             ..WriterOptions::default()
         }
     }
@@ -84,8 +85,7 @@ impl Inner {
             }
             if c.vis.active.is_empty() && c.applied_lsn == c.flushed_lsn {
                 drop(c);
-                self.rotate_and_trim_log();
-                return Ok(());
+                return self.rotate_and_trim_log();
             }
             // Everything with a log position up to `applied_lsn` is in the
             // active buffer or in parts, because requests enter the buffer in
@@ -148,8 +148,9 @@ impl Inner {
                 drop(gate);
                 self.stage_after_commit(Stage::Published);
                 if trim {
-                    self.rotate_and_trim_log();
+                    let rotated = self.rotate_and_trim_log();
                     self.stage_after_commit(Stage::Trimmed);
+                    return rotated;
                 }
                 Ok(())
             }
@@ -187,22 +188,37 @@ impl Inner {
     /// Starts a new log file and then removes the log files that are entirely
     /// inside parts. The trim never removes the newest file, so without the
     /// new file the records of this flush would stay on disk until that file
-    /// reached its size limit. A failure of either step is only noted: the
-    /// data is safe and the next flush tries again.
-    fn rotate_and_trim_log(&self) {
+    /// reached its size limit.
+    ///
+    /// The data is in parts either way. If the new file cannot be created the
+    /// log keeps writing to the current one: the error is recorded and
+    /// returned, and the next flush tries again. If syncing the current file
+    /// fails the log is poisoned: the engine is put in the fatal state at
+    /// once and the error is returned. A failed trim is only recorded, and
+    /// the next flush tries it again.
+    fn rotate_and_trim_log(&self) -> Result<()> {
         let flushed = lock(&self.core).flushed_lsn;
         let wal = self.wal.read().unwrap_or_else(|e| e.into_inner());
-        let Some(wal) = wal.as_ref() else { return };
+        let Some(wal) = wal.as_ref() else {
+            return Ok(());
+        };
+        let mut rotated = Ok(());
         match wal.rotate() {
             Ok(_) => self.stage_after_commit(Stage::LogRotated),
             Err(e) => {
-                lock(&self.core).last_error = Some(format!("rotating the log failed: {e}"));
-                return;
+                let mut c = lock(&self.core);
+                c.last_error = Some(format!("rotating the log failed: {e}"));
+                if matches!(e, Error::Fatal(_)) {
+                    self.set_fatal_locked(&mut c, e.to_string());
+                    return Err(e);
+                }
+                rotated = Err(e);
             }
         }
         if let Err(e) = wal.truncate_before(flushed + 1) {
             lock(&self.core).last_error = Some(format!("trimming the log failed: {e}"));
         }
+        rotated
     }
 
     fn write_and_commit(&self, frozen: &[Arc<RecordBatch>], lsn: u64) -> Result<Written<'_>> {

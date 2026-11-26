@@ -46,7 +46,12 @@ pub(crate) fn create_file(dir: &Path, first: Lsn, mode: SyncMode) -> std::io::Re
         ));
     }
     std::fs::rename(&tmp, &path)?;
-    sync_dir(dir, mode)?;
+    if let Err(e) = sync_dir(dir, mode) {
+        // Not durable, so not to be left in the directory under its name; if
+        // this fails too the caller sees the file and treats it as damage.
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
+    }
     Ok(file)
 }
 
@@ -102,12 +107,18 @@ impl Writer {
                         Ok(rotated) => {
                             let _ = reply.send(Ok(rotated));
                         }
-                        Err(e) => {
-                            // A failed sync or file creation is treated as in
-                            // a roll: the log is poisoned.
+                        Err((e, true)) => {
+                            // A failed sync is a failed sync like any other:
+                            // the log is poisoned.
                             let _ = reply.send(Err(poison_error(&e.to_string())));
                             self.shared.poison(e.to_string(), Vec::new());
                             return;
+                        }
+                        Err((e, false)) => {
+                            // The new file could not be made. The active
+                            // file is intact and still written to; the caller
+                            // may ask again.
+                            let _ = reply.send(Err(e));
                         }
                     }
                     continue;
@@ -212,13 +223,27 @@ impl Writer {
 
     /// Starts a new file at the write position unless the active file holds no
     /// records. Everything in the active file has been synced by the group
-    /// that wrote it; `roll` syncs it again before the new file exists.
-    fn rotate(&mut self) -> Result<bool> {
+    /// that wrote it; the sync is repeated before the new file exists.
+    ///
+    /// The error says whether the log must be poisoned. A failed sync must.
+    /// A failure to create the new file does not, provided that no file with
+    /// the new name is left behind (`create_file` removes the one it made if
+    /// its last step fails): the active file is untouched and the next
+    /// rotation starts again. If one is left, the files on disk no longer
+    /// match what is being written, so it must.
+    fn rotate(&mut self) -> std::result::Result<bool, (Error, bool)> {
         if self.file_records == 0 {
             return Ok(false);
         }
-        self.roll(self.file_first + self.file_records)?;
-        Ok(true)
+        self.sync_active().map_err(|e| (e, true))?;
+        let first = self.file_first + self.file_records;
+        match self.start_file(first) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                let stuck = format::file_path(&self.shared.dir, first).exists();
+                Err((e, stuck))
+            }
+        }
     }
 
     /// Finishes the active file and starts one whose first record is `first`.
@@ -226,6 +251,12 @@ impl Writer {
         // The old file must be durable before the new one is used, otherwise
         // a crash could leave a hole between two files.
         self.sync_active()?;
+        self.start_file(first)
+    }
+
+    /// Creates the file whose first record is `first` and makes it the active
+    /// one. On an error nothing has changed in memory.
+    fn start_file(&mut self, first: Lsn) -> Result<()> {
         let mut files = lock(&self.shared.files);
         self.file = create_file(&self.shared.dir, first, self.options.sync)?;
         files.push(first);

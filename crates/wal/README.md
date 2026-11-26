@@ -76,8 +76,13 @@ written, creates the new file the way a roll does (header written and synced
 under a `.tmp` name, renamed, directory synced), and the records still queued
 go to the new file. The new file's first number is the number of the next
 record, so numbering stays gapless and the newest file is never removed. A
-failed sync or file creation poisons the log, as in a roll, and `rotate`
-returns `Error::Fatal`.
+failed sync of the file written so far poisons the log, as in a roll, and
+`rotate` returns `Error::Fatal`. A failure to create the new file (a full
+disk, say) poisons nothing: the active file is untouched and still written to,
+`rotate` returns the error (not `Fatal`), no file with the new name is left
+behind, and the caller may call it again. If such a file cannot be removed
+after a failed last step, the log is poisoned, since what is on disk no longer
+matches what is written.
 
 A crash leaves a log that opens, whichever step it hit:
 

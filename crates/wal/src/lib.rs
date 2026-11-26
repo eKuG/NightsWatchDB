@@ -656,9 +656,11 @@ impl Wal {
     /// only its header is simply the newest file.
     ///
     /// Waits for the log thread, so it takes as long as the group being
-    /// written plus one file creation. A failure of the sync or of the file
-    /// creation poisons the log like the same failure in a roll, and is
-    /// returned as [`Error::Fatal`].
+    /// written plus one file creation. A failure of the sync poisons the log
+    /// like the same failure in a roll, and is returned as [`Error::Fatal`].
+    /// A failure to create the file poisons nothing: the log goes on writing
+    /// to the file it had, the error is returned as it is, and `rotate` can
+    /// be called again.
     pub fn rotate(&self) -> Result<bool> {
         let (tx, rx) = mpsc::channel();
         {

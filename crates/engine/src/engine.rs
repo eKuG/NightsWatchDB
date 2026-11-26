@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, TryLockError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -94,6 +95,13 @@ pub struct EngineOptions {
     /// `nwdb_segment::WriterOptions::row_list_budget_bytes`), per part.
     /// Default 32 MiB.
     pub row_list_budget_bytes: usize,
+    /// The most pieces of text one part holds (see
+    /// `nwdb_segment::WriterOptions::max_pieces`); text past it is stored
+    /// inline and cannot be searched. Compaction never merges parts whose
+    /// pieces add up to more than this. A test facility, in the manner of
+    /// [`stage_hook`](Self::stage_hook): leave it alone outside tests. Default
+    /// 16,777,216.
+    pub max_pieces: usize,
     /// A test facility, in the manner of the log's `sync_hook`: called at each
     /// [`Stage`] of start-up and of a flush. An error it returns at a stage
     /// before the manifest commit is handled exactly as if that step had
@@ -164,6 +172,12 @@ pub enum Stage {
     /// handled as if the commit had failed with it: nothing changes (`Fatal`
     /// puts the engine in the fatal state).
     BeforeReplaceCommit,
+    /// A replacement of parts has built the new part list and split map for
+    /// the list it saw, and does not hold the publish gate yet. An error
+    /// returned here changes nothing (`Fatal` puts the engine in the fatal
+    /// state). Flushes may publish after this point; the replacement then
+    /// accounts for them under the gate.
+    ReplaceMapBuilt,
     /// A replacement of parts committed to the manifest, before the new part
     /// list is published to queries.
     ReplaceCommitted,
@@ -197,6 +211,7 @@ impl std::fmt::Debug for EngineOptions {
             .field("dedup_window_bytes", &self.dedup_window_bytes)
             .field("text_index_budget_bytes", &self.text_index_budget_bytes)
             .field("row_list_budget_bytes", &self.row_list_budget_bytes)
+            .field("max_pieces", &self.max_pieces)
             .field("stage_hook", &self.stage_hook.as_ref().map(|_| "<hook>"))
             .field("maintenance_interval", &self.maintenance_interval)
             .field("retention", &self.retention)
@@ -226,6 +241,7 @@ impl EngineOptions {
             dedup_window_bytes: nwdb_segment::DEFAULT_DEDUP_WINDOW_BYTES,
             text_index_budget_bytes: nwdb_segment::DEFAULT_TEXT_INDEX_BUDGET_BYTES,
             row_list_budget_bytes: nwdb_segment::DEFAULT_ROW_LIST_BUDGET_BYTES,
+            max_pieces: nwdb_segment::DEFAULT_MAX_PIECES,
             stage_hook: None,
             maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
             retention: None,
@@ -407,6 +423,11 @@ pub(crate) struct Inner {
     /// One maintenance pass at a time, whether from the thread or from
     /// [`Engine::run_maintenance`].
     pub maintenance_gate: Mutex<()>,
+    /// Set by shutdown before it waits for the maintenance thread: no merge
+    /// is started once it is set, and a merge that fails while it is set is
+    /// not a failure. It is also the flag a merge is to check between chunks
+    /// (see `merge_one`).
+    pub merge_stop: Arc<AtomicBool>,
     /// Directories of removed parts that could not be deleted yet; the next
     /// pass tries again. They are unreferenced, so a restart deletes them too.
     pub undeleted: Mutex<Vec<PathBuf>>,
@@ -737,6 +758,7 @@ impl Engine {
             flush_gate: Mutex::new(()),
             publish_gate: Mutex::new(()),
             maintenance_gate: Mutex::new(()),
+            merge_stop: Arc::new(AtomicBool::new(false)),
             undeleted: Mutex::new(Vec::new()),
             lock_file: Mutex::new(Some(lock_file)),
             threads: Mutex::new(Threads::default()),
@@ -1224,6 +1246,7 @@ impl Inner {
             }
             c.stop_flusher = true;
             c.stop_maintenance = true;
+            self.merge_stop.store(true, Ordering::SeqCst);
             self.flusher_cv.notify_all();
             self.maintenance_cv.notify_all();
         }

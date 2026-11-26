@@ -3,6 +3,7 @@
 //! where it tests the thread.
 
 mod common;
+mod search_model;
 mod support;
 
 use std::collections::BTreeSet;
@@ -16,6 +17,7 @@ use nwdb_core::{Error, TraceId, part_dir_name};
 use nwdb_engine::{CompactionOptions, Engine, EngineOptions, ListQuery, Stage, StageHook};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use search_model::Lines;
 use support::disk_state;
 
 /// The test windows are 1000 ns wide (see `common::opts`).
@@ -1059,5 +1061,96 @@ fn a_failure_that_persists_ends_the_pass_instead_of_repeating_in_it() {
     }
     assert_eq!(e.stats().parts, 2);
     m.check(&e, "unchanged");
+    e.shutdown().unwrap();
+}
+
+/// A quiet window of many small parts (as after a period with compaction
+/// off) is merged `max_parts` inputs at a time, the smallest first, and ends
+/// as one part in one pass; a merge's output counts as quiet as its inputs
+/// were, so the window does not wait for another quiet period between merges.
+#[test]
+fn a_quiet_window_of_many_parts_is_merged_in_steps_of_at_most_max_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = compact_opts(dir.path());
+    o.compaction.max_parts = 4;
+    o.compaction.quiet = Duration::from_millis(300);
+    let e = open(o);
+    let (mut f, mut m) = (Feeder::new(), Model::default());
+    for _ in 0..11 {
+        f.round(&e, &mut m, &[0]);
+    }
+    assert_eq!(e.stats().windows_with_many_parts, 1);
+    std::thread::sleep(Duration::from_millis(400));
+    e.run_maintenance().unwrap();
+    let s = e.stats();
+    assert_eq!(s.windows_with_many_parts, 0, "{s:?}");
+    assert_eq!(s.parts, 1);
+    assert!(s.merges_done >= 3, "{}", s.merges_done);
+    assert!(
+        s.parts_merged_away <= s.merges_done * 4,
+        "a merge had more than 4 inputs: {} parts in {} merges",
+        s.parts_merged_away,
+        s.merges_done
+    );
+    m.check(&e, "after the merges");
+    e.shutdown().unwrap();
+}
+
+/// Parts whose pieces of text add up to more than a part holds are not merged,
+/// so no text becomes unsearchable because of a merge; the window stays in
+/// more than one part, and a pass neither fails nor tries again and again.
+#[test]
+fn parts_with_more_pieces_than_a_part_holds_are_not_merged_and_text_stays_searchable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = compact_opts(dir.path());
+    o.splitter = Some(Arc::new(Lines));
+    // Three distinct pieces in each part (each line is longer than the
+    // writer's floor for a piece): two parts fit together, three do not.
+    o.max_pieces = 6;
+    let e = open(o);
+    for part in 0..3u128 {
+        let lines: Vec<String> = (0..3)
+            .map(|i| format!("marker{part}x{i} common words here"))
+            .collect();
+        let mut s = TSpan::new(part + 1, 1, 100 + part as i64).root();
+        s.attrs = lines.join("\n").into_bytes();
+        ingest(&e, &[s]).unwrap();
+        e.flush().unwrap();
+    }
+    let found = |part: u128| -> usize {
+        (0..3)
+            .map(|i| {
+                let query = nwdb_engine::textindex::parse(&format!("marker{part}x{i}")).unwrap();
+                e.snapshot()
+                    .search(&nwdb_engine::SearchQuery {
+                        query,
+                        from_ns: i64::MIN,
+                        to_ns: i64::MAX,
+                        limit: 10,
+                    })
+                    .unwrap()
+                    .len()
+            })
+            .sum()
+    };
+    for part in 0..3 {
+        assert_eq!(found(part), 3, "setup: part {part}");
+    }
+    // The first pass merges the two smallest; the rest do not fit.
+    e.run_maintenance().unwrap();
+    let after_first = e.stats();
+    assert_eq!((after_first.merges_done, after_first.parts), (1, 2));
+    // More passes change nothing and fail at nothing.
+    for _ in 0..5 {
+        e.run_maintenance().unwrap();
+    }
+    let s = e.stats();
+    assert_eq!((s.merges_done, s.parts), (1, 2), "{s:?}");
+    assert_eq!(s.last_compaction_error, None);
+    assert_eq!(s.last_maintenance_error, None);
+    assert_eq!(s.windows_with_many_parts, 1);
+    for part in 0..3 {
+        assert_eq!(found(part), 3, "after maintenance: part {part}");
+    }
     e.shutdown().unwrap();
 }

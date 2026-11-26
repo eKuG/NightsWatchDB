@@ -929,3 +929,27 @@ fn a_blocked_rotation_waits_for_the_group_being_synced() {
     });
     assert_eq!(names(dir.path()), [file_name(1), file_name(2)]);
 }
+
+#[test]
+fn a_rotation_that_cannot_create_the_file_fails_without_poisoning_and_can_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    wal.append_blocking(b"one").unwrap();
+    wal.append_blocking(b"two").unwrap();
+    // A directory where the temporary file would be makes its creation fail.
+    let blocker = dir.path().join(format!("{}.tmp", file_name(3)));
+    std::fs::create_dir(&blocker).unwrap();
+    let err = wal.rotate().unwrap_err();
+    assert!(!matches!(err, Error::Fatal(_)), "{err}");
+    // The log writes on, into the file it had, and loses nothing.
+    wal.append_blocking(b"three").unwrap();
+    assert_eq!(names(dir.path()), [file_name(1)]);
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(wal.rotate().unwrap());
+    wal.append_blocking(b"four").unwrap();
+    assert_eq!(names(dir.path()), [file_name(1), file_name(4)]);
+    wal.shutdown().unwrap();
+    let (wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    assert_eq!(rec.last_lsn, 4);
+    assert_eq!(replay_all(&wal, 0).len(), 4);
+}

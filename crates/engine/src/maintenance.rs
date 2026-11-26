@@ -10,13 +10,14 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nwdb_core::{Error, Result, part_dir_name};
 use nwdb_manifest::Edit;
 use nwdb_segment::{MergeOptions, PartReader, merge_parts};
 
-use crate::compaction::{MergePlan, PartInfo, WindowKey, choose_merge};
+use crate::compaction::{MergePlan, PartInfo, Rule, WindowKey, choose_merge};
 use crate::engine::{Inner, LivePart, Stage, run_hook, sync_dir};
 use crate::flush::panic_message;
 use crate::lock;
@@ -33,8 +34,9 @@ pub(crate) struct CompactionState {
     pub merging: bool,
     pub last_error: Option<String>,
     /// Windows whose merge failed: how many times in a row, and when to try
-    /// again. Other windows are not held back by them.
-    failing: HashMap<WindowKey, (u32, Instant)>,
+    /// again (`None`: a time that cannot be represented, so not by the
+    /// clock). Other windows are not held back by them.
+    failing: HashMap<WindowKey, (u32, Option<Instant>)>,
     /// Windows with a damaged input: left alone until a restart.
     damaged: HashSet<WindowKey>,
 }
@@ -85,12 +87,16 @@ impl Inner {
     /// 2. the new part list and a split map that matches it are published in
     ///    one step under the core lock, so a snapshot never sees a list and a
     ///    map that disagree, nor a removed part and its replacement both
-    ///    present or both absent;
+    ///    present or both absent. The list and the map are built before the
+    ///    gate is taken, from the list seen then; under the gate only the
+    ///    parts a flush published since are added to them;
     /// 3. the directories of the removed parts are deleted and `parts/` is
     ///    synced.
     ///
     /// Steps 1 and 2 hold the publish gate, which a flush also holds from its
     /// commit to its publish; nothing is held while directories are deleted.
+    /// Only one replacement runs at a time (they are made by a maintenance
+    /// pass), which is what lets the list be built before the gate.
     ///
     /// An error before the commit changes nothing: `InvalidArgument` if an id
     /// in `remove` is not live (or is listed twice), anything else from the
@@ -109,19 +115,33 @@ impl Inner {
             .iter()
             .map(|&id| self.parts_dir.join(part_dir_name(id)))
             .collect();
+        let add: Vec<Arc<LivePart>> = add.into_iter().map(Arc::new).collect();
+
+        // The long work, before the gate: the list and the split map that the
+        // list seen now will have after the replacement. Costs what
+        // `change_parts` says, with no lock held. A flush may publish parts
+        // meanwhile; nothing else changes the list, because replacements run
+        // only in a maintenance pass and passes run one at a time.
+        let (seen, seen_split) = {
+            let c = lock(&self.core);
+            (c.vis.parts.clone(), c.vis.split.clone())
+        };
+        let (built, built_split) = change_parts(&seen, &seen_split, remove, add.clone());
+        self.hook_before_commit(Stage::ReplaceMapBuilt)?;
+
         {
             let gate = lock(&self.publish_gate);
-            let (old_parts, old_split) = {
+            let old_parts = {
                 let c = lock(&self.core);
                 if let Some(f) = &c.fatal {
                     return Err(Error::fatal(f.clone()));
                 }
-                (c.vis.parts.clone(), c.vis.split.clone())
+                c.vis.parts.clone()
             };
             let live: HashSet<u64> = old_parts.iter().map(|p| p.meta.part_id).collect();
-            let mut seen = HashSet::new();
+            let mut seen_twice = HashSet::new();
             for id in remove {
-                if !live.contains(id) || !seen.insert(*id) {
+                if !live.contains(id) || !seen_twice.insert(*id) {
                     return Err(Error::invalid_argument(format!(
                         "cannot remove part {id}: it is not live or is listed twice"
                     )));
@@ -130,14 +150,24 @@ impl Inner {
             if remove.is_empty() && add.is_empty() {
                 return Ok(Replaced::default());
             }
-            // The last point where nothing has changed yet.
-            if let Err(e) = run_hook(&self.opts.stage_hook, Stage::BeforeReplaceCommit) {
-                if matches!(e, Error::Fatal(_)) {
-                    let mut c = lock(&self.core);
-                    self.set_fatal_locked(&mut c, e.to_string());
-                }
-                return Err(e);
+            // The parts published since the list was seen. Everything that
+            // was seen must still be live, or the map built above is for a
+            // list that no longer exists; that is refused before the commit.
+            let known: HashSet<u64> = seen.iter().map(|p| p.meta.part_id).collect();
+            let later: Vec<Arc<LivePart>> = old_parts
+                .iter()
+                .filter(|p| !known.contains(&p.meta.part_id))
+                .cloned()
+                .collect();
+            if old_parts.len() != seen.len() + later.len()
+                || later.iter().any(|p| remove.contains(&p.meta.part_id))
+            {
+                return Err(Error::other(
+                    "the part list changed while a replacement was being prepared",
+                ));
             }
+            // The last point where nothing has changed yet.
+            self.hook_before_commit(Stage::BeforeReplaceCommit)?;
 
             // 1. The commit.
             let edit = Edit {
@@ -154,10 +184,13 @@ impl Inner {
             }
             self.stage_after_commit(Stage::ReplaceCommitted);
 
-            // 2. The publish. The map is built outside the core lock and
-            // costs what `change_parts` says.
-            let add = add.into_iter().map(Arc::new).collect();
-            let (parts, split) = change_parts(&old_parts, &old_split, remove, add);
+            // 2. The publish. Only the parts published since cost anything
+            // here, as in a flush.
+            let (parts, split) = if later.is_empty() {
+                (built, built_split)
+            } else {
+                change_parts(&built, &built_split, &[], later)
+            };
             {
                 let mut c = lock(&self.core);
                 c.vis.parts = Arc::new(parts);
@@ -169,6 +202,19 @@ impl Inner {
 
         // 3. The deletion.
         Ok(self.delete_dirs(dirs))
+    }
+
+    /// Calls the stage hook at a point before the commit of a replacement. An
+    /// error it returns is the replacement's; `Fatal` also stops the engine.
+    fn hook_before_commit(&self, stage: Stage) -> Result<()> {
+        if let Err(e) = run_hook(&self.opts.stage_hook, stage) {
+            if matches!(e, Error::Fatal(_)) {
+                let mut c = lock(&self.core);
+                self.set_fatal_locked(&mut c, e.to_string());
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Deletes directories of parts that are no longer in the manifest, one at
@@ -210,7 +256,8 @@ impl Inner {
         loop {
             {
                 let mut c = lock(&self.core);
-                let deadline = Instant::now() + self.opts.maintenance_interval;
+                // `None`: too far away to represent, so only a flush wakes it.
+                let deadline = Instant::now().checked_add(self.opts.maintenance_interval);
                 loop {
                     if c.stop_maintenance {
                         return;
@@ -219,15 +266,22 @@ impl Inner {
                         c.maintenance_due = false;
                         break;
                     }
-                    let now = Instant::now();
-                    if now >= deadline {
-                        break;
-                    }
-                    c = self
-                        .maintenance_cv
-                        .wait_timeout(c, deadline - now)
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0;
+                    c = match deadline {
+                        Some(deadline) => {
+                            let now = Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            self.maintenance_cv
+                                .wait_timeout(c, deadline - now)
+                                .unwrap_or_else(|e| e.into_inner())
+                                .0
+                        }
+                        None => self
+                            .maintenance_cv
+                            .wait(c)
+                            .unwrap_or_else(|e| e.into_inner()),
+                    };
                 }
             }
             // The outcome is in the statistics; there is nobody to return it
@@ -279,17 +333,25 @@ impl Inner {
     /// The steps of a pass. A step that fails does not keep the later ones
     /// from running; the first error is the pass's.
     fn pass_steps(&self, merge: bool) -> Result<()> {
-        let mut result = self.retry_deletions();
-        let mut then = |r: Result<()>| {
-            if result.is_ok() {
-                result = r;
-            }
-        };
-        if !self.maintenance_stopping() {
-            then(self.apply_retention());
-        }
+        let mut last_retention = Instant::now();
+        let mut result = self.retention_step();
         if merge && !self.maintenance_stopping() {
-            then(self.choose_and_merge_parts());
+            let merged = self.choose_and_merge_parts(&mut last_retention);
+            if result.is_ok() {
+                result = merged;
+            }
+        }
+        result
+    }
+
+    /// Retries the deletions that failed and applies retention.
+    fn retention_step(&self) -> Result<()> {
+        let mut result = self.retry_deletions();
+        if !self.maintenance_stopping() {
+            let applied = self.apply_retention();
+            if result.is_ok() {
+                result = applied;
+            }
         }
         result
     }
@@ -336,7 +398,12 @@ impl Inner {
     /// A merge that fails is recorded and its window is left alone for a
     /// while (until a restart if the cause is damage in an input); the other
     /// windows go on. The first error is the step's result.
-    fn choose_and_merge_parts(&self) -> Result<()> {
+    ///
+    /// A pass can keep finding merges for as long as flushes keep coming, so
+    /// before each merge, once `maintenance_interval` has passed since
+    /// retention (and the deletions) last ran, they run again.
+    /// `last_retention` is when that was.
+    fn choose_and_merge_parts(&self, last_retention: &mut Instant) -> Result<()> {
         if !self.opts.compaction.enabled {
             return Ok(());
         }
@@ -345,7 +412,16 @@ impl Inner {
         // failure that persists ends the pass instead of repeating in it,
         // whatever the backoff.
         let mut failed_now = HashSet::new();
-        while !self.maintenance_stopping() {
+        while !self.merge_stop.load(Ordering::SeqCst) && !self.maintenance_stopping() {
+            if last_retention.elapsed() >= self.opts.maintenance_interval {
+                *last_retention = Instant::now();
+                if let Err(e) = self.retention_step() {
+                    first_error.get_or_insert(e);
+                }
+                if self.maintenance_stopping() {
+                    break;
+                }
+            }
             let parts = lock(&self.core).vis.parts.clone();
             let Some(plan) = self.next_merge(&parts, &failed_now) else {
                 break;
@@ -355,6 +431,13 @@ impl Inner {
                     if let Err(e) = replaced.into_result() {
                         first_error.get_or_insert(e);
                     }
+                }
+                // Shutdown asked the merge to stop: not a failure of the
+                // window, unless the engine is lost.
+                Err(e)
+                    if !matches!(e, Error::Fatal(_)) && self.merge_stop.load(Ordering::SeqCst) =>
+                {
+                    break;
                 }
                 Err(e) => {
                     failed_now.insert((plan.window_start_ns, plan.window_ns));
@@ -383,6 +466,7 @@ impl Inner {
                 window_start_ns: p.meta.window_start_ns,
                 window_ns: p.meta.window_ns,
                 size_bytes: p.meta.size_bytes(),
+                pieces: p.meta.payload.pieces,
                 level: p.meta.level,
                 live_for: p.live_since.elapsed(),
             })
@@ -400,15 +484,21 @@ impl Inner {
                 .compaction
                 .failing
                 .iter()
-                .filter(|(_, (_, retry_at))| *retry_at > now)
+                .filter(|(_, (_, retry_at))| retry_at.is_none_or(|t| t > now))
                 .map(|(k, _)| *k)
                 .collect();
             (c.compaction.damaged.clone(), waiting)
         };
-        choose_merge(&self.opts.compaction, &infos, &|start, width| {
-            let key = (start, width);
-            damaged.contains(&key) || waiting.contains(&key) || failed_now.contains(&key)
-        })
+        let max_pieces = self.writer_options().max_pieces as u64;
+        choose_merge(
+            &self.opts.compaction,
+            &infos,
+            max_pieces,
+            &|start, width| {
+                let key = (start, width);
+                damaged.contains(&key) || waiting.contains(&key) || failed_now.contains(&key)
+            },
+        )
     }
 
     /// Merges the parts of `plan` into one and replaces them by it. On any
@@ -439,6 +529,10 @@ impl Inner {
         let options = MergeOptions {
             writer: self.writer_options(),
             level,
+            // WIRE-STOP: once `MergeOptions` has a `stop` field, pass
+            // `stop: Some(self.merge_stop.clone()),` here. Nothing else is
+            // needed on this side: the pass already treats an error that
+            // arrives while the flag is set as no failure.
             ..MergeOptions::default()
         };
         let (meta, stats) = merge_parts(
@@ -460,7 +554,15 @@ impl Inner {
         };
         let reader = PartReader::open(&dir).map_err(abandon)?;
         let output_bytes = meta.size_bytes();
-        let part = LivePart::new(meta, reader);
+        let mut part = LivePart::new(meta, reader);
+        if plan.rule == Rule::Final {
+            // The inputs were all quiet and nothing new is in the output, so
+            // it is as quiet as they were: the window can go on to its next
+            // merge at once, not after another quiet period.
+            if let Some(since) = inputs.iter().map(|p| p.live_since).max() {
+                part.live_since = since;
+            }
+        }
         run_hook(&self.opts.stage_hook, Stage::MergeWritten).map_err(abandon)?;
         let remove: Vec<u64> = inputs.iter().map(|p| p.meta.part_id).collect();
         let replaced = self.replace_parts(&remove, vec![part]).map_err(abandon)?;
@@ -503,10 +605,14 @@ impl Inner {
         } else {
             let n = c.compaction.failing.get(&key).map_or(0, |(n, _)| *n) + 1;
             let factor = 1u32 << (n - 1).min(6);
-            let delay = self.opts.compaction.retry_backoff * factor;
-            c.compaction
-                .failing
-                .insert(key, (n, Instant::now() + delay));
+            // A time that cannot be represented is "not by the clock".
+            let retry_at = self
+                .opts
+                .compaction
+                .retry_backoff
+                .checked_mul(factor)
+                .and_then(|delay| Instant::now().checked_add(delay));
+            c.compaction.failing.insert(key, (n, retry_at));
         }
     }
 
