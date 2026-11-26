@@ -9,8 +9,10 @@
 //! postings. Keys are grouped (up to 128 keys or 32 KiB of lists, whichever
 //! comes first; a list that does not fit the group being filled starts the
 //! next one, and a list over 32 KiB is a group of its own); a group is one
-//! read and carries its own checksum, which is verified whenever one of its
-//! keys is read. The README gives the layout.
+//! read and carries its own checksum, which is also kept in the group index
+//! and checked against both whenever one of its keys is read. The footer's
+//! checksum covers the group index, so it covers every group's checksum. The
+//! README gives the layout.
 
 use std::io::Write;
 
@@ -21,9 +23,9 @@ use crate::ids::is_ascending;
 use crate::source::{ReadAt, Sink, read_checked};
 
 const MAGIC: &[u8; 4] = b"NWIL";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const FOOTER: usize = 40;
-const INDEX_ENTRY: usize = 12;
+const INDEX_ENTRY: usize = 16;
 const MAX_GROUP_KEYS: usize = 128;
 const GROUP_BYTES: usize = 32 * 1024;
 const INLINE_MAX: usize = 8;
@@ -37,6 +39,9 @@ pub struct IdListMeta {
     pub ids: u64,
     /// Size of the file in bytes.
     pub bytes: u64,
+    /// The checksum in the footer, which covers the group index and so every
+    /// group's checksum.
+    pub footer_crc: u32,
 }
 
 /// Writes an id-list file. Lists are pushed in key order: the first list
@@ -48,7 +53,7 @@ pub struct IdListWriter<W: Write> {
     first_key: u64,
     keys: u64,
     ids: u64,
-    index: Vec<(u32, u64)>,
+    index: Vec<(u32, u64, u32)>,
     failed: bool,
 }
 
@@ -123,7 +128,8 @@ impl<W: Write> IdListWriter<W> {
             put_varint(&mut header, l as u64);
         }
         let crc = crc32c::crc32c_append(crc32c::crc32c(&header), &self.lists);
-        self.index.push((self.first_key as u32, self.out.pos()));
+        self.index
+            .push((self.first_key as u32, self.out.pos(), crc));
         self.out.write(&header)?;
         self.out.write(&self.lists)?;
         self.out.write(&crc.to_le_bytes())?;
@@ -141,9 +147,10 @@ impl<W: Write> IdListWriter<W> {
         self.close_group()?;
         let index_offset = self.out.pos();
         let mut index = Vec::with_capacity(self.index.len() * INDEX_ENTRY);
-        for &(key, off) in &self.index {
+        for &(key, off, crc) in &self.index {
             index.extend_from_slice(&key.to_le_bytes());
             index.extend_from_slice(&off.to_le_bytes());
+            index.extend_from_slice(&crc.to_le_bytes());
         }
         let mut footer = [0u8; FOOTER];
         footer[0..4].copy_from_slice(&VERSION.to_le_bytes());
@@ -161,19 +168,36 @@ impl<W: Write> IdListWriter<W> {
             keys: self.keys,
             ids: self.ids,
             bytes: self.out.pos(),
+            footer_crc: crc,
         })
     }
 }
 
 /// Reads an id-list file with positioned reads; `Send + Sync`. Memory held:
-/// 12 bytes per group (about 12 bytes per 128 keys at most).
+/// 16 bytes per group (about 16 bytes per 128 keys at most).
 pub struct IdListReader<S: ReadAt> {
     src: S,
     len: u64,
     meta: IdListMeta,
     first_keys: Vec<u32>,
     offsets: Vec<u64>,
+    crcs: Vec<u32>,
     index_offset: u64,
+}
+
+/// One group read and checked: its bytes, where its lists start in them, and
+/// where each list ends, counted from there.
+struct Loaded {
+    group: usize,
+    bytes: Vec<u8>,
+    data_at: usize,
+    ends: Vec<usize>,
+}
+
+/// The encoded list of one key, from a group that has been checked.
+pub struct IdList<'a> {
+    bytes: &'a [u8],
+    max_ids: u64,
 }
 
 fn corrupt<T>(what: &str) -> Result<T> {
@@ -219,11 +243,13 @@ impl<S: ReadAt> IdListReader<S> {
         }
         let mut first_keys: Vec<u32> = Vec::with_capacity(groups as usize);
         let mut offsets: Vec<u64> = Vec::with_capacity(groups as usize);
+        let mut crcs: Vec<u32> = Vec::with_capacity(groups as usize);
         for (i, e) in index.as_chunks::<INDEX_ENTRY>().0.iter().enumerate() {
             let key = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
             let mut o = [0u8; 8];
             o.copy_from_slice(&e[4..12]);
             let off = u64::from_le_bytes(o);
+            let crc = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
             let ok = if i == 0 {
                 key == 0 && off == 0
             } else {
@@ -236,6 +262,7 @@ impl<S: ReadAt> IdListReader<S> {
             }
             first_keys.push(key);
             offsets.push(off);
+            crcs.push(crc);
         }
         if groups > 0 && keys - u64::from(first_keys[groups as usize - 1]) > MAX_GROUP_KEYS as u64 {
             return corrupt("last group has too many keys");
@@ -247,9 +274,11 @@ impl<S: ReadAt> IdListReader<S> {
                 keys,
                 ids,
                 bytes: len,
+                footer_crc: u32_at(32),
             },
             first_keys,
             offsets,
+            crcs,
             index_offset,
         })
     }
@@ -268,10 +297,44 @@ impl<S: ReadAt> IdListReader<S> {
     /// is `NotFound`. The group holding the key is read whole and its
     /// checksum verified.
     pub fn get(&self, key: u32) -> Result<Vec<u32>> {
-        if u64::from(key) >= self.meta.keys {
-            return Err(Error::not_found(format!("key {key} is not in the file")));
+        let mut ids = Vec::new();
+        self.for_each(std::iter::once(key), |_, list| {
+            ids = list.decode()?;
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// Calls `f` with the list of each of `keys`, in the order given. The
+    /// group read last is kept, so keys in ascending order read each group
+    /// once however many of its keys there are. A key at or above
+    /// [`IdListReader::keys`] is `NotFound`. A group is checked against its
+    /// checksum, in the file and in the group index, when it is read.
+    pub fn for_each(
+        &self,
+        keys: impl IntoIterator<Item = u32>,
+        mut f: impl FnMut(u32, IdList<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let mut loaded: Option<Loaded> = None;
+        for key in keys {
+            if u64::from(key) >= self.meta.keys {
+                return Err(Error::not_found(format!("key {key} is not in the file")));
+            }
+            let g = self.first_keys.partition_point(|&k| k <= key) - 1;
+            if loaded.as_ref().is_none_or(|l| l.group != g) {
+                loaded = Some(self.load_group(g)?);
+            }
+            let l = loaded.as_ref().expect("just loaded");
+            let i = (key - self.first_keys[g]) as usize;
+            let from = if i == 0 { 0 } else { l.ends[i - 1] };
+            let bytes = &l.bytes[l.data_at + from..l.data_at + l.ends[i]];
+            let max_ids = self.meta.ids;
+            f(key, IdList { bytes, max_ids })?;
         }
-        let g = self.first_keys.partition_point(|&k| k <= key) - 1;
+        Ok(())
+    }
+
+    fn load_group(&self, g: usize) -> Result<Loaded> {
         let start = self.offsets[g];
         let end = self
             .offsets
@@ -282,46 +345,56 @@ impl<S: ReadAt> IdListReader<S> {
             Some(&next) => u64::from(next),
             None => self.meta.keys,
         } - u64::from(self.first_keys[g]);
-        let group = read_checked(&self.src, self.len, start, end - start, "group")?;
-        let Some((body, crc)) = group.split_last_chunk::<4>() else {
+        let bytes = read_checked(&self.src, self.len, start, end - start, "group")?;
+        let Some((body, crc)) = bytes.split_last_chunk::<4>() else {
             return corrupt("group is too short for its checksum");
         };
-        if crc32c::crc32c(body) != u32::from_le_bytes(*crc) {
+        let now = crc32c::crc32c(body);
+        if now != u32::from_le_bytes(*crc) || now != self.crcs[g] {
             return corrupt("group checksum mismatch");
         }
         // The header is one length per key; the lists follow it.
         let mut p = 0usize;
-        let (mut list_at, mut want) = (0u64, None);
-        let mut lens = Vec::with_capacity(in_group as usize);
+        let mut list_at = 0u64;
+        let mut ends = Vec::with_capacity(in_group as usize);
         for _ in 0..in_group {
-            lens.push(get_varint(body, &mut p)?);
+            list_at = list_at.saturating_add(get_varint(body, &mut p)?);
+            ends.push(list_at);
         }
-        let data = &body[p..];
-        for (i, &l) in lens.iter().enumerate() {
-            if i as u64 == u64::from(key - self.first_keys[g]) {
-                want = Some((list_at, l));
-            }
-            list_at = list_at.saturating_add(l);
-        }
-        if list_at != data.len() as u64 {
+        if list_at != (body.len() - p) as u64 {
             return corrupt("list lengths do not add up to the group size");
         }
-        let Some((at, l)) = want else {
-            return corrupt("key is missing from its group");
-        };
-        let list = &data[at as usize..(at + l) as usize];
-        self.decode_list(list)
+        let ends = ends.into_iter().map(|e| e as usize).collect();
+        Ok(Loaded {
+            group: g,
+            bytes,
+            data_at: p,
+            ends,
+        })
     }
+}
 
-    fn decode_list(&self, list: &[u8]) -> Result<Vec<u32>> {
+impl IdList<'_> {
+    /// How many ids the list holds, from its leading count and without
+    /// decoding the ids. The count is checked against what the file and the
+    /// list's own bytes can hold.
+    pub fn id_count(&self) -> Result<u64> {
         let mut p = 0usize;
-        let n = get_varint(list, &mut p)?;
-        if n > self.meta.ids
-            || (n > INLINE_MAX as u64 && n.div_ceil(BLOCK as u64) > list.len() as u64)
+        let n = get_varint(self.bytes, &mut p)?;
+        if n > self.max_ids
+            || (n > INLINE_MAX as u64 && n.div_ceil(BLOCK as u64) > self.bytes.len() as u64)
         {
             return corrupt("list claims more ids than the file or its bytes can hold");
         }
-        let n = n as usize;
+        Ok(n)
+    }
+
+    /// The ascending ids.
+    pub fn decode(&self) -> Result<Vec<u32>> {
+        let list = self.bytes;
+        let n = self.id_count()? as usize;
+        let mut p = 0usize;
+        get_varint(list, &mut p)?;
         let mut out = Vec::with_capacity(n.min(BLOCK * 32));
         let mut next_min = 0u64;
         if n <= INLINE_MAX {

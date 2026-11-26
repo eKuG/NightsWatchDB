@@ -382,9 +382,10 @@ list    = varint n, then
           n >  8:  blocks of 128 ids as in the postings (width byte, packed gaps),
                    without a skip table
 crc     = u32 CRC-32C of the header and lists of the group
-index   = per group: u32 first key, u64 offset of the group   (12 bytes)
+index   = per group: u32 first key, u64 offset of the group,
+          u32 CRC-32C of the group (the same value as the group's crc)   (16 bytes)
 footer  = 40 bytes:
-   0  u32  format version (1)
+   0  u32  format version (2)
    4  u32  groups
    8  u64  keys
   16  u64  ids
@@ -398,16 +399,22 @@ current group **before** adding a list that would take it past 32 KiB; that
 list starts the next group, and a list that is over 32 KiB by itself is a group
 of its own. So a read of a small list never fetches or checksums a large
 neighbour; it fetches one group of at most 32 KiB plus its header (a large
-list pays only for itself). The rule is the writer's alone: the layout and
-what a reader accepts are unchanged, so the format version stays 1 and files
-written before the rule are still read. The group's checksum is verified every
-time one of its keys is read.
+list pays only for itself). The group's checksum is verified every time the
+group is read, against the one in the group and the one in the group index. The
+footer checksum covers the group index, so a caller that records the footer
+checksum (`IdListMeta::footer_crc`) elsewhere binds every group of the file to
+that record; version 1 files, which have no checksum in the group index, are
+not read.
+
+`IdListReader::for_each(keys, f)` gives `f` the list of each key in turn
+(`IdList::id_count` reads the length of a list from its head, `IdList::decode`
+the ids) and keeps the group it read last, so keys in ascending order read each
+group once. `get` is `for_each` of one key.
 
 The writer holds one group (up to 32 KiB, or one encoded list if that is
 larger) plus the list being added, and **16 bytes per group** already written
-(a `u32` key and a `u64` offset, held until `finish`); the reader holds 12
-bytes per group (a `u32` and a `u64` in two vectors, at most 12 bytes per 128
-keys).
+(a `u32` key, a `u64` offset and a `u32` checksum, held until `finish`); the
+reader holds 16 bytes per group (at most 16 bytes per 128 keys).
 
 ## Tests
 

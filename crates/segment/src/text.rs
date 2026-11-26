@@ -10,7 +10,9 @@ use crate::index::FileChecksum;
 use crate::writer::{Digest, SharedFile};
 use crate::{TEXT_INDEX_FILE, TEXT_ROWS_FILE};
 use nwdb_core::{Error, Result};
-use nwdb_textindex::{IdListMeta, IdListWriter, IndexBuilder, IndexMeta, IndexOptions};
+use nwdb_textindex::{
+    IdListMeta, IdListWriter, IndexBuilder, IndexMeta, IndexOptions, IndexReader,
+};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
@@ -35,6 +37,10 @@ const PAIR_BYTES: usize = 8;
 pub(crate) struct TextFinished {
     pub index: FileChecksum,
     pub rows: FileChecksum,
+    /// The checksums in the footers of the two files, which cover what the
+    /// files' own checksums chain to.
+    pub index_footer: u32,
+    pub rows_footer: u32,
 }
 
 /// Builds `text.idx` and `text.rows` while a part is written.
@@ -98,11 +104,14 @@ impl TextWriter {
         let rows_file = Arc::new(File::create_new(&self.rows_path)?);
         let digest = Arc::new(Digest::default());
         let out = SharedFile::new(rows_file.clone(), digest.clone());
-        self.pairs.finish(pieces, out)?;
+        let rows_meta = self.pairs.finish(pieces, out)?;
         rows_file.sync_all()?;
+        let index_footer = IndexReader::open(self.index_file.try_clone()?)?.footer_crc();
         Ok(TextFinished {
             index: self.index_digest.get(),
             rows: digest.get(),
+            index_footer,
+            rows_footer: rows_meta.footer_crc,
         })
     }
 }

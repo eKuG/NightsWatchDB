@@ -83,15 +83,35 @@ fn corrupt(file: &str, msg: impl std::fmt::Display) -> Error {
 }
 
 /// A library error that names no file gets the file's name; a short read of a
-/// file whose length was checked means the file changed under us.
+/// file whose length was checked means the file changed under us. A key the
+/// file does not have is a file that does not match the part, not a missing
+/// resource.
 fn named(file: &str, e: Error) -> Error {
     match e {
-        Error::Corrupt(m) => corrupt(file, m),
+        // An error that already names the file is left as it is.
+        Error::Corrupt(m) if m.starts_with(&format!("{file}: ")) => Error::Corrupt(m),
+        Error::Corrupt(m) | Error::NotFound(m) => corrupt(file, m),
         Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
             corrupt(file, "file ended before its recorded length")
         }
         other => other,
     }
+}
+
+/// Refuses a file whose footer checksum is not the one `traces.idx` recorded:
+/// it is not the file this part wrote, whatever its length.
+fn check_footer(file: &str, found: u32, recorded: u32) -> Result<()> {
+    if found != recorded {
+        return Err(corrupt(
+            file,
+            format!(
+                "footer checksum is {found:#010x} but {} recorded {recorded:#010x}: not the \
+                 file this part wrote",
+                crate::INDEX_FILE
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn open_file(dir: &Path, name: &str, recorded_len: u64) -> Result<File> {
@@ -113,9 +133,13 @@ fn open_file(dir: &Path, name: &str, recorded_len: u64) -> Result<File> {
 }
 
 impl TextFiles {
-    /// Opens both files, checking their lengths against the record and that
-    /// they cover the part's `pieces`. The checksums are not read here; see
-    /// [`PartReader::verify`].
+    /// Opens both files, checking their lengths and footer checksums against
+    /// the record and that they cover the part's `pieces`. The footer of each
+    /// file covers its directory (`text.idx`: the checksum of every segment) or
+    /// its group index (`text.rows`: the checksum of every group), and a
+    /// segment or a group is checked against those when it is read, so every
+    /// later read is bound to `traces.idx` without reading the files now. The
+    /// whole-file checksums are not read here; see [`PartReader::verify`].
     pub(crate) fn open(dir: &Path, sums: &FileChecksums, pieces: u64) -> Result<Self> {
         let index_file = open_file(dir, TEXT_INDEX_FILE, sums.text_index.len)?;
         let rows_file = open_file(dir, TEXT_ROWS_FILE, sums.text_rows.len)?;
@@ -123,8 +147,13 @@ impl TextFiles {
             IndexReader::open(index_file.try_clone()?).map_err(|e| named(TEXT_INDEX_FILE, e))?;
         let rows =
             IdListReader::open(rows_file.try_clone()?).map_err(|e| named(TEXT_ROWS_FILE, e))?;
-        // Cheap evidence that the files belong to this part's store: both
-        // are made for exactly its pieces.
+        check_footer(TEXT_INDEX_FILE, index.footer_crc(), sums.text_index_footer)?;
+        check_footer(
+            TEXT_ROWS_FILE,
+            rows.meta().footer_crc,
+            sums.text_rows_footer,
+        )?;
+        // Both files are made for exactly this part's pieces.
         if index.doc_count() != pieces {
             return Err(corrupt(
                 TEXT_INDEX_FILE,
@@ -179,11 +208,13 @@ fn file_checksum(name: &str, file: &File, len: u64) -> Result<FileChecksum> {
     Ok(FileChecksum { len, crc32c: crc })
 }
 
-/// True if the query holds a `Not` anywhere.
-fn has_not(q: &Query) -> bool {
+/// True if evaluating the query needs the set of all rows: it holds a `Not`,
+/// or an `And` with no operands, which is every row.
+fn needs_universe(q: &Query) -> bool {
     match q {
         Query::Not(_) => true,
-        Query::And(v) | Query::Or(v) => v.iter().any(has_not),
+        Query::And(v) => v.is_empty() || v.iter().any(needs_universe),
+        Query::Or(v) => v.iter().any(needs_universe),
         _ => false,
     }
 }
@@ -227,31 +258,22 @@ impl PartReader {
         }
         t.index.verify().map_err(|e| named(TEXT_INDEX_FILE, e))?;
         // The CRC-32C above covers every list of `text.rows`, so the lists are
-        // as the writer made them; reading every one back to check its rows
-        // would read each 32 KiB group once per key in it. A row number
-        // outside the part is refused when a search reads it.
+        // as the writer made them. A row number outside the part is refused
+        // when a search reads it.
         Ok(())
     }
 
-    /// The rows that refer to a piece, checked to lie inside the part.
-    fn piece_rows(&self, piece: u32) -> Result<Vec<u32>> {
-        let rows = self
-            .text
-            .rows
-            .get(piece)
-            .map_err(|e| named(TEXT_ROWS_FILE, e))?;
-        if let Some(&last) = rows.last()
-            && u64::from(last) >= self.row_count()
-        {
+    /// Refuses piece ids that the part's pieces do not have: `text.idx` names
+    /// a document the piece store has no piece for.
+    fn check_pieces(&self, pieces: &[u32]) -> Result<()> {
+        let count = self.text.rows.keys();
+        if let Some(&bad) = pieces.iter().find(|&&p| u64::from(p) >= count) {
             return Err(corrupt(
-                TEXT_ROWS_FILE,
-                format!(
-                    "piece {piece} lists row {last} but the part has {} rows",
-                    self.row_count()
-                ),
+                TEXT_INDEX_FILE,
+                format!("document {bad} but the part has {count} pieces"),
             ));
         }
-        Ok(rows)
+        Ok(())
     }
 
     /// The ascending rows whose text matches `query`.
@@ -279,12 +301,12 @@ impl PartReader {
     /// them. A caller that searches several parts subtracts this from the
     /// limit it gives the next part.
     pub fn search_counted(&self, query: &Query, limits: &SearchLimits) -> Result<(Vec<u32>, u64)> {
-        let universe: Vec<u32> = if has_not(query) {
+        let universe: Vec<u32> = if needs_universe(query) {
             let rows = self.row_count();
             if rows > limits.max_leaf_rows as u64 {
                 return Err(Error::invalid_argument(format!(
-                    "the query has a negation, which covers all {rows} rows of a part, more \
-                     than the limit of {} rows a leaf may produce",
+                    "the query has a negation or an empty AND, which covers all {rows} rows of \
+                     a part, more than the limit of {} rows a leaf may produce",
                     limits.max_leaf_rows
                 )));
             }
@@ -354,6 +376,7 @@ impl PartReader {
         spent: &mut u64,
         holds: impl Fn(&[u8]) -> bool,
     ) -> Result<Vec<u32>> {
+        self.check_pieces(&candidates)?;
         let store = self.piece_store();
         let mut total = *spent;
         for &id in &candidates {
@@ -378,10 +401,12 @@ impl PartReader {
         Ok(confirmed)
     }
 
-    /// The ascending rows that refer to any of `pieces`.
+    /// The ascending rows that refer to any of `pieces`, which are ascending.
     ///
-    /// The rows are collected and sorted when they pass twice the limit, so a
-    /// row that many pieces share does not count many times, and the memory is
+    /// Each group of `text.rows` is read once. A list longer than the limit is
+    /// refused from its count, before it is decoded. The rows are collected
+    /// and sorted when a list would take them past twice the limit, so a row
+    /// that many pieces share does not count many times, and the memory is
     /// about twice the limit however many pieces there are.
     fn pieces_to_rows(
         &self,
@@ -389,6 +414,7 @@ impl PartReader {
         leaf: &Leaf<'_>,
         limits: &SearchLimits,
     ) -> Result<Vec<u32>> {
+        self.check_pieces(pieces)?;
         let limit = limits.max_leaf_rows;
         let too_broad = || {
             Error::invalid_argument(format!(
@@ -396,17 +422,37 @@ impl PartReader {
                 describe(leaf)
             ))
         };
+        let row_count = self.row_count();
         let mut rows: Vec<u32> = Vec::new();
-        for &piece in pieces {
-            rows.extend(self.piece_rows(piece)?);
-            if rows.len() > limit.saturating_mul(2) {
-                rows.sort_unstable();
-                rows.dedup();
-                if rows.len() > limit {
+        self.text
+            .rows
+            .for_each(pieces.iter().copied(), |piece, list| {
+                let n = list.id_count()?;
+                // The ids of one list are distinct, so a list over the limit is
+                // over it whatever else is collected.
+                if n > limit as u64 {
                     return Err(too_broad());
                 }
-            }
-        }
+                if rows.len() as u64 + n > (limit as u64).saturating_mul(2) {
+                    rows.sort_unstable();
+                    rows.dedup();
+                    if rows.len() > limit {
+                        return Err(too_broad());
+                    }
+                }
+                let ids = list.decode()?;
+                if let Some(&last) = ids.last()
+                    && u64::from(last) >= row_count
+                {
+                    return Err(corrupt(
+                        TEXT_ROWS_FILE,
+                        format!("piece {piece} lists row {last} but the part has {row_count} rows"),
+                    ));
+                }
+                rows.extend(ids);
+                Ok(())
+            })
+            .map_err(|e| named(TEXT_ROWS_FILE, e))?;
         rows.sort_unstable();
         rows.dedup();
         if rows.len() > limit {

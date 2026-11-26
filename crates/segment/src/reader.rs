@@ -1176,9 +1176,11 @@ impl PartReader {
     /// store: each must be well formed, refer to pieces that exist, rebuild to
     /// the checksum it carries, and together the ropes must refer to exactly the
     /// bytes of pieces that `pieces.idx` records. Fails with [`Error::Corrupt`]
-    /// naming the file on a mismatch. A part that passes can be read, and can
-    /// be opened again: whatever `open` checks, this checks against the files
-    /// as they are now, including the trailing checksum of `pieces.idx`.
+    /// naming the file on a mismatch. `verify` checks the files this reader
+    /// holds open: a part that passes verify opens, as long as its files were
+    /// not replaced after this reader opened them. Whatever `open` checks, this
+    /// checks against those files as they are now, including the trailing
+    /// checksum of `pieces.idx` and the footer checksums of the text files.
     ///
     /// This costs a sequential read of the part and a rebuild of every value,
     /// so [`open`](Self::open) does not do it; compaction and a scrubber

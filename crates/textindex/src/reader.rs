@@ -655,6 +655,7 @@ pub struct IndexReader<S: ReadAt> {
     src: S,
     meta: IndexMeta,
     segments: Vec<Segment>,
+    footer_crc: u32,
 }
 
 impl<S: ReadAt> IndexReader<S> {
@@ -734,6 +735,7 @@ impl<S: ReadAt> IndexReader<S> {
             src,
             meta,
             segments,
+            footer_crc: stored_crc,
         })
     }
 
@@ -821,6 +823,13 @@ impl<S: ReadAt> IndexReader<S> {
     /// Counts describing the index.
     pub fn meta(&self) -> &IndexMeta {
         &self.meta
+    }
+
+    /// The checksum in the footer. It covers the directory, which holds the
+    /// checksum of every segment, so two files with the same value hold the
+    /// same segments.
+    pub fn footer_crc(&self) -> u32 {
+        self.footer_crc
     }
 
     /// Checks the checksums of every segment now instead of on first use.

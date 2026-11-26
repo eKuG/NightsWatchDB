@@ -917,6 +917,9 @@ fn damage_to_the_text_files_is_corrupt_and_never_a_wrong_answer() {
     }
 }
 
+/// The text files of another part are refused at open, naming the file that
+/// was swapped, whether one is swapped or both. (Files of the same length are
+/// in `search_binding.rs`.)
 #[test]
 fn text_files_of_another_part_are_refused() {
     let mut rng = StdRng::seed_from_u64(21);
@@ -926,18 +929,21 @@ fn text_files_of_another_part_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let pa = write_part(tmp.path(), 1, &a, 20, options());
     let pb = write_part(tmp.path(), 2, &b, 20, options());
-    let scratch = tempfile::tempdir().unwrap();
-    let dir = scratch.path().join("p");
-    copy_dir(&pa, &dir);
-    std::fs::copy(pb.join(TEXT_INDEX_FILE), dir.join(TEXT_INDEX_FILE)).unwrap();
-    std::fs::copy(pb.join(TEXT_ROWS_FILE), dir.join(TEXT_ROWS_FILE)).unwrap();
-    // Whatever open decides, verify cannot accept them, and a search is right
-    // or Corrupt.
-    match PartReader::open(&dir) {
-        Err(e) => assert!(name_of(&e), "{e}"),
-        Ok(r) => {
-            let e = r.verify().unwrap_err();
-            assert!(name_of(&e), "{e}");
+    for (files, named) in [
+        (vec![TEXT_INDEX_FILE], TEXT_INDEX_FILE),
+        (vec![TEXT_ROWS_FILE], TEXT_ROWS_FILE),
+        (vec![TEXT_INDEX_FILE, TEXT_ROWS_FILE], TEXT_INDEX_FILE),
+    ] {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("p");
+        copy_dir(&pa, &dir);
+        for f in &files {
+            std::fs::copy(pb.join(f), dir.join(f)).unwrap();
+        }
+        match PartReader::open(&dir) {
+            Err(Error::Corrupt(m)) => assert!(m.contains(named), "{files:?}: {m}"),
+            Err(e) => panic!("{files:?}: open gave {e}, not Corrupt"),
+            Ok(_) => panic!("{files:?}: the part opened"),
         }
     }
 }

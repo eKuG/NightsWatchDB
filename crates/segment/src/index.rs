@@ -11,7 +11,7 @@ const MAGIC: &[u8; 4] = b"NWTI";
 /// file of a part that is read before any other, so it is where an older part
 /// is recognised.
 const VERSION: u32 = crate::FORMAT_VERSION;
-const HEADER_LEN: usize = 4 + 4 + 8 + 6 * (8 + 4);
+const HEADER_LEN: usize = 4 + 4 + 8 + 6 * (8 + 4) + 4 + 4;
 const RECORD_LEN: usize = 44;
 const CRC_LEN: usize = 4;
 
@@ -51,6 +51,12 @@ pub(crate) struct FileChecksums {
     pub pieces_idx: FileChecksum,
     pub text_index: FileChecksum,
     pub text_rows: FileChecksum,
+    /// The checksum in the footer of `text.idx`, which covers its directory
+    /// and so the checksum of every segment.
+    pub text_index_footer: u32,
+    /// The checksum in the footer of `text.rows`, which covers its group
+    /// index and so the checksum of every group.
+    pub text_rows_footer: u32,
 }
 
 /// What `traces.idx` holds.
@@ -77,6 +83,8 @@ pub(crate) fn encode(entries: &[TraceEntry], checksums: FileChecksums) -> Vec<u8
         out.extend_from_slice(&c.len.to_le_bytes());
         out.extend_from_slice(&c.crc32c.to_le_bytes());
     }
+    out.extend_from_slice(&checksums.text_index_footer.to_le_bytes());
+    out.extend_from_slice(&checksums.text_rows_footer.to_le_bytes());
     push_records(&mut out, entries);
     let crc = crc32c::crc32c(&out);
     out.extend_from_slice(&crc.to_le_bytes());
@@ -147,6 +155,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
         pieces_idx: sum_at(52),
         text_index: sum_at(64),
         text_rows: sum_at(76),
+        text_index_footer: le_u32(&body[88..92]),
+        text_rows_footer: le_u32(&body[92..96]),
     };
     let mut entries: Vec<TraceEntry> = Vec::with_capacity(count as usize);
     for r in body[header_len..].as_chunks::<RECORD_LEN>().0 {
@@ -198,13 +208,15 @@ mod tests {
             len: 12,
             crc32c: 13,
         },
+        text_index_footer: 14,
+        text_rows_footer: 15,
     };
 
     #[test]
     fn round_trip() {
         let all: Vec<_> = (1..50).map(entry).collect();
         let bytes = encode(&all, SUMS);
-        assert_eq!(bytes.len(), 88 + 49 * 44 + 4);
+        assert_eq!(bytes.len(), 96 + 49 * 44 + 4);
         let got = decode(&bytes).unwrap();
         assert_eq!(got.entries, all);
         assert_eq!(got.checksums, SUMS);
@@ -213,7 +225,7 @@ mod tests {
     #[test]
     fn an_older_version_is_refused_before_anything_else_is_checked() {
         let mut bytes = encode(&[entry(1)], SUMS);
-        for old in [1u32, 2] {
+        for old in [1u32, 2, 3, 4, 5, 6] {
             bytes[4..8].copy_from_slice(&old.to_le_bytes());
             // Truncated and with a wrong checksum: the version still wins.
             for b in [&bytes[..], &bytes[..12]] {

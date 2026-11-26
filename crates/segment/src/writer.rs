@@ -38,7 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// every rope that has a reference; version 6 adds the length of the rebuilt
 /// value to those ropes, and the text index and the piece-to-rows lists,
 /// `text.idx` and `text.rows`, whose length and CRC-32C are in `traces.idx`
-/// too; version 7 adds the `arrival` column to `spans.parquet`.
+/// too; version 7 adds the `arrival` column to `spans.parquet`, adds the
+/// CRC-32C of each group to the group index of `text.rows`, and records the
+/// footer checksums of `text.idx` and `text.rows` in `traces.idx`.
 pub const FORMAT_VERSION: u32 = 7;
 
 /// The default for [`WriterOptions::dedup_window_bytes`]: 64 MiB.
@@ -717,6 +719,8 @@ impl PartWriter {
         let TextFinished {
             index: text_index_sum,
             rows: text_rows_sum,
+            index_footer: text_index_footer,
+            rows_footer: text_rows_footer,
         } = text.finish(store.totals.pieces)?;
         let spans_sum = self.spans_digest.get();
         let summary_sum = self.write_summary()?;
@@ -750,6 +754,8 @@ impl PartWriter {
             pieces_idx: idx_sum,
             text_index: text_index_sum,
             text_rows: text_rows_sum,
+            text_index_footer,
+            text_rows_footer,
         };
         write_synced(
             &self.tmp_dir.join(INDEX_FILE),

@@ -10,9 +10,10 @@ use nwdb_core::{
 };
 use nwdb_payload::rope;
 use nwdb_payload::{PieceWriter, PieceWriterOptions, StoreSummary};
+use nwdb_segment::textindex::{IdListWriter, IndexBuilder, IndexOptions};
 use nwdb_segment::{
-    INDEX_FILE, MergeOptions, PIECES_BLK, PIECES_IDX, PartReader, PartWriter, WriterOptions,
-    merge_parts,
+    INDEX_FILE, MergeOptions, PIECES_BLK, PIECES_IDX, PartReader, PartWriter, TEXT_INDEX_FILE,
+    TEXT_ROWS_FILE, WriterOptions, merge_parts,
 };
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -118,6 +119,40 @@ fn install(part: &Path, store: &Path, sum: &StoreSummary) {
     std::fs::write(part.join(INDEX_FILE), &index).unwrap();
 }
 
+/// Replaces `text.idx` and `text.rows` with files for a part of `pieces`
+/// pieces (every piece has a word and no row refers to it) and patches the
+/// lengths and checksums `traces.idx` records for them, and its own checksum:
+/// the text files a writer would have made for a store of that many pieces.
+fn install_text(part: &Path, pieces: u32) {
+    let mut idx = Vec::new();
+    let mut builder = IndexBuilder::new(IndexOptions::default(), &mut idx);
+    for id in 0..pieces {
+        builder.add(id, b"word").unwrap();
+    }
+    builder.finish().unwrap();
+    let mut rows = Vec::new();
+    let mut lists = IdListWriter::new(&mut rows);
+    for _ in 0..pieces {
+        lists.push(&[]).unwrap();
+    }
+    lists.finish().unwrap();
+    let mut index = std::fs::read(part.join(INDEX_FILE)).unwrap();
+    for (name, bytes, at, footer_at) in [
+        (TEXT_INDEX_FILE, idx, 64, 88),
+        (TEXT_ROWS_FILE, rows, 76, 92),
+    ] {
+        std::fs::write(part.join(name), &bytes).unwrap();
+        index[at..at + 8].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        index[at + 8..at + 12].copy_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+        // The footer ends with its checksum and then four bytes of magic.
+        index[footer_at..footer_at + 4].copy_from_slice(&bytes[bytes.len() - 8..bytes.len() - 4]);
+    }
+    let body = index.len() - 4;
+    let crc = crc32c::crc32c(&index[..body]);
+    index[body..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(part.join(INDEX_FILE), &index).unwrap();
+}
+
 fn corrupt(e: Error) -> String {
     match e {
         Error::Corrupt(m) => m,
@@ -156,42 +191,56 @@ fn a_store_of_another_text_is_never_read_as_this_parts_text_in_any_column() {
     }
 }
 
+/// A part of `column` whose piece store has fewer pieces than its text files
+/// cover.
+fn part_with_a_store_of_fewer_pieces(parts: &Path, column: Column) -> PathBuf {
+    let values = vec![random(1, 2048), random(2, 2048)];
+    let part = write_part(parts, 1, column, &[1, 2], &values);
+    let original = PartReader::open(&part).unwrap();
+    let store = original.piece_store();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut w = PieceWriter::create(scratch.path(), PieceWriterOptions::default()).unwrap();
+    let mut session = store.session();
+    for id in 0..4 {
+        let mut piece = Vec::new();
+        store.read_piece(&mut session, id, &mut piece).unwrap();
+        w.add(&piece).unwrap();
+    }
+    let sum = w.finish().unwrap();
+    drop(original);
+    install(&part, scratch.path(), &sum);
+    part
+}
+
+/// The text index lists one document per piece, so a store with fewer pieces
+/// is refused when the part is opened.
+#[test]
+fn a_store_with_fewer_pieces_than_the_text_files_cover_is_refused_at_open() {
+    for column in COLUMNS {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = part_with_a_store_of_fewer_pieces(tmp.path(), column);
+        let m = corrupt(PartReader::open(&part).err().expect("the part opened"));
+        assert!(
+            m.contains(TEXT_INDEX_FILE) && m.contains("pieces"),
+            "{column:?}: {m}"
+        );
+    }
+}
+
+/// With text files that cover the smaller store (as a writer would have made
+/// them) the part opens, and the read of a rope that refers to a piece the store
+/// does not have must be an error, in each raw column, and not another text.
 #[test]
 fn a_store_with_fewer_pieces_is_an_error_not_other_text_in_any_column() {
     for column in COLUMNS {
         let tmp = tempfile::tempdir().unwrap();
-        let values = vec![random(1, 2048), random(2, 2048)];
-        let part = write_part(tmp.path(), 1, column, &[1, 2], &values);
-        let original = PartReader::open(&part).unwrap();
-
-        let store = original.piece_store();
-        let scratch = tempfile::tempdir().unwrap();
-        let mut w = PieceWriter::create(scratch.path(), PieceWriterOptions::default()).unwrap();
-        let mut session = store.session();
-        for id in 0..4 {
-            let mut piece = Vec::new();
-            store.read_piece(&mut session, id, &mut piece).unwrap();
-            w.add(&piece).unwrap();
-        }
-        let sum = w.finish().unwrap();
-        drop(original);
-        install(&part, scratch.path(), &sum);
-
-        // The text index lists one document per piece, so a store with fewer
-        // pieces is refused when the part is opened. Should that check ever
-        // go, the read and `verify` must still refuse it.
-        match PartReader::open(&part) {
-            Err(e) => {
-                let m = corrupt(e);
-                assert!(m.contains("piece"), "{column:?}: {m}");
-            }
-            Ok(reader) => {
-                let rows = reader.row_count();
-                let m = corrupt(reader.read_rows(0, rows, None).unwrap_err());
-                assert!(m.contains("piece"), "{column:?}: {m}");
-                corrupt(reader.verify().unwrap_err());
-            }
-        }
+        let part = part_with_a_store_of_fewer_pieces(tmp.path(), column);
+        install_text(&part, 4);
+        let reader = PartReader::open(&part).unwrap();
+        let rows = reader.row_count();
+        let m = corrupt(reader.read_rows(0, rows, None).unwrap_err());
+        assert!(m.contains("piece"), "{column:?}: {m}");
+        corrupt(reader.verify().unwrap_err());
     }
 }
 

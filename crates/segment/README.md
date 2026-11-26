@@ -209,17 +209,20 @@ offset  size   field
 72      4      CRC-32C of every byte of text.idx, u32
 76      8      length of text.rows in bytes, u64
 84      4      CRC-32C of every byte of text.rows, u32
-88      44*N   records, sorted by trace_id (bytes compared in order)
-88+44N  4      CRC-32C (Castagnoli) of every byte before it
+88      4      the checksum in the footer of text.idx, u32 (see below)
+92      4      the checksum in the footer of text.rows, u32 (see below)
+96      44*N   records, sorted by trace_id (bytes compared in order)
+96+44N  4      CRC-32C (Castagnoli) of every byte before it
 ```
 
 The version is the first thing checked when a part is opened, before the
 lengths, the checksum or the Parquet schema. An index with any other version
 is refused with an error that gives the version the part has and the one this
 build reads, and says that parts from development versions cannot be read.
-Versions 2 and 3 had shorter headers, version 4 ropes have no checksum, and
-version 5 ropes have no length and version 5 parts no text files; there is no
-migration, since the project has had no release.
+Versions 2 and 3 had shorter headers, version 4 ropes have no checksum,
+version 5 ropes have no length and version 5 parts no text files, and version 6
+parts have no footer checksums for the text files and no checksum per group in
+`text.rows`; there is no migration, since the project has had no release.
 
 Parquet 60.2.0 writes no page checksums and zstd's frame checksum is off, so
 damage that leaves the file structure intact would otherwise be returned as
@@ -240,6 +243,18 @@ it is that trailing checksum, which depends on every block's checksum. The
 other recorded CRCs are over every byte of their file. Since nothing re-reads
 those four bytes after open, `verify` reads them again and compares them with
 the CRC-32C of the rest of the file.
+
+The two footer checksums bind the text files to the part the way the checksum of
+`pieces.idx` binds the piece files. The footer of `text.idx` ends with a CRC-32C
+of the file's directory, which holds the CRC-32C of every segment, and of the
+rest of the footer. The footer of `text.rows` ends with a CRC-32C of the group
+index, which holds the CRC-32C of every group, and of the rest of the footer.
+`open` reads both footers (it reads them anyway) and refuses a file whose footer
+checksum is not the recorded one, so the text files of another part are refused
+at open whatever their lengths. After that no byte of either file is trusted
+unchecked: a segment of `text.idx` is checked against the CRC-32C in the
+directory the first time it is used, and a group of `text.rows` is checked
+against the CRC-32C in the group index every time it is read.
 
 A record:
 
@@ -268,9 +283,10 @@ disjoint, so a time-range listing reads only the groups that overlap the range.
 `PartReader::open` fails with `Error::Corrupt`, naming the file, when a file is
 missing, `traces.idx` fails a check, the length of a file (any of the seven)
 differs from the one recorded in the index, `text.idx` or `text.rows` fails the
-open checks of its own format (footer, directory, group index) or does not
-cover exactly the part's pieces (a different number of documents or of lists
-than `pieces.idx` has pieces), `pieces.idx` fails its own checks (magic, version,
+open checks of its own format (footer, directory, group index), has a footer
+checksum other than the one the index recorded (it is the file of another part),
+or does not cover exactly the part's pieces (a different number of documents or
+of lists than `pieces.idx` has pieces), `pieces.idx` fails its own checks (magic, version,
 checksum, tables that do not fill the blocks), a Parquet file does not have the
 expected columns, the index's ranges do not match the number of rows, or the
 summary's row count differs from the trace count. The two piece files are
@@ -284,12 +300,15 @@ the lengths. A `pieces.blk` of the same length alone, with this part's
 are read and by `verify`. Open does not read the data pages or the blocks of
 the piece store.
 
-- **A part that passes `verify` opens.** `verify` checks again, against the
-  files as they are now, everything `open` checks: it reads `traces.idx` again
-  and requires it to decode to what was decoded at open (through the handle kept
-  from open, so it works after the directory has been removed, like the other
-  files), and it
-  checks the trailing checksum of `pieces.idx` against the rest of that file.
+- **A part that passes `verify` opens, as long as its files were not replaced
+  after this reader opened them.** `verify` checks the files this reader holds
+  open. It checks again, against those files as they are now, everything `open`
+  checks: it reads `traces.idx` again and requires it to decode to what was
+  decoded at open (through the handle kept from open, so it works after the
+  directory has been removed, like the other files), and it checks the trailing
+  checksum of `pieces.idx` against the rest of that file. A file replaced by a
+  rename after open (a restore or a copy tool does this) is not seen by `verify`,
+  and the next `open` reads the new file.
   `merge_parts`'s input check (without the walk over the ropes) does the same.
   A test flips a bit at every offset of every file of a small part, and at a
   sample of offsets of a larger one, and requires that either `verify` on the
@@ -410,9 +429,11 @@ For each leaf of the query the index gives candidate pieces. Where the library
 says the index alone cannot decide (a phrase; a word of more than 64 bytes),
 each candidate piece is read once, in the order of its blocks
 (`PieceReader::read_sorted`), and checked with `phrase_matches` /
-`contains_token`. The confirmed pieces become rows through `text.rows` and are
-united. Then `nwdb_textindex::evaluate` combines the leaves. The set of all
-rows is built only when the query contains a `NOT`.
+`contains_token`. The confirmed pieces become rows through `text.rows`, which is
+read one group at a time in ascending order of piece id, so a group is read once
+per leaf however many of its pieces match, and united. Then
+`nwdb_textindex::evaluate` combines the leaves. The set of all rows is built
+only when the query contains a `NOT` or an `AND` with no operands (every row).
 
 One query cannot hold a reader hostage. `SearchLimits` bounds, and a query over
 a bound is `Error::InvalidArgument` saying which (the reader is unharmed):
@@ -423,21 +444,27 @@ a bound is `Error::InvalidArgument` saying which (the reader is unharmed):
 | `max_confirm_bytes` | 256 MiB | the bytes of piece text read to confirm phrases and long words, over the whole query (a piece counts once per leaf that reads it) |
 | `max_leaf_rows` | 10 million | the rows one leaf may produce; for a query with a `NOT`, also the rows the part may have, since the universe is built |
 
-The rows of a leaf are collected and sorted when they pass twice the limit, so
-memory is about twice the limit in row numbers (80 MB at the default) however
-many pieces match. A test pins the memory of a query over 300,000 matching
+The count at the head of each list of `text.rows` is read before the list is
+decoded: a list longer than `max_leaf_rows` is refused without being decoded,
+and the rows collected so far are sorted and de-duplicated before a list is added
+that would take them past twice the limit. So memory is about twice the limit in
+row numbers (80 MB at the default) however many pieces match, and a piece shared
+by a million rows costs nothing before the query is refused. A test pins the memory of a query over 300,000 matching
 pieces with a limit of 100,000 rows, in a child process (4 MiB of growth).
 
 A reader is shared by threads and holds no mutable state for a search. A damaged
 `text.idx` or `text.rows` is `Corrupt` naming the file: the segments of the index
 are checksummed the first time they are used, each group of `text.rows` every time
-it is read, and a row number outside the part is refused. A search never returns
+it is read, a row number outside the part is refused, and so is a document of
+`text.idx` that is not a piece of the part. A search never returns
 a wrong answer because of damage: a test damages every byte of the ends of both
 files and a sample of the rest (truncation, extension, flipped bits) and
 requires `Corrupt` from `open`, `verify` or the search, and the right rows
-from any search that succeeds. Text files of another part are caught by their
-recorded lengths and, at open, by their counts of documents and lists; with equal
-counts only `verify` catches them (its whole-file CRC-32C).
+from any search that succeeds. A `text.idx` or `text.rows` of
+another part is refused at open, naming the file, by its length or by its footer
+checksum (see `traces.idx`), whatever its length; the counts of documents and
+lists are checked as well, and every read of either file is checked against a
+checksum that chains back to `traces.idx`.
 
 `PartReader::text_stats()` reports the sizes of the two files and what they
 cover. `PartReader::max_start_ns()` is the largest maximum in the statistics of
@@ -652,4 +679,7 @@ rebuilt value to every rope that has a reference, after its checksum, and adds
 the text index and the piece-to-rows lists, `text.idx` and `text.rows`, and
 records their lengths and checksums in the index header (the header grows from
 64 to 88 bytes); 7 adds the `arrival` column (`UInt64`, the last column) to
-`spans.parquet`.
+`spans.parquet`, adds the CRC-32C of each group to the group index of
+`text.rows` (the id-list format version becomes 2), and records the footer
+checksums of `text.idx` and `text.rows` in the index header (the header grows
+from 88 to 96 bytes).

@@ -579,6 +579,13 @@ fn index_file_known_answer() {
         want.extend_from_slice(&crc32c::crc32c(counted).to_le_bytes());
     }
     assert_eq!(want.len(), 88);
+    // The footer checksums of the two text files, each four bytes before the
+    // 4-byte magic that ends the file.
+    for file in [TEXT_INDEX_FILE, TEXT_ROWS_FILE] {
+        let bytes = std::fs::read(dir.join(file)).unwrap();
+        want.extend_from_slice(&bytes[bytes.len() - 8..bytes.len() - 4]);
+    }
+    assert_eq!(want.len(), 96);
     // Trace 0x05: first row 2, one row, start -50, end 40.
     want.extend_from_slice(&[0x05; 16]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
@@ -591,7 +598,7 @@ fn index_file_known_answer() {
     want.extend_from_slice(&[2, 0, 0, 0]);
     want.extend_from_slice(&[100, 0, 0, 0, 0, 0, 0, 0]);
     want.extend_from_slice(&[0x2C, 0x01, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(want.len(), 88 + 2 * 44);
+    assert_eq!(want.len(), 96 + 2 * 44);
     // CRC-32C of everything above, little-endian. The header holds the
     // checksums of the Parquet files, so this one is computed, with the
     // algorithm pinned by the check value at the top of the test.
@@ -677,7 +684,7 @@ fn corrupt_parts_are_rejected_at_open() {
         &|b| {
             // The first record's row count, made one larger, with a valid
             // checksum: the ranges no longer tile the Parquet rows.
-            b[88 + 24] = b[88 + 24].wrapping_add(1);
+            b[96 + 24] = b[96 + 24].wrapping_add(1);
             reseal(b);
         },
         "row ranges disagree with the Parquet file",
@@ -685,7 +692,7 @@ fn corrupt_parts_are_rejected_at_open() {
     expect_corrupt(
         &|b| {
             // Two records swapped: ids out of order, checksum valid.
-            let (first, second) = (88, 88 + 44);
+            let (first, second) = (96, 96 + 44);
             let a: Vec<u8> = b[first..second].to_vec();
             let c: Vec<u8> = b[second..second + 44].to_vec();
             b[first..second].copy_from_slice(&c);

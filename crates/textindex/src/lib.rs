@@ -55,7 +55,7 @@ mod tokenizer;
 pub mod ids;
 
 pub use builder::{DEFAULT_SEGMENT_BUDGET, IndexBuilder, IndexOptions, MIN_SEGMENT_BUDGET};
-pub use idlist::{IdListMeta, IdListReader, IdListWriter};
+pub use idlist::{IdList, IdListMeta, IdListReader, IdListWriter};
 pub use ids::DocIds;
 pub use meta::IndexMeta;
 pub use query::{
