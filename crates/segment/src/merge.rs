@@ -303,7 +303,7 @@ pub fn merge_parts(
             rows += trace_rows;
             next += 1;
         }
-        merger.merge_chunk(&parts)?;
+        merger.merge_chunk(&parts, &order[begin..next])?;
     }
     if !merger.builder.is_empty() {
         let batch = merger.builder.finish();
@@ -387,8 +387,8 @@ struct Merger<'a> {
 
 impl Merger<'_> {
     /// Writes the rows of the traces of one chunk, in output order.
-    fn merge_chunk(&mut self, parts: &[Part]) -> Result<()> {
-        let mut keys = self.read_keys(parts)?;
+    fn merge_chunk(&mut self, parts: &[Part], traces: &[OrderKey]) -> Result<()> {
+        let mut keys = self.read_keys(parts, traces)?;
         let before = keys.len();
         // The earliest arrival of a span id wins: inputs are oldest first, and
         // within an input the first row.
@@ -416,8 +416,14 @@ impl Merger<'_> {
     }
 
     /// The keys of every row of `parts`, read without touching the raw
-    /// columns or the piece stores.
-    fn read_keys(&self, parts: &[Part]) -> Result<Vec<KeyRow>> {
+    /// columns or the piece stores. `traces` are the traces of the chunk, which
+    /// `Part::trace` counts into.
+    ///
+    /// Every row is checked to be of the trace its input's index lists it
+    /// under. Parquet pages carry no checksum, so a damaged page can decode to
+    /// other ids; caught here, it is damage in a named input, not a confusing
+    /// refusal from the writer further on.
+    fn read_keys(&self, parts: &[Part], traces: &[OrderKey]) -> Result<Vec<KeyRow>> {
         let inputs = self.inputs;
         let mut keys = Vec::with_capacity(parts.iter().map(|p| p.count as usize).sum());
         for (i, input) in inputs.iter().enumerate() {
@@ -435,14 +441,19 @@ impl Merger<'_> {
                 let run = &mine[at..end];
                 let first = run[0].first;
                 let batches = input
-                    .read_rows_stored(first, run_end - first, Some(&[col::SPAN_ID, col::START_NS]))
+                    .read_rows_stored(
+                        first,
+                        run_end - first,
+                        Some(&[col::SPAN_ID, col::START_NS, col::TRACE_ID]),
+                    )
                     .map_err(|e| named(inputs, i, e))?;
                 let short = || damaged(inputs, i, "spans.parquet: fewer rows than the index lists");
                 let (mut part, mut left, mut row) = (0, run[0].count, first);
                 for batch in &batches {
-                    let (Some(spans), Some(starts)) = (
+                    let (Some(spans), Some(starts), Some(ids)) = (
                         batch.column(0).as_fixed_size_binary_opt(),
                         batch.column(1).as_primitive_opt::<Int64Type>(),
+                        batch.column(2).as_fixed_size_binary_opt(),
                     ) else {
                         return Err(damaged(inputs, i, "spans.parquet: unexpected column types"));
                     };
@@ -455,6 +466,16 @@ impl Merger<'_> {
                             .value(r)
                             .try_into()
                             .map_err(|_| damaged(inputs, i, "spans.parquet: bad span id"))?;
+                        let listed = traces
+                            .get(run[part].trace as usize)
+                            .map(|t| t.trace.as_slice());
+                        if listed != Some(ids.value(r)) {
+                            return Err(damaged(
+                                inputs,
+                                i,
+                                "spans.parquet: a row is not of the trace the index lists it under",
+                            ));
+                        }
                         keys.push(KeyRow {
                             trace: run[part].trace,
                             input: i as u16,

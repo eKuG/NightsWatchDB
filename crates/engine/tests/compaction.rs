@@ -633,7 +633,9 @@ fn a_damaged_input_fails_the_merge_without_harm_and_is_not_retried_until_restart
     let m_window1: Model = Model {
         spans: m.spans.iter().filter(|s| s.start >= W).cloned().collect(),
     };
-    // Damage a part of window 0 on disk: one byte in the middle of its rows.
+    // Damage a part of window 0 on disk: one byte of its rows. The rows are at
+    // the start of the file, right after the 4-byte magic; the middle of a
+    // small file is its footer, and a part with a damaged footer does not open.
     let victim = e
         .snapshot()
         .part_traces()
@@ -647,7 +649,8 @@ fn a_damaged_input_fails_the_merge_without_harm_and_is_not_retried_until_restart
         .join(part_dir_name(victim))
         .join("spans.parquet");
     let mut bytes = std::fs::read(&file).unwrap();
-    let at = bytes.len() / 2;
+    let at = 64;
+    assert!(bytes.len() > 4 * at, "the part is too small for this test");
     bytes[at] ^= 0xff;
     std::fs::write(&file, &bytes).unwrap();
 
