@@ -280,8 +280,12 @@ fn what_expired_while_the_engine_was_down_goes_at_start_up() {
 
     now.store(2 * W + R, Ordering::SeqCst);
     let e = open(with_clock(dir.path(), Some(R), &now));
-    wait_for("the start-up pass", || e.stats().parts == 1);
-    assert_eq!(e.stats().retention_parts_removed, 1);
+    // The counter is the last thing a removal updates, after the publish
+    // and the deletion of the directories, so it is what to wait for.
+    wait_for("the start-up pass", || {
+        e.stats().retention_parts_removed == 1
+    });
+    assert_eq!(e.stats().parts, 1);
     assert_eq!(part_dirs(dir.path()), manifest_ids(dir.path()));
     e.shutdown().unwrap();
 }
@@ -298,9 +302,10 @@ fn the_thread_runs_after_a_flush_and_every_interval() {
     ingest(&e, &[at(1, 1, 5)]).unwrap();
     e.flush().unwrap();
     wait_for("a pass after the flush", || {
-        e.stats().maintenance_passes > passes && e.stats().parts == 0
+        let s = e.stats();
+        s.maintenance_passes > passes && s.retention_parts_removed == 1
     });
-    assert_eq!(e.stats().retention_parts_removed, 1);
+    assert_eq!(e.stats().parts, 0);
     e.shutdown().unwrap();
 
     // Short interval: no flush, the clock moves.
