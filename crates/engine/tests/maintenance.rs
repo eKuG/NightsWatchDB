@@ -320,7 +320,8 @@ fn shutdown_during_a_pass_starts_no_further_merge_and_a_merge_error_then_is_no_f
 
 /// Shutdown while a merge is in progress: the merge ends without finishing,
 /// leaves no merged part and no directory behind, is no failure, and after a
-/// restart every span is there and the merge can be done. The hook starts the
+/// restart every span is there (also the ones the hook sent while shutdown was
+/// beginning, which are flushed by the shutdown) and the merge can be done. The hook starts the
 /// shutdown just before `merge_parts` is called, so the merge begins with the
 /// stop flag already set and ends at its first check.
 #[test]
@@ -329,10 +330,12 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
     let slot: Arc<Mutex<Option<Engine>>> = Arc::default();
     let shutdown: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
     let starts = Arc::new(AtomicU64::new(0));
+    let model = Arc::new(Mutex::new(Model::default()));
     let mut o = compact_opts(dir.path());
     o.compaction.retry_backoff = Duration::from_secs(3600);
     o.stage_hook = Some({
         let (slot, shutdown, starts) = (slot.clone(), shutdown.clone(), starts.clone());
+        let model = model.clone();
         Arc::new(move |s| {
             if s == Stage::MergeStarting && starts.fetch_add(1, Ordering::SeqCst) == 0 {
                 let e = slot.lock().unwrap().clone().unwrap();
@@ -342,8 +345,15 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
                 }));
                 // Ingest is refused once shutdown has begun, which is also
                 // when it has set the stop flag.
+                // What it accepts is in the model.
                 let t = Instant::now();
-                while ingest(&e, &[TSpan::new(99, 1, 5).root()]).is_ok() {
+                loop {
+                    let n = starts.fetch_add(1, Ordering::SeqCst) as u128;
+                    let span = TSpan::new(1_000 + n, 1, 5).root();
+                    if ingest(&e, std::slice::from_ref(&span)).is_err() {
+                        break;
+                    }
+                    model.lock().unwrap().add(&[span]);
                     assert!(
                         t.elapsed() < Duration::from_secs(30),
                         "shutdown did not begin"
@@ -356,12 +366,11 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
     });
     let e = open(o);
     *slot.lock().unwrap() = Some(e.clone());
-    let mut model = Model::default();
     for round in 0..3u128 {
         let spans: Vec<TSpan> = (0..5u128)
             .map(|k| TSpan::new(round * 10 + k + 1, 1, 1 + k as i64).root())
             .collect();
-        model.add(&spans);
+        model.lock().unwrap().add(&spans);
         ingest(&e, &spans).unwrap();
         e.flush().unwrap();
     }
@@ -372,22 +381,29 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
     let s = e.stats();
     slot.lock().unwrap().take();
     drop(e);
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
     assert!(outcome.is_ok(), "{outcome:?}");
     assert_eq!(s.merges_done, 0, "{s:?}");
     assert_eq!(s.last_compaction_error, None);
     assert!(!s.fatal);
-    assert_eq!(
-        part_dir_names(dir.path()),
-        parts_before,
-        "the abandoned merge left a directory or removed an input"
+    // The shutdown's own flush may have added one part; the merge added none and
+    // left no temporary directory.
+    let parts_after = part_dir_names(dir.path());
+    assert!(
+        parts_before.iter().all(|p| parts_after.contains(p)),
+        "an input was removed: {parts_after:?}"
+    );
+    assert!(
+        parts_after.len() <= parts_before.len() + 1
+            && parts_after.iter().all(|p| !p.contains("tmp")),
+        "the abandoned merge left a directory: {parts_after:?}"
     );
 
     // After a restart every span is there, and the merge can be done.
     let e = open(compact_opts(dir.path()));
+    let model = model.lock().unwrap().clone();
     model.check(&e, "after the restart");
     compact_fully(&e);
-    assert_eq!(e.stats().merges_done, 1);
+    assert!(e.stats().merges_done >= 1);
     model.check(&e, "after the merge");
     e.shutdown().unwrap();
 }
