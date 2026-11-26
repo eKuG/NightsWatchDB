@@ -485,6 +485,19 @@ func realMain() error {
 	add("exp_list1", listIn(exp.FromNs, exp.ToNs, url.Values{"service": {exp.Service}}))
 	add("exp_list2", listIn(exp.FromNs, exp.ToNs, url.Values{"model": {exp.Model}, "error": {"true"}}))
 	add("exp_agg", tokensOp(exp.FromNs, exp.ToNs, "chat"))
+	// Search of message text, newest 20 spans over all time. A dataset
+	// without text answers with no spans; the bytes column shows which.
+	search := func(q string) func(int) (string, url.Values) {
+		return func(int) (string, url.Values) { return "/api/v1/search", url.Values{"q": {q}, "limit": {"20"}} }
+	}
+	add("search_word", search("traceback"))
+	add("search_common_word", search("error"))
+	add("search_and", search("error timeout"))
+	add("search_or", search("timeout OR retry"))
+	add("search_not", search("error -import"))
+	add("search_phrase", search(`"not found"`))
+	add("search_prefix", search("config*"))
+	add("search_no_hit", search("zqxjkvw"))
 
 	// One more token query, not timed, gives the number of spans the server
 	// holds in the range, for the caller to compare with what it sent.
