@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// What the process was asked to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub struct Config {
     pub api_allowed_hosts: Vec<String>,
     /// Start even if log files were lost (see the README).
     pub accept_lost_log: bool,
+    /// How long data is kept; `None` keeps everything (see the README).
+    pub retention: Option<Duration>,
 }
 
 /// The text printed by `--help`.
@@ -47,6 +50,9 @@ Options (each also reads an environment variable; a flag wins):
   --accept-lost-log        NWDB_ACCEPT_LOST_LOG  [off]
                            start although log files were lost, giving up the
                            records acknowledged since the last flush
+  --retention DURATION     NWDB_RETENTION        [keep everything]
+                           a positive whole number and a unit s, m, h or d,
+                           for example 7d; older data is removed
   --help                   print this text
   --version                print the version
 
@@ -65,6 +71,7 @@ pub fn parse(
     let mut otlp = None;
     let mut api = None;
     let mut hosts = None;
+    let mut retention = None;
     let mut accept_lost_log = false;
     let mut args = args.into_iter().map(|a| {
         a.into_string()
@@ -90,6 +97,7 @@ pub fn parse(
             "--otlp-grpc-addr" => &mut otlp,
             "--api-addr" => &mut api,
             "--api-allowed-hosts" => &mut hosts,
+            "--retention" => &mut retention,
             _ => return Err(format!("unknown argument `{name}`")),
         };
         let value = match inline {
@@ -117,6 +125,15 @@ pub fn parse(
         s.parse::<SocketAddr>()
             .map_err(|e| format!("{what} `{s}` is not an IP:PORT address: {e}"))
     };
+    // A flag is parsed as given, so `--retention ""` is an error; an empty
+    // variable counts as unset, like the others.
+    let retention = match retention {
+        Some(v) => Some(parse_retention(&v)?),
+        None => match pick(None, "NWDB_RETENTION", "")?.as_str() {
+            "" => None,
+            v => Some(parse_retention(v)?),
+        },
+    };
     Ok(Command::Run(Config {
         data_dir: pick(data_dir, "NWDB_DATA_DIR", "./data")?.into(),
         otlp_grpc_addr: addr(
@@ -134,6 +151,7 @@ pub fn parse(
                     ));
                 }
             },
+        retention,
         api_allowed_hosts: pick(hosts, "NWDB_API_ALLOWED_HOSTS", "")?
             .split(',')
             .map(str::trim)
@@ -141,6 +159,35 @@ pub fn parse(
             .map(str::to_owned)
             .collect(),
     }))
+}
+
+/// A positive whole number followed by `s`, `m`, `h` or `d`, such as `7d`.
+/// Nothing else is accepted: no sign, no space, no fraction, no zero.
+fn parse_retention(text: &str) -> Result<Duration, String> {
+    let bad = || {
+        format!(
+            "retention `{text}` is not a positive whole number followed by s, m, h or d \
+             (for example 7d)"
+        )
+    };
+    let unit = match text.chars().last() {
+        Some('s') => 1,
+        Some('m') => 60,
+        Some('h') => 3600,
+        Some('d') => 86_400,
+        _ => return Err(bad()),
+    };
+    let digits = &text[..text.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    if n == 0 {
+        return Err(bad());
+    }
+    n.checked_mul(unit)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("retention `{text}` is too large"))
 }
 
 #[cfg(test)]
@@ -218,6 +265,53 @@ mod tests {
             get(&["--accept-lost-log"], &[("NWDB_ACCEPT_LOST_LOG", "0")]),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn retention_is_a_number_with_a_unit() {
+        let get = |args: &[&str], env: &[(&str, &str)]| match run(args, env) {
+            Ok(Command::Run(c)) => Ok(c.retention),
+            Ok(_) => panic!(),
+            Err(e) => Err(e),
+        };
+        let secs = |n| Ok(Some(Duration::from_secs(n)));
+        assert_eq!(get(&[], &[]), Ok(None));
+        assert_eq!(get(&["--retention", "90s"], &[]), secs(90));
+        assert_eq!(get(&["--retention=15m"], &[]), secs(900));
+        assert_eq!(get(&[], &[("NWDB_RETENTION", "36h")]), secs(36 * 3600));
+        assert_eq!(get(&[], &[("NWDB_RETENTION", "7d")]), secs(7 * 86_400));
+        // The flag wins; an empty variable is unset.
+        assert_eq!(
+            get(&["--retention=1d"], &[("NWDB_RETENTION", "x")]),
+            secs(86_400)
+        );
+        assert_eq!(get(&[], &[("NWDB_RETENTION", "")]), Ok(None));
+        for bad in [
+            "",
+            "0",
+            "0d",
+            "00s",
+            "7",
+            "d",
+            "7w",
+            "7D",
+            "-7d",
+            "+7d",
+            " 7d",
+            "7d ",
+            "7 d",
+            "1.5h",
+            "1e3s",
+            "7dd",
+            "0x10s",
+            "99999999999999999999d",
+            "307445734561825861d",
+        ] {
+            assert!(get(&["--retention", bad], &[]).is_err(), "flag `{bad}`");
+            if !bad.is_empty() {
+                assert!(get(&[], &[("NWDB_RETENTION", bad)]).is_err(), "env `{bad}`");
+            }
+        }
     }
 
     #[test]

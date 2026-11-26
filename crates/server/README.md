@@ -73,12 +73,33 @@ Both `--flag value` and `--flag=value` work.
 | `--api-addr` | `NWDB_API_ADDR` | `127.0.0.1:4320` |
 | `--api-allowed-hosts` | `NWDB_API_ALLOWED_HOSTS` | none; comma-separated host names |
 | `--accept-lost-log` | `NWDB_ACCEPT_LOST_LOG` | off; a switch (the variable is `1`, `true`, `0` or `false`) |
+| `--retention` | `NWDB_RETENTION` | unset: keep everything; otherwise a positive whole number and a unit `s`, `m`, `h` or `d`, such as `7d` |
 | `--help` | | print the options |
 | `--version` | | print the version |
 
 Addresses are `IP:PORT`; host names are not resolved. The data directory is
 locked: a second process on the same directory fails to start. An argument or
 a `NWDB_*` variable that is not valid UTF-8 is a usage error (exit code 2).
+
+### Retention
+
+With `--retention 7d` the server removes data once it is older than that.
+Anything that is not a positive whole number followed by `s`, `m`, `h` or `d`
+(zero, `1.5h`, `7`, `7w`, an empty flag) is a usage error and exits with code
+2; unset keeps everything, and an empty `NWDB_RETENTION` counts as unset. A
+background thread, every 10 seconds and after every flush, removes the parts
+whose whole 15-minute time window is older than the retention, in one step, so
+a query sees a part or does not. **A trace is kept for at least the retention
+after the start of its window, and for at most the retention plus one window
+plus one maintenance interval** (a window is 15 minutes and the interval 10
+seconds, plus the time the flush interval and the pass themselves take).
+Data that is already older than the retention when it arrives is accepted,
+stored and then removed by a later pass; data with timestamps in the future is
+kept until its window has aged out. Retention works on whole parts: a trace
+whose spans arrived in different windows can lose its older part and keep the
+newer one. Data still in the memory buffer is removed after it has been
+written, not before. Removed data is deleted from disk; the log is rotated
+after each flush, so `wal/` does not keep records that are already stored.
 
 ### A lost log
 
@@ -272,13 +293,17 @@ curl http://127.0.0.1:4320/healthz
 **`GET /api/v1/stats`** returns the engine counters: `records_ingested`,
 `bytes_ingested`, `acked_lsn`, `flushed_lsn`, `buffered_bytes`, `parts`,
 `flushes`, `flushing`, `fatal`, `last_error`, `payload_logical_bytes`,
-`payload_unique_bytes` and `payload_stored_bytes`. The last three are for the
-flushed parts: the large text (prompts, completions, tool definitions and
+`payload_unique_bytes`, `payload_stored_bytes`, `maintenance_passes`,
+`retention_parts_removed` and `last_maintenance_error`. The three `payload_*`
+fields are for the flushed parts: the large text (prompts, completions, tool definitions and
 results, and other long values) their spans hold, counting every use; the same
 text with each distinct piece counted once per part; and what that takes on
 disk after compression. In agent traces the second is a small fraction of the
 first. A trace reads back exactly as it was
-sent either way.
+sent either way. `maintenance_passes` counts the maintenance passes since the
+start (failed ones too), `retention_parts_removed` the parts that retention
+removed, and `last_maintenance_error` is the error of the most recent pass that
+failed, or null.
 
 ```sh
 curl http://127.0.0.1:4320/api/v1/stats

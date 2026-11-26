@@ -8,7 +8,9 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use support::{copy_dir, disk_state, obsolete_log_files, recover_and_check, run_child, tree_of};
+use support::{
+    copy_dir, disk_state, obsolete_log_files, present_ids, recover_and_check, run_child, tree_of,
+};
 
 fn abort_env(stage: &str, n: u64) -> Vec<(&'static str, String)> {
     vec![("NWDB_ABORT_AT", format!("{stage}:{n}"))]
@@ -32,6 +34,7 @@ fn every_flush_stage_leaves_a_recoverable_directory() {
         "AllPartsWritten",
         "Committed",
         "Published",
+        "LogRotated",
         "Trimmed",
     ];
     for (i, stage) in stages.into_iter().enumerate() {
@@ -56,7 +59,7 @@ fn every_flush_stage_leaves_a_recoverable_directory() {
                     "{stage}: {unreferenced:?}"
                 );
             }
-            "Committed" | "Published" => {
+            "Committed" | "Published" | "LogRotated" => {
                 assert!(unreferenced.is_empty(), "{stage}: {unreferenced:?}");
                 assert!(state.wal_flushed_lsn > 0, "{stage}");
                 assert!(obsolete > 0, "{stage}: no obsolete log file is left");
@@ -144,6 +147,115 @@ fn every_open_stage_leaves_a_recoverable_directory() {
         }
 
         let e = recover_and_check(dir.path(), &acked, i % 2 == 0, stage, 100 + i as u128);
+        e.shutdown().unwrap();
+        let (_, unreferenced) = disk_state(dir.path());
+        assert!(unreferenced.is_empty(), "{stage}: {unreferenced:?}");
+    }
+}
+
+/// A crash in the middle of a replacement of parts, which retention starts
+/// with a fixed clock when the child opens a directory that holds expired
+/// parts. Nothing of the expired parts may come back, nothing acknowledged
+/// that was not in them may be lost, and the directories the manifest no
+/// longer references are deleted by the recovery.
+#[test]
+fn every_replace_stage_leaves_a_recoverable_directory() {
+    // The base: eight flushes, so parts of several windows, and a log with
+    // the records after the last flush.
+    let base = tempfile::tempdir().unwrap();
+    let acked_before: BTreeSet<u64> = crash_at(base.path(), 0, "Trimmed", 8).into_iter().collect();
+    let (state, _) = disk_state(base.path());
+    let mut parts: Vec<_> = state.parts.iter().collect();
+    parts.sort_by_key(|p| p.window_start_ns);
+    // Expire the oldest windows until at least three parts are expired, and
+    // keep at least one.
+    let mut expired_end = i64::MIN;
+    let mut expired = Vec::new();
+    for p in &parts {
+        if expired.len() >= 3 && p.window_start_ns + p.window_ns > expired_end {
+            break;
+        }
+        expired_end = expired_end.max(p.window_start_ns + p.window_ns);
+        expired.push(p.part_id);
+    }
+    assert!(expired.len() >= 3, "the base has too few parts");
+    assert!(
+        expired.len() < parts.len(),
+        "the base has too few windows: {:?}",
+        parts.iter().map(|p| p.window_start_ns).collect::<Vec<_>>()
+    );
+    let expired_names: Vec<String> = expired
+        .iter()
+        .map(|id| nwdb_core::part_dir_name(*id))
+        .collect();
+    // The ids that the expired parts hold, from a copy of the base opened
+    // without retention.
+    let in_expired: BTreeSet<u64> = {
+        let copy = tempfile::tempdir().unwrap();
+        copy_dir(base.path(), copy.path());
+        let e = common::open(common::opts(copy.path()));
+        let ids: BTreeSet<u64> = e
+            .snapshot()
+            .part_traces()
+            .into_iter()
+            .filter(|(id, _)| expired.contains(id))
+            .flat_map(|(_, traces)| traces)
+            .map(|t| u128::from_be_bytes(t.0) as u64 - 1)
+            .collect();
+        e.shutdown().unwrap();
+        ids
+    };
+    assert!(!in_expired.is_empty());
+    let retention_ns = 1_000;
+    let env = |stage: &str| {
+        let mut env = abort_env(stage, 1);
+        env.push(("NWDB_RETENTION_NS", retention_ns.to_string()));
+        env.push(("NWDB_CLOCK_NS", (expired_end + retention_ns).to_string()));
+        env
+    };
+
+    for (i, stage) in ["ReplaceCommitted", "ReplacePublished", "PartDirDeleted"]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(base.path(), dir.path());
+        let run = run_child(dir.path(), 5_000_000, 0, &env(stage), None);
+        run.assert_aborted_at(stage);
+
+        // The commit is one manifest version: no expired part is live.
+        let (state, unreferenced) = disk_state(dir.path());
+        assert!(
+            expired.iter().all(|id| state.part(*id).is_none()),
+            "{stage}: an expired part is still live"
+        );
+        let left: Vec<&String> = expired_names
+            .iter()
+            .filter(|n| unreferenced.contains(n))
+            .collect();
+        match stage {
+            "ReplaceCommitted" | "ReplacePublished" => {
+                assert_eq!(left.len(), expired.len(), "{stage}: {unreferenced:?}");
+            }
+            // The abort came right after the first directory was deleted.
+            _ => assert_eq!(left.len(), expired.len() - 1, "{stage}: {unreferenced:?}"),
+        }
+
+        // Recovery: every acknowledged id that was not in an expired part is
+        // there, none of the expired parts' ids is, and the leftovers are
+        // gone.
+        let acked: BTreeSet<u64> = acked_before
+            .iter()
+            .chain(&run.acked)
+            .copied()
+            .filter(|id| !in_expired.contains(id))
+            .collect();
+        let e = recover_and_check(dir.path(), &acked, i % 2 == 0, stage, 200 + i as u128);
+        let present = present_ids(&e);
+        assert!(
+            present.is_disjoint(&in_expired),
+            "{stage}: expired data came back"
+        );
         e.shutdown().unwrap();
         let (_, unreferenced) = disk_state(dir.path());
         assert!(unreferenced.is_empty(), "{stage}: {unreferenced:?}");

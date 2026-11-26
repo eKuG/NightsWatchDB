@@ -15,7 +15,7 @@ use nwdb_core::{
     BatchLimits, Error, PayloadSplitter, RawColumn, RecordDecoder, Result, SpanBatchBuilder,
     SpanColumns, SpanId, SpanRecord, TraceId, TraceSummary,
 };
-use nwdb_engine::{AggQuery, Engine, EngineOptions, ListQuery, TokenAgg};
+use nwdb_engine::{AggQuery, Engine, EngineOptions, ListQuery, Snapshot, TokenAgg};
 use nwdb_wal::{SyncMode, WalOptions};
 
 /// The log tag of the test encoding.
@@ -485,7 +485,11 @@ impl Model {
 
     /// Checks every query against the engine's answers.
     pub fn check(&self, e: &Engine, what: &str) {
-        let snap = e.snapshot();
+        self.check_snapshot(&e.snapshot(), what);
+    }
+
+    /// Checks every query against the answers of one snapshot.
+    pub fn check_snapshot(&self, snap: &Snapshot, what: &str) {
         for t in self.trace_ids() {
             let got = snap.get_trace(TraceId(t.to_be_bytes())).unwrap();
             assert_eq!(

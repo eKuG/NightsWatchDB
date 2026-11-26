@@ -697,3 +697,235 @@ fn real_sync_mode_works() {
     assert_eq!(rec.first_lsn, 3);
     assert_eq!(replay_all(&wal, rec.first_lsn).len(), 3);
 }
+
+fn names(dir: &Path) -> Vec<String> {
+    log_files(dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
+        .collect()
+}
+
+fn file_name(first: u64) -> String {
+    format!("wal-{first:020}.log")
+}
+
+fn with_min(min: Lsn) -> WalOptions {
+    WalOptions {
+        min_next_lsn: Some(min),
+        ..opts(1 << 20)
+    }
+}
+
+#[test]
+fn rotate_starts_a_new_file_and_a_trim_removes_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    for i in 0..3u8 {
+        wal.append_blocking(&[i; 10]).unwrap();
+    }
+    assert!(wal.rotate().unwrap());
+    assert_eq!(names(dir.path()), [file_name(1), file_name(4)]);
+    // The new file holds no records, so a second rotation does nothing.
+    assert!(!wal.rotate().unwrap());
+    assert_eq!(wal.stats().files, 2);
+
+    assert_eq!(wal.append_blocking(b"four").unwrap(), 4);
+    // The old file is wholly below 4 and goes; the newest never does.
+    assert_eq!(wal.truncate_before(4).unwrap(), 1);
+    assert_eq!(wal.truncate_before(100).unwrap(), 0);
+    assert_eq!(names(dir.path()), [file_name(4)]);
+    wal.shutdown().unwrap();
+
+    let (wal, rec) = Wal::open(dir.path(), with_min(5)).unwrap();
+    assert_eq!((rec.first_lsn, rec.last_lsn), (4, 4));
+    assert_eq!(replay_all(&wal, 5).len(), 0);
+    assert_eq!(wal.append_blocking(b"five").unwrap(), 5);
+}
+
+#[test]
+fn rotate_on_a_log_without_records_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    assert!(!wal.rotate().unwrap());
+    assert_eq!(names(dir.path()), [file_name(1)]);
+    wal.shutdown().unwrap();
+
+    // Also after a restart over a header-only file, and over a log that was
+    // trimmed down to such a file.
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    wal.append_blocking(b"a").unwrap();
+    assert!(wal.rotate().unwrap());
+    wal.truncate_before(2).unwrap();
+    wal.shutdown().unwrap();
+    let (wal, rec) = Wal::open(dir.path(), with_min(2)).unwrap();
+    assert_eq!((rec.first_lsn, rec.last_lsn, rec.files), (2, 1, 1));
+    assert!(!wal.rotate().unwrap());
+    assert_eq!(names(dir.path()), [file_name(2)]);
+}
+
+#[test]
+fn a_log_that_ends_exactly_at_the_position_is_healthy_after_rotate_and_trim() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    for i in 0..5u8 {
+        wal.append_blocking(&[i; 10]).unwrap();
+    }
+    assert!(wal.rotate().unwrap());
+    assert_eq!(wal.truncate_before(6).unwrap(), 1);
+    wal.shutdown().unwrap();
+    // Only the header-only file is left; the engine's position is 5.
+    let files = log_files(dir.path());
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        std::fs::metadata(&files[0]).unwrap().len(),
+        crate::format::HEADER_LEN
+    );
+    let (wal, rec) = Wal::open(dir.path(), with_min(6)).unwrap();
+    assert_eq!((rec.first_lsn, rec.last_lsn, rec.reset_to), (6, 5, None));
+    assert_eq!(replay_all(&wal, 6).len(), 0);
+    assert_eq!(wal.append_blocking(b"six").unwrap(), 6);
+}
+
+#[test]
+fn a_lost_log_is_still_detected_after_a_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    for i in 0..5u8 {
+        wal.append_blocking(&[i; 10]).unwrap();
+    }
+    assert!(wal.rotate().unwrap());
+    wal.append_blocking(b"six").unwrap();
+    wal.shutdown().unwrap();
+    // The caller says records up to 8 are in data files, but the log ends at 6.
+    let err = Wal::open(dir.path(), with_min(9)).err().unwrap();
+    assert!(
+        matches!(&err, Error::Corrupt(m) if m.contains("allow_lost_log")),
+        "{err}"
+    );
+}
+
+#[test]
+fn records_queued_during_a_rotation_go_to_the_new_file_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    let wal = Arc::new(wal);
+    let writer = {
+        let wal = Arc::clone(&wal);
+        std::thread::spawn(move || {
+            for i in 0..400u32 {
+                wal.append_blocking(&i.to_le_bytes()).unwrap();
+            }
+        })
+    };
+    let mut rotated = 0;
+    while !writer.is_finished() {
+        if wal.rotate().unwrap() {
+            rotated += 1;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    writer.join().unwrap();
+    assert!(rotated > 0);
+    let wal = Arc::into_inner(wal).unwrap();
+    wal.shutdown().unwrap();
+
+    // Every file is contiguous with the next and the records are 0..400.
+    let (wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    assert_eq!((rec.first_lsn, rec.last_lsn), (1, 400));
+    assert!(rec.files > 1);
+    let all = replay_all(&wal, 0);
+    for (i, (lsn, p)) in all.iter().enumerate() {
+        assert_eq!(*lsn, i as u64 + 1);
+        assert_eq!(p, &(i as u32).to_le_bytes());
+    }
+}
+
+/// The states a crash can leave at each step of a rotation, built by hand:
+/// the log must open, replay exactly the records it held, and carry on.
+#[test]
+fn a_crash_at_each_step_of_a_rotation_leaves_a_log_that_opens() {
+    let header = crate::format::encode_header(4);
+    for step in ["tmp", "header-only", "old file removed"] {
+        let dir = tempfile::tempdir().unwrap();
+        build(dir.path(), opts(1 << 20), &thirty(3));
+        let tmp = dir.path().join(format!("{}.tmp", file_name(4)));
+        let new = dir.path().join(file_name(4));
+        match step {
+            // The new file was being created: temporary name, short header.
+            "tmp" => std::fs::write(&tmp, &header[..7]).unwrap(),
+            "header-only" => std::fs::write(&new, header).unwrap(),
+            _ => {
+                std::fs::write(&new, header).unwrap();
+                std::fs::remove_file(dir.path().join(file_name(1))).unwrap();
+            }
+        }
+        let min = if step == "old file removed" { 4 } else { 1 };
+        let (wal, rec) = Wal::open(dir.path(), with_min(min)).unwrap();
+        assert_eq!(rec.last_lsn, 3, "{step}");
+        let expect = if step == "old file removed" { 0 } else { 3 };
+        assert_eq!(replay_all(&wal, min).len(), expect, "{step}");
+        assert_eq!(wal.append_blocking(b"next").unwrap(), 4, "{step}");
+        wal.shutdown().unwrap();
+        let (wal, rec) = Wal::open(dir.path(), with_min(min)).unwrap();
+        assert_eq!(rec.last_lsn, 4, "{step}");
+        assert_eq!(replay_all(&wal, 4).len(), 1, "{step}");
+        assert!(
+            !names(dir.path()).iter().any(|n| n.ends_with(".tmp")),
+            "{step}"
+        );
+    }
+}
+
+#[test]
+fn a_failed_sync_during_a_rotation_poisons_the_log_and_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Gate::new(true);
+    let mut o = opts(1 << 20);
+    o.sync_hook = Some(gate.hook());
+    let (wal, _) = Wal::open(dir.path(), o).unwrap();
+    wal.append_blocking(b"one").unwrap();
+    wal.append_blocking(b"two").unwrap();
+    gate.fail.store(true, Ordering::SeqCst);
+    let err = wal.rotate().unwrap_err();
+    assert!(matches!(err, Error::Fatal(_)), "{err}");
+    assert!(matches!(
+        wal.append_blocking(b"x").unwrap_err(),
+        Error::Fatal(_)
+    ));
+    assert!(matches!(wal.rotate().unwrap_err(), Error::Fatal(_)));
+    assert!(wal.shutdown().is_err());
+    // The sync failed before the new file was created.
+    assert_eq!(names(dir.path()), [file_name(1)]);
+    let (wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    assert_eq!(rec.last_lsn, 2);
+    assert_eq!(replay_all(&wal, 0).len(), 2);
+}
+
+#[test]
+fn a_blocked_rotation_waits_for_the_group_being_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Gate::new(false);
+    let mut o = opts(1 << 20);
+    o.sync_hook = Some(gate.hook());
+    let (wal, _) = Wal::open(dir.path(), o).unwrap();
+    let wal = Arc::new(wal);
+    let results: Results = Arc::default();
+    wal.append(b"one", collect(&results));
+    wait_for("the sync to start", || {
+        gate.calls.load(Ordering::SeqCst) == 1
+    });
+    // Queued behind the group in the sync: goes to the new file.
+    wal.append(b"two", collect(&results));
+    let rot = {
+        let wal = Arc::clone(&wal);
+        std::thread::spawn(move || wal.rotate())
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!rot.is_finished());
+    gate.set_open(true);
+    assert!(rot.join().unwrap().unwrap());
+    wait_for("both acknowledgements", || {
+        results.lock().unwrap().len() == 2
+    });
+    assert_eq!(names(dir.path()), [file_name(1), file_name(2)]);
+}

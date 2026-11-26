@@ -4,7 +4,7 @@
 //! README walks through each one.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use arrow_array::RecordBatch;
 use nwdb_core::{
@@ -16,11 +16,14 @@ use nwdb_segment::{PartReader, PartWriter, WriterOptions};
 use crate::engine::{Inner, LivePart, Stage, run_hook};
 use crate::lock;
 use crate::rows::group_traces;
+use crate::split::change_parts;
 
-/// Parts written by one flush, opened and not yet published.
-struct Written {
+/// Parts written and committed by one flush, opened and not yet published.
+/// Holds the publish gate, which is released when the parts are published.
+struct Written<'a> {
     metas: Vec<PartMeta>,
     readers: Vec<PartReader>,
+    gate: MutexGuard<'a, ()>,
 }
 
 impl Inner {
@@ -67,7 +70,7 @@ impl Inner {
             }
             if c.vis.active.is_empty() && c.applied_lsn == c.flushed_lsn {
                 drop(c);
-                self.trim_log();
+                self.rotate_and_trim_log();
                 return Ok(());
             }
             // Everything with a log position up to `applied_lsn` is in the
@@ -93,23 +96,26 @@ impl Inner {
             });
         match outcome {
             Ok(written) => {
-                // Only a flush changes the part list and flushes run one at
-                // a time, so what is read here is what the new list extends.
-                // The split map is built outside the lock and published with
-                // the list.
-                let (mut parts, old_split) = {
+                // The publish gate is held since before the commit, so no
+                // replacement changed the list since: what is read here is
+                // what the new list extends. The split map is built outside
+                // the core lock and published with the list.
+                let Written {
+                    metas,
+                    readers,
+                    gate,
+                } = written;
+                let (old_parts, old_split) = {
                     let c = lock(&self.core);
-                    (c.vis.parts.as_ref().clone(), c.vis.split.clone())
+                    (c.vis.parts.clone(), c.vis.split.clone())
                 };
-                let old_len = parts.len();
-                parts.extend(
-                    written
-                        .metas
-                        .into_iter()
-                        .zip(written.readers)
-                        .map(|(meta, reader)| Arc::new(LivePart { meta, reader })),
-                );
-                let split = Arc::new(old_split.extend(&parts, old_len));
+                let added = metas
+                    .into_iter()
+                    .zip(readers)
+                    .map(|(meta, reader)| Arc::new(LivePart { meta, reader }))
+                    .collect();
+                let (parts, split) = change_parts(&old_parts, &old_split, &[], added);
+                let split = Arc::new(split);
                 {
                     let mut c = lock(&self.core);
                     // Parts and buffer change in one step, so a snapshot sees
@@ -121,10 +127,14 @@ impl Inner {
                     c.flushed_lsn = lsn;
                     c.flushes += 1;
                     c.flushing = false;
+                    // Expired parts may be waiting for the next pass.
+                    c.maintenance_due = true;
+                    self.maintenance_cv.notify_all();
                 }
+                drop(gate);
                 self.stage_after_commit(Stage::Published);
                 if trim {
-                    self.trim_log();
+                    self.rotate_and_trim_log();
                     self.stage_after_commit(Stage::Trimmed);
                 }
                 Ok(())
@@ -156,23 +166,32 @@ impl Inner {
 
     /// Calls the stage hook at a point after the manifest commit, where its
     /// result no longer matters: the flush has happened.
-    fn stage_after_commit(&self, stage: Stage) {
+    pub(crate) fn stage_after_commit(&self, stage: Stage) {
         let _ = catch_unwind(AssertUnwindSafe(|| run_hook(&self.opts.stage_hook, stage)));
     }
 
-    /// Removes log files that are entirely inside parts. A failure is only
-    /// noted: the data is safe and the next flush tries again.
-    fn trim_log(&self) {
+    /// Starts a new log file and then removes the log files that are entirely
+    /// inside parts. The trim never removes the newest file, so without the
+    /// new file the records of this flush would stay on disk until that file
+    /// reached its size limit. A failure of either step is only noted: the
+    /// data is safe and the next flush tries again.
+    fn rotate_and_trim_log(&self) {
         let flushed = lock(&self.core).flushed_lsn;
         let wal = self.wal.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(wal) = wal.as_ref()
-            && let Err(e) = wal.truncate_before(flushed + 1)
-        {
+        let Some(wal) = wal.as_ref() else { return };
+        match wal.rotate() {
+            Ok(_) => self.stage_after_commit(Stage::LogRotated),
+            Err(e) => {
+                lock(&self.core).last_error = Some(format!("rotating the log failed: {e}"));
+                return;
+            }
+        }
+        if let Err(e) = wal.truncate_before(flushed + 1) {
             lock(&self.core).last_error = Some(format!("trimming the log failed: {e}"));
         }
     }
 
-    fn write_and_commit(&self, frozen: &[Arc<RecordBatch>], lsn: u64) -> Result<Written> {
+    fn write_and_commit(&self, frozen: &[Arc<RecordBatch>], lsn: u64) -> Result<Written<'_>> {
         run_hook(&self.opts.stage_hook, Stage::FlushFrozen)?;
         let cols = frozen
             .iter()
@@ -197,6 +216,7 @@ impl Inner {
         let ids = self.manifest.reserve_part_ids(windows.len() as u64)?;
         let mut metas: Vec<PartMeta> = Vec::new();
         let mut readers: Vec<PartReader> = Vec::new();
+        let mut gate = None;
         let result: Result<()> = (|| {
             for ((w, range), id) in windows.iter().zip(ids) {
                 let mut writer = PartWriter::create(
@@ -233,6 +253,10 @@ impl Inner {
                 run_hook(&self.opts.stage_hook, Stage::PartWritten)?;
             }
             run_hook(&self.opts.stage_hook, Stage::AllPartsWritten)?;
+            // From here to the publish no replacement may commit: its edit and
+            // ours must each see the list the other left. Taken only now, so
+            // the long work above never holds it.
+            gate = Some(lock(&self.publish_gate));
             self.manifest.commit(Edit {
                 add: metas.clone(),
                 wal_flushed_lsn: Some(lsn),
@@ -242,8 +266,14 @@ impl Inner {
             Ok(())
         })();
         match result {
-            Ok(()) => Ok(Written { metas, readers }),
+            Ok(()) => Ok(Written {
+                metas,
+                readers,
+                gate: gate.expect("the publish gate is taken before the commit"),
+            }),
             Err(e) => {
+                // Cleaning up is long work, which the gate does not cover.
+                drop(gate.take());
                 if !matches!(e, Error::Fatal(_)) {
                     // Nothing was published, so the directories are garbage.
                     // If this fails they are removed at the next start-up.
@@ -259,7 +289,7 @@ impl Inner {
 }
 
 /// The text of a panic payload, for the error message.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     panic
         .downcast_ref::<&str>()
         .map(|s| (*s).to_string())

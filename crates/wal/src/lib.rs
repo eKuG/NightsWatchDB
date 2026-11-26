@@ -4,7 +4,9 @@
 //! only after the log has been synced to disk. After a crash the engine opens
 //! the log, replays it from the last record it had already written into data
 //! files, and carries on. Once data is safely in data files the log is trimmed
-//! with [`Wal::truncate_before`].
+//! with [`Wal::truncate_before`], after [`Wal::rotate`] has started a new file
+//! so that the newest file, which a trim never removes, holds no record that
+//! is already in data files.
 //!
 //! # Group commit
 //!
@@ -210,6 +212,8 @@ pub(crate) struct State {
     pub appended: bool,
     pub pending_bytes: u64,
     pub stats: WalStats,
+    /// Callers of `rotate` waiting for the log thread, oldest first.
+    pub rotations: Vec<mpsc::Sender<Result<bool>>>,
 }
 
 pub(crate) struct Shared {
@@ -406,7 +410,7 @@ impl Wal {
             reset_to = Some(min);
         }
 
-        let (file, file_size, file_records) = match active {
+        let (file, file_first, file_size, file_records) = match active {
             Some((first, size, records)) => {
                 let file = std::fs::OpenOptions::new()
                     .append(true)
@@ -417,13 +421,14 @@ impl Wal {
                     file.sync_data()?;
                     writer::sync_dir(dir, options.sync)?;
                 }
-                (file, size, records)
+                (file, first, size, records)
             }
             None => {
                 let start = removed_start.unwrap_or(1);
                 firsts.push(start);
                 (
                     writer::create_file(dir, start, options.sync)?,
+                    start,
                     HEADER_LEN,
                     0,
                 )
@@ -452,6 +457,7 @@ impl Wal {
             shared: Arc::clone(&shared),
             options,
             file,
+            file_first,
             file_size,
             file_records,
             last_sync: None,
@@ -630,6 +636,41 @@ impl Wal {
         drop(files);
         outcome?;
         Ok(removed as u64)
+    }
+
+    /// Starts a new log file at the current write position, so that the file
+    /// holding the records written so far can be removed by
+    /// [`truncate_before`](Wal::truncate_before) once they are in data files.
+    /// Without it the newest file, which a trim never removes, would keep
+    /// records that are long since in data files until it reaches its size
+    /// limit.
+    ///
+    /// Returns `Ok(true)` if a file was started and `Ok(false)` if the newest
+    /// file holds no records (nothing to do). The work is done by the log
+    /// thread between two groups: everything it has written is synced first,
+    /// the new file is created the way a rolled file is (header synced under a
+    /// temporary name, renamed, directory synced), and the records still
+    /// queued go to the new file. Numbering stays gapless and the newest file
+    /// is never removed. A crash at any step leaves a log that opens: a
+    /// leftover temporary file is removed by `open`, and a new file that holds
+    /// only its header is simply the newest file.
+    ///
+    /// Waits for the log thread, so it takes as long as the group being
+    /// written plus one file creation. A failure of the sync or of the file
+    /// creation poisons the log like the same failure in a roll, and is
+    /// returned as [`Error::Fatal`].
+    pub fn rotate(&self) -> Result<bool> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut st = lock(&self.shared.state);
+            if let Some(msg) = &st.poisoned {
+                return Err(poison_error(msg));
+            }
+            st.rotations.push(tx);
+        }
+        self.shared.wake.notify_one();
+        rx.recv()
+            .unwrap_or_else(|_| Err(Error::fatal("the log stopped before it could rotate")))
     }
 
     /// Highest sequence number covered by a completed sync. Right after

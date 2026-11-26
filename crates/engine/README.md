@@ -28,7 +28,8 @@ engine.shutdown()?;
    write. A record the log failed gets the log's error (`Fatal`).
 4. The flusher thread writes the buffer into parts when it reaches
    `buffer_bytes`, or when its oldest data is `flush_interval` old; `flush()`
-   does it on demand.
+   does it on demand. The maintenance thread removes parts that retention has
+   expired (see Retention).
 5. After a crash `open` loads the manifest, opens the parts and replays the log
    from the position the manifest records through the registered decoders.
 
@@ -102,7 +103,8 @@ finishes before the next.
 7. Only after the replay succeeded: delete the part directories the manifest
    does not reference. One of them may be the only decoded copy of data whose
    log record no longer decodes, so it must outlive a refused replay.
-8. Start the threads and accept requests.
+8. Start the threads and accept requests. The maintenance thread's first pass
+   runs at once, so what expired while the engine was down goes soon.
 
 A refusal is a verdict on what is on disk: log, manifest or parts are damaged
 or missing, and the start changes nothing. The one exception is a failure
@@ -118,22 +120,42 @@ failure, not a refusal, and the next start continues from where it stopped.
 | log thread (in `nwdb-wal`) | writes and syncs groups, runs callbacks in order; its callbacks only push to a queue |
 | applier (`nwdb-applier`) | pops results in log order, inserts into the buffer, calls `on_durable` outside every lock |
 | flusher (`nwdb-flusher`) | waits for the size or age trigger, then flushes; after a failed flush waits one second before retrying |
-| callers | `flush()` runs on the calling thread, serialised with the flusher by a gate; it checks the closing state after taking the gate |
+| maintenance (`nwdb-maintenance`) | wakes every `maintenance_interval` (default 10 s) and after every flush, and runs one pass: it retries directory deletions that failed, then applies retention; the place where parts will be chosen and merged is marked in the pass and does nothing yet |
+| callers | `flush()` runs on the calling thread, serialised with the flusher by a gate; it checks the closing state after taking the gate. `run_maintenance()` runs one pass on the calling thread, serialised with the thread |
 
 One mutex (`Core`) holds the visible state and counters, and is held only to
 move pointers, never across I/O. A snapshot is three `Arc` clones taken under
 it. The only blocking calls in the log's callback path are the queue's short
 lock; the log is never called from a callback.
 
+Three more mutexes order the long operations: the flush gate (one flush at a
+time), the maintenance gate (one pass at a time) and the publish gate (a
+manifest commit that changes the part list, together with the publish that
+follows it; see Replacing parts). Where a thread needs two, it takes them in
+the order flush gate or maintenance gate first, then the publish gate, then
+the core mutex. No gate is held while parts are written or directories are
+deleted.
+
 `Engine` is a cheap clone. `shutdown()` stops accepting, waits for every
-accepted request to be acknowledged, stops the flusher, then takes the flush
-gate and holds it while it flushes, shuts the log down, stops the applier and
-releases the lock; a `flush()` that raced with it finishes before it or finds
+accepted request to be acknowledged, stops the flusher and the maintenance
+thread, then takes the maintenance gate and the flush gate and holds them while
+it flushes, shuts the log down, stops the applier and releases the lock; a `flush()` that raced with it finishes before it or finds
 the engine closed, so nothing is written after the lock is gone. A second
 concurrent `shutdown()` waits for the first to finish. Dropping the last handle
 does the same without the flush (what is acknowledged is in the log), and if the
 last handle is dropped by a callback running on an engine thread, the cleanup
 runs on a separate thread rather than joining itself.
+
+**How long shutdown can wait for maintenance.** A pass looks at the stop flag
+between its steps, and shutdown sets it first, so shutdown waits for the step
+in progress and no more. A step is one manifest commit together with the
+publish that follows it (a file write and two syncs, plus the rebuild of the
+split map described under Replacing parts, which is in memory), or the deletion
+of one part directory. If shutdown arrives while a replacement is deleting its
+directories, the ones not yet reached stay on disk, unreferenced; the next
+start-up deletes them. A pass that is waiting for the publish gate waits for a
+flush's commit and publish, which is the same order of time. Nothing in a pass
+waits for ingest, for queries or for a flush's writing of parts.
 
 ## The flush
 
@@ -158,15 +180,28 @@ runs on a separate thread rather than joining itself.
    returns the original bytes, so nothing else here depends on it. The memory
    of a flush is the buffer being written plus, for the part being written,
    its row group and its de-duplication window (64 MiB by default).
-4. **Commit.** One manifest commit adds all the parts and sets
-   `wal_flushed_lsn` to the frozen position.
-5. **Publish.** Extend the split map for the new parts (outside the lock, see
-   Reads), then under the core lock replace the part list and the split map and
-   clear the frozen buffer in one step, so a snapshot sees the data exactly once
-   and its map matches its parts.
-6. **Trim.** `truncate_before(wal_flushed_lsn + 1)`, only after the commit
-   returned `Ok`. A failure is recorded in `stats().last_error` and retried by
-   the next flush; the data is safe.
+4. **Commit.** Take the publish gate, then one manifest commit adds all the
+   parts and sets `wal_flushed_lsn` to the frozen position. The gate is taken
+   only now, after the long work of step 3.
+5. **Publish.** Build the new part list and split map (outside the core lock,
+   see Replacing parts), then under the core lock replace the part list and the
+   split map and clear the frozen buffer in one step, so a snapshot sees the
+   data exactly once and its map matches its parts. Then release the publish
+   gate.
+6. **Rotate and trim.** `Wal::rotate` starts a new log file at the current
+   write position (nothing happens if the newest file holds no records), then
+   `truncate_before(wal_flushed_lsn + 1)` removes the files wholly inside
+   parts, only after the commit returned `Ok`. A trim never removes the newest
+   file, so without the rotation the records of this flush would stay in it
+   until it reached `max_file_bytes` (256 MiB by default): a benchmark found
+   134 MB of log on disk after everything had been flushed. After a flush with
+   no ingest in between, `wal/` holds one file of 20 bytes (its header). Records
+   that arrive between the freeze and the rotation stay in the old file, which
+   the next flush removes. A failure of either step is recorded in
+   `stats().last_error` and retried by the next flush; the data is safe. The
+   same rotation and trim run when a flush finds nothing to write, so a log
+   that is all flushed (the state older versions left) is cleaned too, and at
+   shutdown.
 
 What a crash leaves, and why recovery is right. The stage names are those of
 `EngineOptions::stage_hook` (below); the crash tests abort the process at each
@@ -178,14 +213,17 @@ and check the column "On disk":
 | a part write, `PartWritten` | `<id>.tmp`, maybe finished parts, manifest unchanged | the leftovers are unreferenced; `next_part_id` is first moved above them; replay rebuilds the buffer; then they are deleted |
 | `AllPartsWritten` (before the commit) | finished parts the manifest does not know | same: never reused, data replayed, then deleted |
 | the commit | the new manifest file either exists or not (create-if-absent link, directory sync) | not there: as above. There: parts are referenced and `wal_flushed_lsn` covers them, so replay starts after them |
-| `Committed`, `Published` (before trimming) | parts referenced; log files wholly inside parts | replay starts at `wal_flushed_lsn + 1`; `Wal::open` removes the obsolete files first, damaged or not |
-| trimming | a prefix of the old files removed, oldest first | the log is still contiguous and covers `wal_flushed_lsn + 1` |
+| `Committed`, `Published` (before rotating) | parts referenced; log files wholly inside parts | replay starts at `wal_flushed_lsn + 1`; `Wal::open` removes the obsolete files first, damaged or not |
+| the rotation | a `wal-<n>.log.tmp` that is being written, or a new file holding only its header after the old files | the log opens either way: `open` removes the temporary file; a header-only newest file is an ordinary newest file with no records, numbered after the last record |
+| `LogRotated` (before trimming) | as after `Published`, plus the new file | same as above |
+| trimming | a prefix of the old files removed, oldest first | the log is still contiguous and covers `wal_flushed_lsn + 1`; it may consist of the header-only file alone, which starts exactly at `wal_flushed_lsn + 1`: that is a healthy log, not a lost one |
 | `Trimmed` | nothing obsolete | nothing to do |
 
-The two invariants behind the table: `wal_flushed_lsn` only moves in the same
-commit that makes the data live, and the log is only trimmed after that commit
-returned. A record is therefore always in the log or in live parts, and
-replaying from `wal_flushed_lsn + 1` never replays something already in a part.
+The invariants behind the table: `wal_flushed_lsn` only moves in the same
+commit that makes the data live, and the log is only rotated and trimmed after
+that commit returned. A record is therefore always in the log or in live
+parts, and replaying from `wal_flushed_lsn + 1` never replays something already
+in a part.
 
 A non-`Fatal` error in steps 2 to 4 puts the frozen buffer back in front of
 the active one (nothing is lost), removes the parts this attempt wrote, and
@@ -198,6 +236,136 @@ A panic while writing or committing (after the freeze) is caught and treated
 as `Fatal`: the frozen buffer stays visible, no later flush can freeze over it
 and commit a position that covers records not in a part, and a restart recovers
 from the log. A panic in the stage hook after the commit is ignored.
+
+## Replacing parts
+
+Parts are immutable and a flush only adds them. Everything that takes parts
+away (retention now, merging later) goes through one internal operation,
+`Inner::replace_parts(remove: &[u64], add: Vec<LivePart>) -> Result<Replaced>`:
+the ids of live parts to remove and zero or more new parts, each already
+written to `parts/` with its `PartMeta` and an open `PartReader` (ids reserved
+with `manifest.reserve_part_ids`). It is "replace these by those". In this
+order:
+
+1. **Commit.** One manifest commit that removes and adds them.
+2. **Publish.** The new part list and a split map that matches it replace the
+   old ones in one step under the core lock. A snapshot sees the list from
+   before or the list from after, each with its own map; never a removed part
+   and its replacement both present or both absent.
+3. **Delete.** The directories of the removed parts are deleted, one at a
+   time, and `parts/` is synced.
+
+Rules:
+
+- **A flush and a replacement never interleave.** The publish gate is held from
+  just before the manifest commit to the end of the publish, by a flush and by
+  a replacement alike. Each therefore reads the list the other left, and each
+  commit's edit is valid against the state it was built from. Nothing long
+  happens under it: a flush takes it only after its parts are written, and
+  deleting directories comes after it is released. The part list stays in part
+  id order whichever of the two published first (a replacement can reserve an
+  id, a flush then reserve and publish higher ones, and the replacement publish
+  last).
+- **Before the commit an error changes nothing.** An id in `remove` that is not
+  live, or listed twice, is `InvalidArgument`, and so is anything the manifest
+  refuses (such as a new part whose id is live). The new parts are then not
+  live; their directories stay the caller's to delete, and a restart deletes
+  them otherwise. `Fatal` from the manifest puts the engine in the fatal state
+  as it does in a flush.
+- **After the commit the replacement is done.** A failure to delete a directory
+  is returned in `Replaced::deletion_errors`, recorded in the statistics by the
+  pass, and the directory is kept in a list that the next pass retries (the
+  directory is unreferenced, so a restart removes it too). A stage hook's
+  result or panic after the commit is ignored.
+- **Old snapshots are not disturbed.** A snapshot taken before the removal reads
+  the removed parts from files its readers hold open, so a read never fails
+  because a directory is gone. A directory that is already gone when the
+  deletion gets to it is not an error.
+
+The split map stores positions in the part list, so it is rebuilt for the new
+list, in memory and outside the core lock:
+
+- The old map is renumbered: each of its entries (one per split trace) loses
+  the holders that were removed, is mapped to the new positions, and is
+  dropped if fewer than two holders are left. Cost: the number of split
+  traces; no part is read.
+- For the added parts, the same merge over their sorted trace indexes and a
+  galloping step in every other part's index as a flush does: the added parts'
+  traces times, per other part, a step of at most the logarithm of its size
+  over those traces. With nothing added (retention) there is no such step.
+- Allocating the new list costs the number of live parts.
+
+So a removal costs the number of live parts plus the number of split traces,
+and a merge adds the traces of the merged part times the number of live parts
+(with the logarithm above).
+
+Crash points. The stage names are those of the stage hook; the crash tests
+abort the process at each and reopen. Start-up deletes the directories the
+manifest does not reference after the replay, and a part id that reached the
+disk is never reused, so no new rule is needed:
+
+| Crash at / during | On disk | Recovery |
+|---|---|---|
+| before the commit | the new parts' directories, unreferenced; the old parts live | the new directories are deleted at start-up; nothing was removed |
+| `ReplaceCommitted` (after the commit, before the publish) | the manifest has the new list; the removed parts' directories still exist, unreferenced | the manifest decides: the removed parts are gone, the new ones live; the leftover directories are deleted at start-up |
+| `ReplacePublished` (before any deletion) | as above | as above |
+| `PartDirDeleted` (once per directory; in the middle of deleting several) | some of the removed directories deleted, the rest unreferenced | the rest are deleted at start-up |
+
+After each crash the database reopens with exactly the surviving data (what
+the manifest lists, plus the log's records after `wal_flushed_lsn`), and
+nothing acknowledged is lost: a replacement does not touch `wal_flushed_lsn`
+or the log.
+
+## Retention
+
+`EngineOptions::retention` is `None` (keep everything, the default) or a
+duration. A part is expired when its whole time window is older than the
+retention: `window_start_ns + window_ns <= now - retention`, computed without
+overflow. A maintenance pass removes all expired parts with one replacement,
+so retention is atomic for queries: a snapshot sees the expired parts or not,
+never some of them. The clock is `EngineOptions::clock` (Unix nanoseconds; a
+test facility like the stage hook), by default the system clock. A retention
+of zero and a `maintenance_interval` of zero are refused by `open`.
+
+**A trace is kept for at least the retention after the start of its window,
+and for at most the retention plus one window plus one maintenance
+interval.** At least, because a part is not removed before its whole window
+has ended and the retention after that has passed, and a span starts inside
+the window of the part that holds it. At most, because a part is expired one
+window plus the retention after its window starts, and a pass looks at the
+clock every `maintenance_interval` (or sooner, after a flush). Time spent in
+the pass comes on top (a commit and some deletions), and so does the age of
+data in the buffer: a part is written when the data is flushed, up to
+`flush_interval` after it arrived.
+
+What this means for particular data:
+
+- **Data that is already expired when it arrives** is nothing special: it is
+  logged, acknowledged, visible to queries while it is in the buffer, written
+  by a flush into a part like any other, and removed by the first pass after
+  that. It leaves queries one flush and one pass after it arrived.
+- **Data with timestamps in the future** is kept until its window ages out: its
+  part is not expired until `now` has passed the end of its window plus the
+  retention. A sender whose clock is a year ahead has its data kept a year
+  longer.
+- **A trace is cut by window.** A part holds the traces of one window of one
+  flush, each in the window of its earliest span in that flush's buffer.
+  Retention removes parts, so a trace whose spans were flushed into different
+  windows (late spans, a trace longer than a window) can lose its older part
+  and keep the newer one; queries then return what is left.
+- **The buffer is not touched.** Data in the buffer, expired or not, is
+  removed only after a flush has written it into a part.
+
+Statistics: `maintenance_passes` (every pass counts, failed ones too),
+`retention_parts_removed` and `last_maintenance_error`. A pass that fails
+records its error there (a later success does not clear it, like `last_error`)
+and the next pass tries again; a failed step does not keep the later steps of
+the pass from running.
+
+**Where merging will go.** `choose_and_merge_parts` in the pass is empty: a
+later step chooses parts there, writes the merged part with the merge function
+of `nwdb-segment`, and publishes it with `replace_parts`. Nothing else is
+prepared.
 
 ## Stored text
 
@@ -222,12 +390,16 @@ unique.
   `IdsRaised`, `ReplayFinished`, `LeftoversDeleted`.
 - A flush: `FlushFrozen`, `PartWritten` (once per part), `AllPartsWritten`
   (before the commit), `Committed` (before publishing), `Published`
-  (before the trim), `Trimmed`.
+  (before the log is rotated), `LogRotated` (before the trim), `Trimmed`.
+- A replacement of parts: `ReplaceCommitted` (before publishing),
+  `ReplacePublished` (before any directory is deleted), `PartDirDeleted`
+  (after each directory).
 
 An error returned at a stage before the manifest commit is handled exactly as
 if that step had failed with that error (`Fatal` puts the engine in the fatal
 state; anything else restores the buffer and removes the parts of that
-attempt). After the commit the return value is ignored, and so is a panic.
+attempt). After the commit the return value is ignored, and so is a panic;
+this covers every stage from `Committed` on, the replacement stages included.
 
 
 ## Reads
@@ -279,8 +451,8 @@ does not block, and is not blocked by, ingest or flush.
   new parts' traces, plus for each of them a galloping step in every old part's
   index. `get_trace` uses it too: a trace in the map is read from its parts
   only, and any other trace is in at most one part, so the search of the
-  indexes ends at the first part that has it. If compaction later removes
-  parts, the part numbers in the map must be rebuilt with the list.
+  indexes ends at the first part that has it. When parts are removed, the part
+  numbers in the map are rebuilt with the list (see Replacing parts).
 - Token sums: a negative count in a column (possible from another ingest
   path; the OTLP door never stores one) counts as 0, so every term is
   non-negative and saturating addition gives the same total however the spans
@@ -323,7 +495,9 @@ root, not the earliest.
   buffered.
 - Flush is one part per window per flush: many windows in one buffer make many
   small parts. Compaction is a later checkpoint.
-- No retention, no compaction, no object store.
+- Retention removes whole parts and nothing else: the buffer and the log are
+  not touched by it. There is no compaction yet (the merge is a later step),
+  and no object store.
 - The age limit counts from the first batch that entered an empty buffer.
 - A callback that panics is caught and ignored; a panic anywhere else on the
   applier thread would leave `shutdown` waiting.
@@ -343,8 +517,8 @@ from `FlushFrozen` to `Trimmed` through the stage hook. Two kinds of test run it
   trim) and how many left a temporary or an unreferenced finished part
   directory behind, looking at the directory without opening the manifest.
 - `tests/crash_stages.rs` makes the child abort itself (`std::process::abort`)
-  at a named stage on its n-th occurrence, so every flush stage and every
-  start-up stage is hit deterministically. For each it checks the on-disk state
+  at a named stage on its n-th occurrence, so every flush stage, every
+  replacement stage and every start-up stage is hit deterministically. For each it checks the on-disk state
   that stage should leave (for example unreferenced finished parts after
   `AllPartsWritten`; referenced parts and obsolete log files after
   `Committed`), reopens, and checks every acknowledged record is present
@@ -358,7 +532,19 @@ that the replay would flush after every record, leaves the directory byte for
 byte as it was and that restoring what was lost lets it open;
 `tests/injected.rs` injects errors and panics through the hook;
 `tests/shutdown_races.rs` runs `flush`, `ingest` and two `shutdown` calls at
-once.
+once. `tests/log_rotation.rs` checks the size of `wal/` after a flush and
+opens a copy of the directory taken at each stage of a flush, with records
+acknowledged after the freeze, to see that exactly the records not in parts are
+replayed. `tests/retention.rs` runs retention against a model with a clock the
+test moves (across flushes and restarts), checks the boundaries, the thread,
+shutdown during a pass, and ingest, flush, queries and maintenance at once for
+a few seconds. The replace operation itself, which no public call reaches, is
+tested inside the crate (`src/replace_tests.rs`): an old snapshot reads every
+trace after the removal, a flush and a replacement wait for each other, errors
+before the commit change nothing, and a directory that cannot be deleted is
+retried. `tests/crash_stages.rs` also starts the child on a directory with
+expired parts and a fixed clock, so that retention's replacement is aborted at
+each of its stages.
 
 Known limit: killing a process does not drop the operating system's page
 cache, so a write that was never synced is still seen by the next start. The

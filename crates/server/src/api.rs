@@ -413,6 +413,9 @@ async fn stats(State(api): State<Api>) -> Response {
             "payload_logical_bytes": s.payload_logical_bytes,
             "payload_unique_bytes": s.payload_unique_bytes,
             "payload_stored_bytes": s.payload_stored_bytes,
+            "maintenance_passes": s.maintenance_passes,
+            "retention_parts_removed": s.retention_parts_removed,
+            "last_maintenance_error": s.last_maintenance_error,
         }),
     )
 }

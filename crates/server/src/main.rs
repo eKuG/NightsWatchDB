@@ -51,6 +51,7 @@ async fn run(config: Config) -> ExitCode {
     options.api_addr = config.api_addr;
     options.api_allowed_hosts = config.api_allowed_hosts;
     options.engine.accept_lost_log = config.accept_lost_log;
+    options.engine.retention = config.retention;
     eprintln!(
         "nightswatchdb {}: opening {}",
         env!("CARGO_PKG_VERSION"),

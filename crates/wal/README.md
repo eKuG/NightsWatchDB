@@ -59,6 +59,39 @@ filesystems that persist a file's size before its data, such a file would be
 a zero-filled header). A newly created log directory is synced into its parent
 (best effort: skipped on platforms where a directory cannot be synced).
 
+### Rotation
+
+`truncate_before` removes only files wholly below a position and never the
+newest file, and the newest file is replaced only when it would pass
+`max_file_bytes`. A caller that has written everything into data files would
+therefore keep up to a whole file of records it no longer needs (a benchmark
+found 134 MB of log after everything had been flushed). `Wal::rotate` starts a
+new file at the current write position on demand, so the trim that follows can
+remove the old one.
+
+`rotate` returns `Ok(true)` if it started a file and `Ok(false)` if the newest
+file holds no records (a second call, or a fresh log), in which case nothing
+changes. The log thread does it between two groups: it syncs the file it has
+written, creates the new file the way a roll does (header written and synced
+under a `.tmp` name, renamed, directory synced), and the records still queued
+go to the new file. The new file's first number is the number of the next
+record, so numbering stays gapless and the newest file is never removed. A
+failed sync or file creation poisons the log, as in a roll, and `rotate`
+returns `Error::Fatal`.
+
+A crash leaves a log that opens, whichever step it hit:
+
+- before the new file exists: the old log, unchanged;
+- while it is being created: a `.tmp` file, which `open` removes;
+- after the rename: a newest file that holds only its header, numbered one past
+  the last record. It is valid, holds no records, and appending continues in
+  it;
+- after the old files are trimmed: the header-only file alone. If the caller's
+  `min_next_lsn` equals its number, the log ends exactly at the caller's
+  position, which is healthy and opens; replay from that number replays
+  nothing. A caller whose position is higher than the log's end still gets the
+  lost-log refusal below.
+
 ## Recovery
 
 `Wal::open` lists the files and checks them in order.

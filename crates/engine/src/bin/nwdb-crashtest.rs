@@ -26,6 +26,10 @@
 //!   only, so the point at which it aborts does not depend on timing.
 //! - `NWDB_BUFFER_BYTES=<n>` overrides the buffer size, so that a recovery
 //!   flushes while it replays.
+//! - `NWDB_RETENTION_NS=<n>` and `NWDB_CLOCK_NS=<t>` turn retention on with a
+//!   clock fixed at `t` (Unix nanoseconds), so the maintenance pass that runs
+//!   at start-up removes the parts that are expired at `t` by a replacement
+//!   whose stages the abort variable can name.
 
 #[path = "../../tests/common/mod.rs"]
 mod common;
@@ -82,6 +86,14 @@ fn main() {
     });
     if let Ok(n) = std::env::var("NWDB_BUFFER_BYTES") {
         o.buffer_bytes = n.parse().expect("NWDB_BUFFER_BYTES");
+    }
+    if let Ok(n) = std::env::var("NWDB_RETENTION_NS") {
+        o.retention = Some(Duration::from_nanos(n.parse().expect("NWDB_RETENTION_NS")));
+        let now: i64 = std::env::var("NWDB_CLOCK_NS")
+            .expect("NWDB_CLOCK_NS with NWDB_RETENTION_NS")
+            .parse()
+            .expect("NWDB_CLOCK_NS");
+        o.clock = Some(Arc::new(move || now));
     }
     let seen = AtomicU64::new(0);
     o.stage_hook = Some(Arc::new(move |stage: Stage| {

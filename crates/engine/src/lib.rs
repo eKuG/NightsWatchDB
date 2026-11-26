@@ -19,11 +19,17 @@
 
 mod engine;
 mod flush;
+mod maintenance;
 mod query;
 mod rows;
 mod split;
 
-pub use engine::{Engine, EngineOptions, EngineStats, Stage, StageHook};
+#[cfg(test)]
+extern crate self as nwdb_engine;
+#[cfg(test)]
+mod replace_tests;
+
+pub use engine::{Clock, Engine, EngineOptions, EngineStats, Stage, StageHook};
 pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
 
 use std::sync::{Mutex, MutexGuard};

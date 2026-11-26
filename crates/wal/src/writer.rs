@@ -6,7 +6,7 @@ use std::io::Write;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use nwdb_core::{Error, Result};
@@ -62,10 +62,18 @@ pub(crate) fn sync_dir(dir: &Path, mode: SyncMode) -> std::io::Result<()> {
     Ok(())
 }
 
+/// What the log thread does next.
+enum Work {
+    Batch(Vec<Item>),
+    Rotate(mpsc::Sender<Result<bool>>),
+}
+
 pub(crate) struct Writer {
     pub shared: Arc<Shared>,
     pub options: WalOptions,
     pub file: File,
+    /// Sequence number of the active file's first record.
+    pub file_first: Lsn,
     /// Size of the active file including bytes written but not yet synced.
     pub file_size: u64,
     pub file_records: u64,
@@ -87,7 +95,25 @@ impl Writer {
     }
 
     fn run_loop(&mut self, inflight: &mut Vec<Item>) {
-        while let Some(batch) = self.next_batch() {
+        while let Some(work) = self.next_batch() {
+            let batch = match work {
+                Work::Rotate(reply) => {
+                    match self.rotate() {
+                        Ok(rotated) => {
+                            let _ = reply.send(Ok(rotated));
+                        }
+                        Err(e) => {
+                            // A failed sync or file creation is treated as in
+                            // a roll: the log is poisoned.
+                            let _ = reply.send(Err(poison_error(&e.to_string())));
+                            self.shared.poison(e.to_string(), Vec::new());
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                Work::Batch(batch) => batch,
+            };
             *inflight = batch;
             match self.commit(inflight) {
                 Ok(()) => {
@@ -112,11 +138,19 @@ impl Writer {
 
     /// Waits for work and returns it, honouring the minimum spacing between
     /// syncs. Returns `None` once shutdown was requested and the queue is empty.
-    fn next_batch(&mut self) -> Option<Vec<Item>> {
+    fn next_batch(&mut self) -> Option<Work> {
         let mut st = lock(&self.shared.state);
         loop {
-            while st.queue.is_empty() && !st.shutdown {
+            // A rotation goes between two groups, before the records that are
+            // still queued; they are written to the new file.
+            if !st.rotations.is_empty() {
+                return Some(Work::Rotate(st.rotations.remove(0)));
+            }
+            while st.queue.is_empty() && !st.shutdown && st.rotations.is_empty() {
                 st = self.shared.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+            if !st.rotations.is_empty() {
+                continue;
             }
             if st.queue.is_empty() {
                 return None;
@@ -137,7 +171,7 @@ impl Writer {
                     continue;
                 }
             }
-            return Some(std::mem::take(&mut st.queue));
+            return Some(Work::Batch(std::mem::take(&mut st.queue)));
         }
     }
 
@@ -176,6 +210,17 @@ impl Writer {
         Ok(())
     }
 
+    /// Starts a new file at the write position unless the active file holds no
+    /// records. Everything in the active file has been synced by the group
+    /// that wrote it; `roll` syncs it again before the new file exists.
+    fn rotate(&mut self) -> Result<bool> {
+        if self.file_records == 0 {
+            return Ok(false);
+        }
+        self.roll(self.file_first + self.file_records)?;
+        Ok(true)
+    }
+
     /// Finishes the active file and starts one whose first record is `first`.
     fn roll(&mut self, first: Lsn) -> Result<()> {
         // The old file must be durable before the new one is used, otherwise
@@ -184,6 +229,7 @@ impl Writer {
         let mut files = lock(&self.shared.files);
         self.file = create_file(&self.shared.dir, first, self.options.sync)?;
         files.push(first);
+        self.file_first = first;
         self.file_size = format::HEADER_LEN;
         self.file_records = 0;
         Ok(())
@@ -220,12 +266,18 @@ impl Shared {
     /// acknowledged: `inflight` (taken off the queue by the log thread) first,
     /// then whatever is still queued.
     pub(crate) fn poison(&self, msg: String, inflight: Vec<Item>) {
-        let queued = {
+        let (queued, rotations) = {
             let mut st = lock(&self.state);
             st.poisoned.get_or_insert_with(|| msg.clone());
             st.pending_bytes = 0;
-            std::mem::take(&mut st.queue)
+            (
+                std::mem::take(&mut st.queue),
+                std::mem::take(&mut st.rotations),
+            )
         };
+        for r in rotations {
+            let _ = r.send(Err(poison_error(&msg)));
+        }
         for item in inflight.into_iter().chain(queued) {
             let err: Error = poison_error(&msg);
             let _ = catch_unwind(AssertUnwindSafe(|| (item.done)(Err(err))));

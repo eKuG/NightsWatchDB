@@ -29,6 +29,10 @@ use crate::split::SplitMap;
 /// again. An explicit [`Engine::flush`] is never delayed by it.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// How long the maintenance thread sleeps between passes when nothing wakes
+/// it earlier.
+const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Settings for [`Engine::open`].
 #[derive(Clone)]
 pub struct EngineOptions {
@@ -86,10 +90,23 @@ pub struct EngineOptions {
     /// is ignored. A panic in it before the commit is a fatal flush error.
     /// Leave it `None` outside tests.
     pub stage_hook: Option<StageHook>,
+    /// How often the maintenance thread runs a pass when no flush woke it
+    /// sooner; must be positive. Default 10 seconds.
+    pub maintenance_interval: Duration,
+    /// How long data is kept. A part is removed by a maintenance pass once its
+    /// whole time window is older than this: `window_start_ns + window_ns <=
+    /// now - retention`. `None` keeps everything. Default `None`.
+    pub retention: Option<Duration>,
+    /// The clock retention reads, Unix nanoseconds. A test facility, in the
+    /// manner of [`stage_hook`](Self::stage_hook); `None` is the system clock.
+    pub clock: Option<Clock>,
 }
 
 /// The type of [`EngineOptions::stage_hook`].
 pub type StageHook = Arc<dyn Fn(Stage) -> Result<()> + Send + Sync>;
+
+/// The type of [`EngineOptions::clock`]: Unix nanoseconds.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 /// A point of start-up or of a flush, for [`EngineOptions::stage_hook`]. A
 /// test facility: the names and the points may change with the engine.
@@ -120,8 +137,20 @@ pub enum Stage {
     /// The parts are visible to queries and the frozen buffer is gone, before
     /// the log is trimmed.
     Published,
+    /// The log started a new file, so that the trim that follows can remove
+    /// the records that are now in parts (only in a flush that trims).
+    LogRotated,
     /// The log was trimmed (only in a flush that trims).
     Trimmed,
+    /// A replacement of parts committed to the manifest, before the new part
+    /// list is published to queries.
+    ReplaceCommitted,
+    /// The new part list is visible to queries, before any directory of a
+    /// removed part is deleted.
+    ReplacePublished,
+    /// The directory of one removed part was deleted (called once per
+    /// directory), before the next one.
+    PartDirDeleted,
 }
 
 /// Calls the hook, if there is one.
@@ -145,6 +174,9 @@ impl std::fmt::Debug for EngineOptions {
             .field("splitter", &self.splitter.as_ref().map(|_| "<splitter>"))
             .field("dedup_window_bytes", &self.dedup_window_bytes)
             .field("stage_hook", &self.stage_hook.as_ref().map(|_| "<hook>"))
+            .field("maintenance_interval", &self.maintenance_interval)
+            .field("retention", &self.retention)
+            .field("clock", &self.clock.as_ref().map(|_| "<clock>"))
             .finish()
     }
 }
@@ -168,6 +200,9 @@ impl EngineOptions {
             splitter: None,
             dedup_window_bytes: nwdb_segment::DEFAULT_DEDUP_WINDOW_BYTES,
             stage_hook: None,
+            maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+            retention: None,
+            clock: None,
         }
     }
 }
@@ -206,6 +241,15 @@ pub struct EngineStats {
     /// Bytes the live parts' piece stores take on disk, compressed. The
     /// distance from `payload_logical_bytes` is what sharing saves.
     pub payload_stored_bytes: u64,
+    /// Maintenance passes run since the engine was opened, failed ones
+    /// included.
+    pub maintenance_passes: u64,
+    /// Parts removed by retention since the engine was opened.
+    pub retention_parts_removed: u64,
+    /// The error of the most recent maintenance pass that failed, if any. A
+    /// later pass that succeeds does not clear it (like `last_error`); the
+    /// pass count shows that passes go on.
+    pub last_maintenance_error: Option<String>,
 }
 
 /// A live part: its metadata and an open reader.
@@ -250,6 +294,12 @@ pub(crate) struct Core {
     pub bytes: u64,
     pub flushes: u64,
     pub last_error: Option<String>,
+    pub stop_maintenance: bool,
+    /// A flush finished (or the engine started) since the last pass began.
+    pub maintenance_due: bool,
+    pub maintenance_passes: u64,
+    pub retention_removed: u64,
+    pub last_maintenance_error: Option<String>,
 }
 
 struct Pending {
@@ -279,6 +329,8 @@ pub(crate) struct Inner {
     pub core: Mutex<Core>,
     /// Wakes the flusher.
     pub flusher_cv: Condvar,
+    /// Wakes the maintenance thread.
+    pub maintenance_cv: Condvar,
     /// Signals that `outstanding` reached zero.
     idle_cv: Condvar,
     queue: Arc<Queue>,
@@ -287,6 +339,17 @@ pub(crate) struct Inner {
     pub parts_dir: PathBuf,
     /// One flush at a time.
     pub flush_gate: Mutex<()>,
+    /// Held from just before a manifest commit that changes the part list
+    /// until the new list is published, by a flush and by a replacement alike,
+    /// so their commit-and-publish steps never interleave. Never held while
+    /// parts are written or directories are deleted.
+    pub publish_gate: Mutex<()>,
+    /// One maintenance pass at a time, whether from the thread or from
+    /// [`Engine::run_maintenance`].
+    pub maintenance_gate: Mutex<()>,
+    /// Directories of removed parts that could not be deleted yet; the next
+    /// pass tries again. They are unreferenced, so a restart deletes them too.
+    pub undeleted: Mutex<Vec<PathBuf>>,
     lock_file: Mutex<Option<File>>,
     threads: Mutex<Threads>,
     /// Held for the whole of `shutdown`, so a second caller waits for the
@@ -294,11 +357,12 @@ pub(crate) struct Inner {
     shut_down: Mutex<bool>,
 }
 
-/// The two engine threads, until shutdown takes them.
+/// The engine threads, until shutdown takes them.
 #[derive(Default)]
 struct Threads {
     applier: Option<(ThreadId, JoinHandle<()>)>,
     flusher: Option<(ThreadId, JoinHandle<()>)>,
+    maintenance: Option<(ThreadId, JoinHandle<()>)>,
 }
 
 struct Handle {
@@ -360,7 +424,7 @@ fn decode_record(
     Ok((batches, bytes))
 }
 
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     // Best effort by design: the callers only use it to make a deletion
     // durable sooner, and a leftover is deleted again at the next start-up.
     if let Ok(d) = File::open(dir) {
@@ -401,6 +465,16 @@ impl Engine {
         }
         if options.buffer_bytes == 0 {
             return Err(Error::invalid_argument("buffer_bytes must be positive"));
+        }
+        if options.maintenance_interval.is_zero() {
+            return Err(Error::invalid_argument(
+                "maintenance_interval must be positive",
+            ));
+        }
+        if options.retention.is_some_and(|r| r.is_zero()) {
+            return Err(Error::invalid_argument(
+                "retention must be positive (None keeps everything)",
+            ));
         }
         let mut decoder_map = HashMap::new();
         for (tag, d) in decoders {
@@ -586,14 +660,25 @@ impl Engine {
                 bytes: 0,
                 flushes: 0,
                 last_error: None,
+                stop_maintenance: false,
+                // A pass right after start-up removes what expired while the
+                // engine was down.
+                maintenance_due: true,
+                maintenance_passes: 0,
+                retention_removed: 0,
+                last_maintenance_error: None,
             }),
             flusher_cv: Condvar::new(),
+            maintenance_cv: Condvar::new(),
             idle_cv: Condvar::new(),
             queue: Arc::default(),
             wal: RwLock::new(None),
             manifest,
             parts_dir,
             flush_gate: Mutex::new(()),
+            publish_gate: Mutex::new(()),
+            maintenance_gate: Mutex::new(()),
+            undeleted: Mutex::new(Vec::new()),
             lock_file: Mutex::new(Some(lock_file)),
             threads: Mutex::new(Threads::default()),
             shut_down: Mutex::new(false),
@@ -636,7 +721,7 @@ impl Engine {
         })
     }
 
-    fn inner(&self) -> &Arc<Inner> {
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
         &self.handle.inner
     }
 
@@ -809,7 +894,21 @@ impl Engine {
                 .iter()
                 .map(|p| p.meta.payload.stored_bytes)
                 .sum(),
+            maintenance_passes: c.maintenance_passes,
+            retention_parts_removed: c.retention_removed,
+            last_maintenance_error: c.last_maintenance_error.clone(),
         }
+    }
+
+    /// Runs one maintenance pass now, on the calling thread, and returns its
+    /// result: the same pass the maintenance thread runs, serialised with it.
+    /// For tests and for operators who want a pass without waiting for the
+    /// interval. A failure is also recorded in the statistics.
+    ///
+    /// [`Error::Unavailable`] once the engine is shut down, [`Error::Fatal`]
+    /// in the fatal state.
+    pub fn run_maintenance(&self) -> Result<()> {
+        self.inner().run_pass()
     }
 
     /// Stops accepting requests, waits for every accepted request to be
@@ -833,7 +932,7 @@ impl Inner {
     fn on_engine_thread(&self) -> bool {
         let me = std::thread::current().id();
         let t = lock(&self.threads);
-        [&t.applier, &t.flusher]
+        [&t.applier, &t.flusher, &t.maintenance]
             .into_iter()
             .flatten()
             .any(|(id, _)| *id == me)
@@ -909,6 +1008,8 @@ impl Inner {
         lock(&self.threads).applier = Some(applier);
         let flusher = spawn("nwdb-flusher", Inner::flusher_loop)?;
         lock(&self.threads).flusher = Some(flusher);
+        let maintenance = spawn("nwdb-maintenance", Inner::maintenance_loop)?;
+        lock(&self.threads).maintenance = Some(maintenance);
         Ok(())
     }
 
@@ -1033,12 +1134,26 @@ impl Inner {
                 c = self.idle_cv.wait(c).unwrap_or_else(|e| e.into_inner());
             }
             c.stop_flusher = true;
+            c.stop_maintenance = true;
             self.flusher_cv.notify_all();
+            self.maintenance_cv.notify_all();
         }
-        let Threads { applier, flusher } = std::mem::take(&mut *lock(&self.threads));
+        let Threads {
+            applier,
+            flusher,
+            maintenance,
+        } = std::mem::take(&mut *lock(&self.threads));
         if let Some((_, flusher)) = flusher {
             let _ = flusher.join();
         }
+        // A pass looks at the stop flag between its steps, so this waits for
+        // the step in progress and no longer (see the README).
+        if let Some((_, maintenance)) = maintenance {
+            let _ = maintenance.join();
+        }
+        // Also excludes a pass started by `run_maintenance` on another thread;
+        // none can start later, the stop flag is set.
+        let _pass = lock(&self.maintenance_gate);
 
         // The gate is held from the final flush until the log is shut down and
         // the directory lock released, so a `flush` that raced with this
