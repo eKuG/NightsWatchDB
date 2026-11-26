@@ -745,7 +745,8 @@ and no rope rebuilt (a test checks that a search of words reads no piece block;
 only a phrase, which has to be confirmed against its text, reads pieces). Only the
 `limit` best hits are held, so memory is one range of rows, the matching row
 numbers of one part, the hits and the winner cache described next (at most
-2^20 span entries, 8 bytes of span id and 16 of winner each plus map overhead).
+2^20 span entries, 8 bytes of span id and 16 of winner each plus map overhead;
+one trace with more spans than that is still held whole).
 
 The same span (trace id and span id) can be in two parts: a retry that crossed a
 flush, until a merge. Only its winning copy is a hit: the one with the smallest
@@ -760,7 +761,7 @@ ids and `arrival` of its rows are read, nothing else), once per search however
 many parts have matching rows in it: a trace split over H parts costs H reads,
 not H times H-1. The winner of every span id of the trace among all holders is
 kept in a cache shared by the whole search, bounded at 2^20 span entries in
-total; when adding a trace would pass the bound the cache is emptied first, which
+total (a single trace with more spans is still held whole); when adding a trace would pass the bound the cache is emptied first, which
 costs reads again and never changes the answer. The check is only for a hit
 whose trace is in the split map; a trace in one part is not checked. A search
 reads `span_id` and `arrival` of a split trace from every part that holds it, so

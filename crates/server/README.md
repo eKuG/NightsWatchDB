@@ -94,7 +94,9 @@ whose whole 15-minute time window is older than the retention, in one step, so
 a query sees a part or does not. **A trace is kept for at least the retention
 after the start of its window, and for at most the retention plus one window
 plus one maintenance interval** (a window is 15 minutes and the interval 10
-seconds, plus the time the flush interval and the pass themselves take).
+seconds, plus at most one step of a pass, the longest being one merge; data
+that waits in the buffer is also written up to the flush interval after it
+arrived).
 Data that is already older than the retention when it arrives is accepted,
 stored and then removed by a later pass; data with timestamps in the future is
 kept until its window has aged out. Retention works on whole parts: a trace
@@ -118,8 +120,10 @@ instead of rebuilding it, so the merged part is a good deal smaller than its
 inputs. Queries and ingest go on during a merge; a merge never crosses a window
 and takes at most 4 GiB of inputs. Retention runs first in each pass.
 `--no-compaction` turns it off; `--compaction-quiet 5m` waits longer before
-merging a window into one part. Shutdown waits for a merge that is running to
-finish (the engine README gives the bound); `/api/v1/stats` reports what
+merging a window into one part. A merge that is running when shutdown begins is
+abandoned: it leaves no part behind, loses nothing and is done again after the
+next start; shutdown waits only for the input being verified or the chunk being
+written (the engine README gives the bound). `/api/v1/stats` reports what
 compaction has done.
 
 ### A lost log
@@ -432,7 +436,8 @@ the other promoted attributes are not text either (list traces by `service` and
 `model` instead). A span's text is all its messages together: a word matches if
 any message has it, a phrase must lie inside one message, and `AND`, `OR` and `-`
 combine spans. A span that was delivered twice into different parts is returned
-once. The search takes a concurrency slot like the other queries.
+once, from the copy that arrived first; a later copy is never returned, even when
+only the later copy matches the query or lies in the time range. The search takes a concurrency slot like the other queries.
 
 **Escaped text is searched as it reads.** Messages are often JSON, where a
 newline is written `\n` and `é` may be written `\u00e9`. When a message is one
@@ -450,10 +455,11 @@ a phrase must lie inside one message, never across two.
 
 A query that the parser refuses (nothing to search for, an unterminated quote or
 parenthesis, more than 64 operands, nesting deeper than 32, a query longer than
-16 KiB) or that is over a limit of one search of one part (a prefix that expands
-to more than 1,024 terms, more than 256 MiB of text to read to confirm phrases and
-words longer than 64 bytes, a word or phrase that matches more than 10 million
-rows of one part) is a 400 with the message.
+16 KiB) or that is over a limit (a prefix that expands to more than 1,024 terms or a
+word or phrase that matches more than 10 million rows, each counted in one part;
+more than 256 MiB of text to read to confirm phrases and words longer than 64
+bytes, one budget for the whole search, parts together) is a 400 with the
+message.
 
 ## Shutdown
 

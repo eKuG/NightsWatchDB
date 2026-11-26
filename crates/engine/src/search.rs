@@ -158,7 +158,8 @@ impl Held {
 /// For each span id, the smallest `(arrival, part)` among its copies.
 type Earliest = HashMap<[u8; 8], (u64, usize)>;
 
-/// The most span entries the winner cache of one search holds in total.
+/// The most span entries the winner cache of one search holds in total. One
+/// trace with more spans than this is still held whole.
 const RIVALS_MAX_ENTRIES: usize = 1 << 20;
 
 /// The winners of the split traces a search asked about. When adding a trace

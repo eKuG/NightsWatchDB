@@ -983,10 +983,13 @@ fn a_rotation_that_cannot_create_the_file_fails_without_poisoning_and_can_be_ret
     assert_eq!(replay_all(&wal, 0).len(), 4);
 }
 
-/// A rotation whose new file is created but whose directory cannot be synced:
-/// the file is removed again, so the log is as it was, and not poisoned.
+/// A rotation whose new file is renamed into place but whose directory cannot
+/// be synced: what is on disk is unknown, so the log is poisoned and the file
+/// is left where it is (removing it would not be durable either). After a
+/// restart the old file ends before the new file's first number and the new
+/// file is empty: the log opens, is contiguous, and appending goes on.
 #[test]
-fn a_rotation_whose_directory_sync_fails_removes_the_new_file_and_does_not_poison() {
+fn a_rotation_whose_directory_sync_fails_poisons_the_log_and_leaves_the_new_file() {
     let dir = tempfile::tempdir().unwrap();
     let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
     wal.append_blocking(b"one").unwrap();
@@ -997,16 +1000,25 @@ fn a_rotation_whose_directory_sync_fails_removes_the_new_file_and_does_not_poiso
         .push((dir.path().to_path_buf(), None));
     let err = wal.rotate().unwrap_err();
     writer::DIR_SYNC_FAULTS.lock().unwrap().clear();
-    assert!(!matches!(err, Error::Fatal(_)), "{err}");
-    assert_eq!(names(dir.path()), [file_name(1)], "the new file was left");
-    wal.append_blocking(b"three").unwrap();
-    assert!(wal.rotate().unwrap());
-    assert_eq!(names(dir.path()), [file_name(1), file_name(4)]);
+    assert!(matches!(err, Error::Fatal(_)), "{err}");
+    assert!(matches!(
+        wal.append_blocking(b"three"),
+        Err(Error::Fatal(_))
+    ));
+    assert!(matches!(wal.rotate(), Err(Error::Fatal(_))));
+    assert_eq!(names(dir.path()), [file_name(1), file_name(3)]);
+    drop(wal);
+
+    let (wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    assert_eq!(rec.last_lsn, 2);
+    assert_eq!(replay_all(&wal, 0).len(), 2);
+    assert_eq!(wal.append_blocking(b"three").unwrap(), 3);
+    assert_eq!(names(dir.path()), [file_name(1), file_name(3)]);
     wal.shutdown().unwrap();
 }
 
-/// The same, but the new file cannot be removed: what is on disk no longer
-/// matches what is written, so the log is poisoned.
+/// The same failure when the file cannot be removed either (it is replaced by
+/// a directory): still poisoned, as the file is not touched.
 #[test]
 fn a_rotation_that_leaves_its_new_file_behind_poisons_the_log() {
     let dir = tempfile::tempdir().unwrap();
