@@ -292,5 +292,5 @@ Known limits at this checkpoint:
 - A value shorter than 8 bytes is never stored as a piece, and text beyond
   16.7 million pieces in one part is stored in the row.
 - Verifying a part rebuilds every value in it.
-- Span-only data takes more space than the baseline, and token totals over
-  a long range are slower than the baseline, until parts are compacted.
+- Span-only data takes more space than the baseline until parts are
+  compacted. Token totals over a long range read every part on one thread.

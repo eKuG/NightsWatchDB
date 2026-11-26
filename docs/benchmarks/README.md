@@ -171,20 +171,31 @@ the answer cannot change. The responses have the same sizes before and after.
 **Beside the earlier numbers.** The datasets and the profile are the ones of
 experiment A, so the server can be set beside that experiment and beside the
 ClickHouse baseline measured then. They are not one run: the baseline was
-measured on another day through its own pipeline, and it used the
-OpenTelemetry Collector exporter's schema as shipped, which a tuned schema
-would beat.
+ClickHouse server loaded through the OpenTelemetry Collector's exporter with
+the exporter's own table (`ORDER BY (ServiceName, SpanName,
+toDateTime(Timestamp))`, one partition per day), measured on another day
+through its own pipeline. A schema tuned for these queries would beat it.
+
+Only rows that measure the same thing are compared:
 
 | | Server now | Experiment code | ClickHouse baseline |
 |---|---|---|---|
 | 8 GB of text, stored | 62.1 MB | 62.0 MB + 3.9 MB span tables | 495.8 MB |
-| 8 GB of text, token totals p50 | 5.5 ms | 1.4 ms | 420 ms |
-| 8 GB of text, list with a filter p50 | 0.6 to 1.1 ms | 0.34 ms | 586 ms |
 | 10M spans, stored | 560 MB | 385 MB | 469 MB |
 | 10M spans, open a trace p50 | 0.89 ms | 0.59 ms | 11.5 ms |
-| 10M spans, list newest 50 p50 | 0.76 ms | 7.0 ms | 4.9 ms |
-| 10M spans, list with a filter p50 | 0.8 to 1.0 ms | 8.8 ms | 773 ms |
-| 10M spans, token totals p50 | 379 ms | 86 ms | 272 ms |
+
+The list and aggregate queries of the harness are not the experiment's
+queries, so their times must not be set beside the experiment's or the
+baseline's:
+
+| Experiment and baseline measured | The harness measures | |
+|---|---|---|
+| Newest 50 traces of one service, in the middle half of the time range: 7.0 ms and 4.9 ms | Newest 50 of one service over the whole range: 0.95 ms | close, not the same range |
+| Newest 50 traces that have an error and use one model, same window: 8.8 ms and 773 ms | One filter at a time: 0.8 to 1.0 ms | not the same query |
+| Token totals of chat spans in the same window: 86 ms and 272 ms | Token totals of all spans over the whole range: 379 ms | the harness query reads about twice the range and every operation |
+
+An earlier version of this page compared those times directly. The harness
+needs the experiment's three queries before they can be compared.
 
 **Where the server is behind.**
 
@@ -192,9 +203,9 @@ would beat.
   than the baseline (469 MB). It is in 125 small parts that are never merged;
   compaction is checkpoint 6. Until that is built and measured, this is a
   deficit, not a promise.
-- Token totals over the whole range of the span-only data take 379 ms, slower
-  than the baseline's 272 ms. The query reads five columns of every part on
-  one thread.
+- Token totals over the whole range of the span-only data take 379 ms. The
+  query reads five columns of every part on one thread. Whether that is
+  ahead of or behind the baseline is not known until the same query is run.
 - Opening a large trace has a long tail: 59 ms at the 99th percentile on the
   text-heavy data, where a trace is megabytes of JSON.
 - Peak memory during a load is 0.8 to 1.2 GB with the default buffer sizes.
