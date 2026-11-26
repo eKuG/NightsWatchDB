@@ -16,15 +16,22 @@ fn stored() -> Vec<u8> {
 
 #[test]
 fn a_wrong_translation_to_inline_bytes_is_caught_when_read() {
-    // Wrong bytes of another length, and wrong bytes of the right length.
-    for wrong in [&b"other bytes"[..], b"0123456789abcdeX"] {
-        let mut moved = Vec::new();
-        let r = rope::translate(&stored(), |_| Ok(Mapped::Inline(wrong)), &mut moved);
-        assert!(
-            matches!(r, Err(RopeError::Length | RopeError::Checksum)),
-            "{wrong:?}: {r:?}"
-        );
-    }
+    // Bytes of another length are a length error; bytes of the right length
+    // that differ are a checksum error.
+    let mut moved = Vec::new();
+    let r = rope::translate(
+        &stored(),
+        |_| Ok(Mapped::Inline(b"other bytes")),
+        &mut moved,
+    );
+    assert!(matches!(r, Err(RopeError::Length)), "{r:?}");
+    let mut moved = Vec::new();
+    let r = rope::translate(
+        &stored(),
+        |_| Ok(Mapped::Inline(b"0123456789abcdeX")),
+        &mut moved,
+    );
+    assert!(matches!(r, Err(RopeError::Checksum)), "{r:?}");
 }
 
 #[test]
