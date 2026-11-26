@@ -82,18 +82,21 @@ and every number: [docs/benchmarks](docs/benchmarks/README.md).
 | | NightsWatchDB server | ClickHouse baseline (earlier run) |
 |---|---|---|
 | 8 GB of agent-trace text, stored | 62 MB | 496 MB |
+| ... newest 50 traces with an error and one model, median | 1.4 ms | 586 ms |
+| ... token totals of chat spans by model, median | 3.4 ms | 420 ms |
 | 10M spans without text, stored | 560 MB | 469 MB |
-| 10M spans, open a trace, median | 0.9 ms | 11.5 ms |
+| ... open a trace, median | 0.9 ms | 11.5 ms |
+| ... newest 50 traces of one service, median | 0.9 ms | 4.9 ms |
+| ... newest 50 traces with an error and one model, median | 1.0 ms | 773 ms |
+| ... token totals of chat spans by model, median | 196 ms | 272 ms |
 
-On the same ten million spans the server lists the newest 50 traces, with or
-without a filter, in under 1 ms, and sums tokens over the whole range in
-379 ms. Those are not set beside the baseline here because the harness does
-not yet run the baseline's exact list and aggregate queries.
+The queries and their parameters are the same on both sides. The runs are
+not: the baseline used the Collector exporter's schema as shipped and was
+measured on another day, and the server is measured over HTTP.
 
-It is ahead where the design is built and behind where it is not: span-only
-data is stored in many small parts until compaction exists. The baseline used
-the Collector exporter's schema as shipped and was not measured in the same
-run.
+It is behind where the design is not built yet: span-only data is stored in
+many small parts until compaction exists, and takes more space than the
+baseline.
 
 ## Running it
 

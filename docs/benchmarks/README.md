@@ -176,26 +176,39 @@ the exporter's own table (`ORDER BY (ServiceName, SpanName,
 toDateTime(Timestamp))`, one partition per day), measured on another day
 through its own pipeline. A schema tuned for these queries would beat it.
 
-Only rows that measure the same thing are compared:
+The harness also runs the experiment's three queries with the experiment's
+parameters (`exp_list1`, `exp_list2`, `exp_agg` in the result files of
+2026-11-26: the most frequent root service and request model, and the middle
+half of the time range), so these rows compare the same thing:
 
 | | Server now | Experiment code | ClickHouse baseline |
 |---|---|---|---|
 | 8 GB of text, stored | 62.1 MB | 62.0 MB + 3.9 MB span tables | 495.8 MB |
+| 8 GB of text, newest 50 traces with an error and one model, p50 | 1.4 ms | 0.34 ms | 586 ms |
+| 8 GB of text, token totals of chat spans by model, p50 | 3.4 ms | 1.4 ms | 420 ms |
 | 10M spans, stored | 560 MB | 385 MB | 469 MB |
-| 10M spans, open a trace p50 | 0.89 ms | 0.59 ms | 11.5 ms |
+| 10M spans, open a trace, p50 | 0.9 ms | 0.59 ms | 11.5 ms |
+| 10M spans, newest 50 traces of one service, p50 | 0.92 ms | 7.0 ms | 4.9 ms |
+| 10M spans, newest 50 traces with an error and one model, p50 | 0.99 ms | 8.8 ms | 773 ms |
+| 10M spans, token totals of chat spans by model, p50 | 196 ms | 86 ms | 272 ms |
 
-The list and aggregate queries of the harness are not the experiment's
-queries, so their times must not be set beside the experiment's or the
-baseline's:
+What still differs between the columns:
 
-| Experiment and baseline measured | The harness measures | |
-|---|---|---|
-| Newest 50 traces of one service, in the middle half of the time range: 7.0 ms and 4.9 ms | Newest 50 of one service over the whole range: 0.95 ms | close, not the same range |
-| Newest 50 traces that have an error and use one model, same window: 8.8 ms and 773 ms | One filter at a time: 0.8 to 1.0 ms | not the same query |
-| Token totals of chat spans in the same window: 86 ms and 272 ms | Token totals of all spans over the whole range: 379 ms | the harness query reads about twice the range and every operation |
-
-An earlier version of this page compared those times directly. The harness
-needs the experiment's three queries before they can be compared.
+- The server is measured over HTTP from another container and returns whole
+  trace summaries as JSON. The experiment code was timed in-process with files
+  open and returned fewer fields.
+- The baseline was measured on 2026-11-24 after `OPTIMIZE FINAL`, through its
+  own client. The server has no compaction, so it answers from 105 and 125
+  parts.
+- The server's data holds the small extra batch the harness sends before its
+  crash restart (750 and 2,464 spans), so the time window moves by a hair.
+- The server counts a trace as having an error when a span has an `error.type`
+  or an error status; the experiment used `error.type` alone. The generator
+  sets both together, so the answers are the same on this data.
+- The other list and token rows in the result files (`list_newest_50`,
+  `tokens_range` and so on) are the harness's own queries over the whole
+  range. They are not the experiment's queries and are not compared with it.
+  An earlier version of this page did compare them; that was a mistake.
 
 **Where the server is behind.**
 
@@ -203,9 +216,9 @@ needs the experiment's three queries before they can be compared.
   than the baseline (469 MB). It is in 125 small parts that are never merged;
   compaction is checkpoint 6. Until that is built and measured, this is a
   deficit, not a promise.
-- Token totals over the whole range of the span-only data take 379 ms. The
-  query reads five columns of every part on one thread. Whether that is
-  ahead of or behind the baseline is not known until the same query is run.
+- Token totals on the span-only data take 196 ms for the experiment's query,
+  ahead of the baseline (272 ms) and behind the experiment code (86 ms). The
+  query reads five columns of every part on one thread.
 - Opening a large trace has a long tail: 59 ms at the 99th percentile on the
   text-heavy data, where a trace is megabytes of JSON.
 - Peak memory during a load is 0.8 to 1.2 GB with the default buffer sizes.
