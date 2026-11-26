@@ -6,6 +6,8 @@ use std::io::Write;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
@@ -55,8 +57,30 @@ pub(crate) fn create_file(dir: &Path, first: Lsn, mode: SyncMode) -> std::io::Re
     Ok(file)
 }
 
+/// Directories whose sync fails, for tests. With `Some(first)` the file that
+/// starts at `first` is also replaced by a directory with something in it, so
+/// that it cannot be removed.
+#[cfg(test)]
+pub(crate) static DIR_SYNC_FAULTS: Mutex<Vec<(std::path::PathBuf, Option<Lsn>)>> =
+    Mutex::new(Vec::new());
+
 /// Syncs a directory so that file creations and removals in it are durable.
 pub(crate) fn sync_dir(dir: &Path, mode: SyncMode) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some((_, keep)) = DIR_SYNC_FAULTS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(d, _)| d == dir)
+    {
+        if let Some(first) = keep {
+            let stuck = format::file_path(dir, *first);
+            std::fs::remove_file(&stuck)?;
+            std::fs::create_dir(&stuck)?;
+            std::fs::write(stuck.join("x"), b"x")?;
+        }
+        return Err(std::io::Error::other("injected directory sync failure"));
+    }
     if mode == SyncMode::None {
         return Ok(());
     }

@@ -957,3 +957,46 @@ fn a_rotation_that_cannot_create_the_file_fails_without_poisoning_and_can_be_ret
     assert_eq!(rec.last_lsn, 4);
     assert_eq!(replay_all(&wal, 0).len(), 4);
 }
+
+/// A rotation whose new file is created but whose directory cannot be synced:
+/// the file is removed again, so the log is as it was, and not poisoned.
+#[test]
+fn a_rotation_whose_directory_sync_fails_removes_the_new_file_and_does_not_poison() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    wal.append_blocking(b"one").unwrap();
+    wal.append_blocking(b"two").unwrap();
+    writer::DIR_SYNC_FAULTS
+        .lock()
+        .unwrap()
+        .push((dir.path().to_path_buf(), None));
+    let err = wal.rotate().unwrap_err();
+    writer::DIR_SYNC_FAULTS.lock().unwrap().clear();
+    assert!(!matches!(err, Error::Fatal(_)), "{err}");
+    assert_eq!(names(dir.path()), [file_name(1)], "the new file was left");
+    wal.append_blocking(b"three").unwrap();
+    assert!(wal.rotate().unwrap());
+    assert_eq!(names(dir.path()), [file_name(1), file_name(4)]);
+    wal.shutdown().unwrap();
+}
+
+/// The same, but the new file cannot be removed: what is on disk no longer
+/// matches what is written, so the log is poisoned.
+#[test]
+fn a_rotation_that_leaves_its_new_file_behind_poisons_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
+    wal.append_blocking(b"one").unwrap();
+    wal.append_blocking(b"two").unwrap();
+    writer::DIR_SYNC_FAULTS
+        .lock()
+        .unwrap()
+        .push((dir.path().to_path_buf(), Some(3)));
+    let err = wal.rotate().unwrap_err();
+    writer::DIR_SYNC_FAULTS.lock().unwrap().clear();
+    assert!(matches!(err, Error::Fatal(_)), "{err}");
+    assert!(matches!(
+        wal.append_blocking(b"three"),
+        Err(Error::Fatal(_))
+    ));
+}
