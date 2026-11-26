@@ -177,7 +177,8 @@ that is stored interns nothing.
 ### Memory of a decoded request
 
 The memory of the decoded batches (`get_array_memory_size` summed) is at most
-8 times the size of the request, plus 64 KiB for each batch, for the shapes
+8 times the size of the request, plus 64 KiB for each batch and 8 bytes for
+each row (the `arrival` column, which the decoder fills with zeros), for the shapes
 the tests try: one large resource with many small spans, many small
 `ResourceSpans` each with its own resource, many small `ScopeSpans` under one
 large resource, and requests of random shape. The origin limit and the

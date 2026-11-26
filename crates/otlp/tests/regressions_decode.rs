@@ -102,6 +102,10 @@ const PER_BATCH: usize = 64 * 1024;
 /// The most the decoded batches may weigh, as a multiple of the request.
 const FACTOR: usize = 8;
 
+/// What the `arrival` column costs a row: eight bytes, which a decoder fills
+/// with zeros. The factor above was set for rows without it.
+const ARRIVAL_BYTES_PER_ROW: usize = 8;
+
 /// What minimal 30-byte spans can reach: one row of the table costs about 200
 /// bytes whatever the span holds, and Arrow's buffers grow by doubling, so a
 /// batch with few more rows than a power of two holds nearly twice that.
@@ -112,7 +116,9 @@ const MINIMAL_SPAN_FACTOR: f64 = 11.0;
 fn check_bound(name: &str, req: &[u8]) -> (f64, DecodeStats) {
     let (batches, stats) = decoder().decode_with_stats(req).unwrap();
     let used = memory(&batches);
-    let allowed = FACTOR * req.len() + PER_BATCH * batches.len();
+    let allowed = FACTOR * req.len()
+        + PER_BATCH * batches.len()
+        + ARRIVAL_BYTES_PER_ROW * stats.spans as usize;
     let factor = used as f64 / req.len() as f64;
     eprintln!(
         "{name}: request {} bytes, {} rows in {} batches, {used} bytes in memory ({factor:.2}x)",
@@ -206,8 +212,13 @@ fn decoded_memory_is_bounded_by_the_request_size() {
         max_rows: 100,
         max_bytes: usize::MAX,
     });
-    let (batches, _) = small.decode_with_stats(&req).unwrap();
-    assert!(memory(&batches) <= FACTOR * req.len() + PER_BATCH * batches.len());
+    let (batches, stats) = small.decode_with_stats(&req).unwrap();
+    assert!(
+        memory(&batches)
+            <= FACTOR * req.len()
+                + PER_BATCH * batches.len()
+                + ARRIVAL_BYTES_PER_ROW * stats.spans as usize
+    );
 }
 
 /// Measures the worst case for minimal spans: a batch whose row count is just

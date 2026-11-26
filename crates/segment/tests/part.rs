@@ -555,7 +555,7 @@ fn index_file_known_answer() {
 
     let mut want: Vec<u8> = Vec::new();
     want.extend_from_slice(b"NWTI");
-    want.extend_from_slice(&[6, 0, 0, 0]);
+    want.extend_from_slice(&[7, 0, 0, 0]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
     // Length (u64) and CRC-32C (u32) of spans.parquet, summary.parquet,
     // pieces.blk, pieces.idx, text.idx and text.rows.
@@ -1189,7 +1189,7 @@ fn part_meta_describes_the_part() {
 
     assert_eq!(meta.part_id, 42);
     assert_eq!(meta.level, 0);
-    assert_eq!(meta.format_version, 6);
+    assert_eq!(meta.format_version, 7);
     assert_eq!(meta.window_start_ns, window_start);
     assert_eq!(meta.window_ns, WINDOW_NS);
     assert_eq!(meta.rows, spans.len() as u64);
