@@ -7,7 +7,7 @@ use nwdb_core::Error;
 use nwdb_textindex::{IdListReader, IdListWriter};
 use rand::Rng;
 use rand::rngs::StdRng;
-use support::rng;
+use support::{CountingSource, rng};
 
 fn write(lists: &[Vec<u32>]) -> (Vec<u8>, nwdb_textindex::IdListMeta) {
     let mut out = Vec::new();
@@ -172,4 +172,91 @@ fn a_file_reader_serves_many_threads() {
         }
     });
     std::fs::remove_file(&path).unwrap();
+}
+
+/// Two groups of 128 keys, in the lists `base + key` and `base + key + 7`. The
+/// ids all take two bytes as varints, so a file built with another `base` has
+/// groups of the same lengths.
+fn two_groups(base: u32) -> Vec<u8> {
+    let lists: Vec<Vec<u32>> = (0..256u32).map(|k| vec![base + k, base + k + 7]).collect();
+    write(&lists).0
+}
+
+/// Where the second group lies in the file: `(start, end)`.
+fn second_group(file: &[u8]) -> (usize, usize) {
+    let f = file.len() - 40;
+    let groups = u32::from_le_bytes(file[f + 4..f + 8].try_into().unwrap());
+    assert_eq!(groups, 2);
+    let index = u64::from_le_bytes(file[f + 24..f + 32].try_into().unwrap()) as usize;
+    let start = u64::from_le_bytes(file[index + 16 + 4..index + 16 + 12].try_into().unwrap());
+    (start as usize, index)
+}
+
+fn corrupt_or_panic<T: std::fmt::Debug>(r: nwdb_core::Result<T>, what: &str) {
+    assert!(matches!(r, Err(Error::Corrupt(_))), "{what}: {r:?}");
+}
+
+#[test]
+fn a_flipped_byte_in_one_group_is_corrupt_when_that_group_is_read() {
+    let clean = two_groups(1000);
+    let r = IdListReader::open(clean.as_slice()).unwrap();
+    for k in [0u32, 127, 128, 255] {
+        assert_eq!(
+            r.get(k).unwrap(),
+            [1000 + k, 1007 + k],
+            "clean file, key {k}"
+        );
+    }
+    let (start, end) = second_group(&clean);
+    // The last four bytes of a group are its own checksum.
+    for at in [start, start + 5, end - 5, end - 1] {
+        let mut v = clean.clone();
+        v[at] ^= 0x01;
+        // The file opens: the group index and footer are intact.
+        let r = IdListReader::open(v.as_slice()).unwrap();
+        assert_eq!(r.get(0).unwrap(), [1000, 1007], "the first group is fine");
+        assert_eq!(r.get(127).unwrap(), [1127, 1134]);
+        corrupt_or_panic(r.get(128), &format!("byte {at}, key 128"));
+        corrupt_or_panic(r.get(255), &format!("byte {at}, key 255"));
+    }
+}
+
+#[test]
+fn a_group_of_another_file_with_its_own_valid_checksum_is_corrupt() {
+    let a = two_groups(1000);
+    let b = two_groups(2000);
+    let (start, end) = second_group(&a);
+    assert_eq!(second_group(&b), (start, end), "the files have one layout");
+    let mut mixed = a.clone();
+    mixed[start..end].copy_from_slice(&b[start..end]);
+    let r = IdListReader::open(mixed.as_slice()).unwrap();
+    assert_eq!(r.get(5).unwrap(), [1005, 1012]);
+    // The group is whole and its own checksum holds; the group index of this
+    // file records the checksum of the group it wrote.
+    corrupt_or_panic(r.get(128), "a group from another file");
+}
+
+/// Keys of one group, asked for in ascending order, cost one read of the
+/// group, however many they are; a key of the next group costs one more.
+#[test]
+fn for_each_reads_a_group_once_for_all_its_keys() {
+    let file = two_groups(1000);
+    let src = CountingSource::new(file);
+    let r = IdListReader::open(&src).unwrap();
+    src.take_calls();
+    let mut seen = Vec::new();
+    r.for_each(0..128, |k, list| {
+        seen.push((k, list.decode()?));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen.len(), 128);
+    assert_eq!(src.take_calls(), 1, "128 keys of one group");
+    r.for_each(0..256, |_, _| Ok(())).unwrap();
+    assert_eq!(src.take_calls(), 2, "256 keys of two groups");
+    // Asked one key at a time, the same keys read the group each time.
+    for k in 0..4 {
+        r.get(k).unwrap();
+    }
+    assert_eq!(src.take_calls(), 4);
 }

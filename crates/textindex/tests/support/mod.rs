@@ -211,6 +211,7 @@ fn doc_matches(t: &[(String, bool)], q: &Query) -> bool {
 pub struct CountingSource {
     data: Vec<u8>,
     read: std::sync::atomic::AtomicU64,
+    calls: std::sync::atomic::AtomicU64,
     delay: std::time::Duration,
 }
 
@@ -224,8 +225,14 @@ impl CountingSource {
         Self {
             data,
             read: std::sync::atomic::AtomicU64::new(0),
+            calls: std::sync::atomic::AtomicU64::new(0),
             delay,
         }
+    }
+
+    /// Read calls made since the last call.
+    pub fn take_calls(&self) -> u64 {
+        self.calls.swap(0, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Bytes read since the last call.
@@ -242,6 +249,7 @@ impl ReadAt for CountingSource {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
         self.read
             .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.delay.is_zero() {
             std::thread::sleep(self.delay);
         }
