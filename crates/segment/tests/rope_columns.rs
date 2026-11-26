@@ -177,11 +177,21 @@ fn a_store_with_fewer_pieces_is_an_error_not_other_text_in_any_column() {
         drop(original);
         install(&part, scratch.path(), &sum);
 
-        let reader = PartReader::open(&part).unwrap();
-        let rows = reader.row_count();
-        let m = corrupt(reader.read_rows(0, rows, None).unwrap_err());
-        assert!(m.contains("piece"), "{column:?}: {m}");
-        corrupt(reader.verify().unwrap_err());
+        // The text index lists one document per piece, so a store with fewer
+        // pieces is refused when the part is opened. Should that check ever
+        // go, the read and `verify` must still refuse it.
+        match PartReader::open(&part) {
+            Err(e) => {
+                let m = corrupt(e);
+                assert!(m.contains("piece"), "{column:?}: {m}");
+            }
+            Ok(reader) => {
+                let rows = reader.row_count();
+                let m = corrupt(reader.read_rows(0, rows, None).unwrap_err());
+                assert!(m.contains("piece"), "{column:?}: {m}");
+                corrupt(reader.verify().unwrap_err());
+            }
+        }
     }
 }
 
