@@ -165,6 +165,11 @@ fn rope_error(inputs: &[&PartReader], i: usize, e: RopeError) -> Error {
             format!("spans.parquet: a stored value is malformed ({what})"),
         ),
         RopeError::Checksum => damaged(inputs, i, "spans.parquet: a stored value is damaged"),
+        RopeError::Length => damaged(
+            inputs,
+            i,
+            "spans.parquet: a stored value does not add up to the length it carries",
+        ),
         RopeError::Piece(e) => named(inputs, i, e),
     }
 }

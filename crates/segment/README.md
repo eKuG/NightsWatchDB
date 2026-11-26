@@ -64,7 +64,7 @@ A raw value is stored as a *rope*: a sequence of segments, each inline bytes or
 a reference to a piece of the store. The encoding is documented in
 `nwdb-payload`: an empty value is zero bytes, a value with no cuts is `0x00`
 and the value, and a value with cuts is `0x03`, the CRC-32C of the value
-(4 bytes), then `varint(len << 1)` and inline bytes, or `varint(id << 1 | 1)`
+(4 bytes), the length of the value (a varint), then `varint(len << 1)` and inline bytes, or `varint(id << 1 | 1)`
 for piece `id`. A null `events` or `links` stays null. The cuts are made in the
 value's original bytes and nothing is re-encoded, so reading concatenates the
 segments and gets the original back byte for byte. The checksum is there because
@@ -72,7 +72,9 @@ Parquet pages carry none and a read does not run `verify`: one flipped bit in a
 reference would otherwise return a piece of another span, perhaps another
 sender's text. The reader checks every rebuilt value that has references against
 its checksum and returns `Corrupt` instead of the bytes on a mismatch; a value
-with none is its own bytes and costs nothing extra.
+with none is its own bytes and costs nothing extra. The length is there so
+that a damaged run length cannot make a read allocate what the whole store
+holds (see Reading).
 
 Which bytes become pieces is decided by the `PayloadSplitter` in
 `WriterOptions::splitter` (`nwdb_otlp::OtlpSplitter` for OTLP); with none every
@@ -213,8 +215,8 @@ lengths, the checksum or the Parquet schema. An index with any other version
 is refused with an error that gives the version the part has and the one this
 build reads, and says that parts from development versions cannot be read.
 Versions 2 and 3 had shorter headers, version 4 ropes have no checksum, and
-version 5 has no text files; there is no migration, since the project has had no
-release.
+version 5 ropes have no length and version 5 parts no text files; there is no
+migration, since the project has had no release.
 
 Parquet 60.2.0 writes no page checksums and zstd's frame checksum is off, so
 damage that leaves the file structure intact would otherwise be returned as
@@ -224,14 +226,17 @@ files and records them here, once the files are complete (the piece store, the
 text files and the summary are written before the index). `PartReader::open`
 checks the lengths, and the CRC-32C of `pieces.idx`, which it reads in full
 anyway and which holds the checksum of every block; `PartReader::verify` checks
-the other CRCs, every block of the piece store, both text files and every rope.
+the other CRCs, every block of the piece store, both text files and every rope,
+and re-checks everything `open` checks (below).
 
 The checksum recorded for `pieces.idx` leaves out the file's last four bytes.
 They are the file's own CRC-32C, and the CRC-32C of a message with its CRC-32C
 appended is the same constant (0x48674bc7) for every message, so a checksum of
 the whole file would be the same for every part and bind nothing; over the rest
 it is that trailing checksum, which depends on every block's checksum. The
-other recorded CRCs are over every byte of their file.
+other recorded CRCs are over every byte of their file. Since nothing re-reads
+those four bytes after open, `verify` reads them again and compares them with
+the CRC-32C of the rest of the file.
 
 A record:
 
@@ -270,9 +275,22 @@ compared with the record before anything is read: their lengths first (a file
 extended to any size is not read), then, once `pieces.idx` has been read in
 full (it is read anyway), its CRC-32C. `pieces.idx` holds the checksum of every
 block, so this binds the blocks to the part: the piece files of another part are
-refused at open, even with equal lengths, naming `pieces.idx`. Open does not
-read the data pages or the blocks of the piece store.
+refused at open, naming `pieces.idx`, because its checksum differs, whatever
+the lengths. A `pieces.blk` of the same length alone, with this part's
+`pieces.idx`, passes open: its blocks are caught by their checksums when they
+are read and by `verify`. Open does not read the data pages or the blocks of
+the piece store.
 
+- **A part that passes `verify` opens.** `verify` checks again, against the
+  files as they are now, everything `open` checks: it reads `traces.idx` again
+  and requires it to decode to what was decoded at open (through the handle kept
+  from open, so it works after the directory has been removed, like the other
+  files), and it
+  checks the trailing checksum of `pieces.idx` against the rest of that file.
+  `merge_parts`'s input check (without the walk over the ropes) does the same.
+  A test flips a bit at every offset of every file of a small part, and at a
+  sample of offsets of a larger one, and requires that either `verify` on the
+  open reader fails or a fresh `open` succeeds and its own `verify` passes.
 - `PartReader::verify` re-reads all six data files and compares their length
   and CRC-32C with the recorded values (`Corrupt` naming the file on a
   mismatch), reads every block of the piece store, checks every segment of
@@ -304,8 +322,12 @@ read the data pages or the blocks of the piece store.
   decompressed 1,000). Memory beyond the output itself is one decompressed block
   and 16 bytes for each reference of the batch (at most one for every 8 bytes of
   output for an honest part, since a piece is at least 8 bytes by default).
-- A rope never decides how much is allocated. Before anything is allocated, the
-  reader refuses (`Corrupt`) a value whose references add up to more bytes than
+- A rope never decides how much is allocated. A rope with references records
+  the length of the value it rebuilds to; before anything is allocated the
+  reader adds up the segments and refuses (`Corrupt`) a value that does not add
+  up to it, stopping at the first segment that goes past it, so one flipped bit
+  in an inline run's length, which can turn text into hundreds of references to
+  a large piece, costs a few steps and no allocation. A value whose references add up to more bytes than
   `pieces.idx` records for the whole part, and a batch whose references together
   do (no honest value or batch can exceed the total of all references of its
   part), and a total that cannot be represented; the output is then reserved
@@ -605,6 +627,8 @@ columns; 4 stores `attrs`, `events` and `links` as ropes, adds `pieces.blk` and
 `pieces.idx`, and records their lengths and checksums in the index header; 5
 adds the CRC-32C of the rebuilt value to every rope that has a reference (the
 rope tag `0x03` is followed by 4 bytes of checksum), and makes `open` compare the
-CRC-32C of `pieces.idx` with the one in the index; 6 adds the text index and the
-piece-to-rows lists, `text.idx` and `text.rows`, and records their lengths and
-checksums in the index header (the header grows from 64 to 88 bytes).
+CRC-32C of `pieces.idx` with the one in the index; 6 adds the length of the
+rebuilt value to every rope that has a reference, after its checksum, and adds
+the text index and the piece-to-rows lists, `text.idx` and `text.rows`, and
+records their lengths and checksums in the index header (the header grows from
+64 to 88 bytes).

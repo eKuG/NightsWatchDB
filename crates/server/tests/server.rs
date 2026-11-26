@@ -626,9 +626,18 @@ async fn list_and_token_endpoints_with_filters() {
         "payload_logical_bytes",
         "payload_unique_bytes",
         "payload_stored_bytes",
+        "fatal",
+        "maintenance_passes",
+        "retention_parts_removed",
+        "last_maintenance_error",
     ] {
         assert!(stats.get(k).is_some(), "stats lacks {k}");
     }
+    // Nothing has been removed by retention and maintenance has had no error;
+    // the count of passes is a number whether or not one has run yet.
+    assert_eq!(stats["retention_parts_removed"], 0, "{stats}");
+    assert!(stats["last_maintenance_error"].is_null(), "{stats}");
+    assert!(stats["maintenance_passes"].is_u64(), "{stats}");
     server.shutdown().await.unwrap();
 }
 

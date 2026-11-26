@@ -35,9 +35,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// columns; version 4 stores `attrs`, `events` and `links` as ropes and adds
 /// the piece store, `pieces.blk` and `pieces.idx`, whose length and CRC-32C
 /// are in `traces.idx` too; version 5 adds the CRC-32C of the rebuilt value to
-/// every rope that has a reference; version 6 adds the text index and the
-/// piece-to-rows lists, `text.idx` and `text.rows`, whose length and CRC-32C
-/// are in `traces.idx` too.
+/// every rope that has a reference; version 6 adds the length of the rebuilt
+/// value to those ropes, and the text index and the piece-to-rows lists,
+/// `text.idx` and `text.rows`, whose length and CRC-32C are in `traces.idx`
+/// too.
 pub const FORMAT_VERSION: u32 = 6;
 
 /// The default for [`WriterOptions::dedup_window_bytes`]: 64 MiB.

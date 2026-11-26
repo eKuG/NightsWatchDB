@@ -262,7 +262,10 @@ impl PieceReader {
     /// Length and CRC-32C of `pieces.blk` and of `pieces.idx` as they are on
     /// disk now, read in full, for comparison with the values recorded when
     /// the part was written. Fails with [`Error::Corrupt`] if a file's length
-    /// is not the one it had when the store was opened.
+    /// is not the one it had when the store was opened, or if the last four
+    /// bytes of `pieces.idx` are not the CRC-32C of the rest of it: the
+    /// recorded checksum leaves them out, but `open` checks them, so a store
+    /// that passes here is one that opens.
     pub fn file_sums(&self) -> Result<(FileSum, FileSum)> {
         Ok((
             sum_of(&self.blk, BLOCKS_FILE, self.totals.stored_bytes, 0)?,
@@ -307,6 +310,24 @@ fn sum_of(file: &File, name: &str, opened_len: u64, tail: u64) -> Result<FileSum
             })?;
         crc = crc32c::crc32c_append(crc, &buf[..n]);
         at += n as u64;
+    }
+    // The bytes left out of the sum are the file's own checksum of the bytes
+    // before them: read them again, as `open` would.
+    if tail > 0 {
+        let mut trailer = [0u8; IDX_TRAILER as usize];
+        file.read_exact_at(&mut trailer, end)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    Error::corrupt(format!("{name}: file ended before its length"))
+                }
+                _ => Error::Io(e),
+            })?;
+        if u32::from_le_bytes(trailer) != crc {
+            return Err(Error::corrupt(format!(
+                "{name}: the file's own checksum, in its last {tail} bytes, does not match the \
+                 rest of the file"
+            )));
+        }
     }
     Ok(FileSum {
         len: opened_len,

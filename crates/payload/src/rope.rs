@@ -10,6 +10,7 @@
 //! empty value        ->  (no bytes)
 //! value with no cuts ->  0x00, the value
 //! value with cuts    ->  0x03, CRC-32C of the value (u32, little endian),
+//!                        varint(length of the value),
 //!                        then segments until the end:
 //!                          varint(len << 1),     len bytes of inline data
 //!                          varint(id << 1 | 1)   a reference to piece `id`
@@ -19,7 +20,10 @@
 //! empty value costs nothing. A value with cuts carries the checksum of the
 //! bytes it rebuilds to, so that a damaged reference, which Parquet would not
 //! notice, cannot splice in another value's text unseen: the reader checks it
-//! after rebuilding. A reference costs one to five bytes. Varints are the
+//! after rebuilding. It also carries the length of that value, which the
+//! segments must add up to: the reader compares the two before it allocates
+//! anything, so a damaged run length cannot make it reserve what the whole
+//! store holds. A reference costs one to five bytes. Varints are the
 //! usual little-endian base-128 form. Inline segments are never empty, and
 //! two segments of one kind may follow each other (two adjacent cuts are two
 //! references).
@@ -41,6 +45,8 @@ pub enum RopeError {
     Malformed(&'static str),
     /// The rebuilt value does not have the checksum the rope carries.
     Checksum,
+    /// The segments do not add up to the length the rope carries.
+    Length,
     /// Fetching a piece failed.
     Piece(Error),
 }
@@ -114,6 +120,7 @@ pub fn encode_cut(value: &[u8], cuts: &[Range<usize>], ids: &[u32], out: &mut Ve
     }
     out.push(TAG_SEGMENTS);
     out.extend_from_slice(&crc32c::crc32c(value).to_le_bytes());
+    put_varint(out, value.len() as u64);
     let mut at = 0;
     for (cut, &id) in cuts.iter().zip(ids) {
         if cut.start > at {
@@ -141,9 +148,9 @@ pub fn segments(rope: &[u8]) -> Segments<'_> {
                 failed: None,
             };
         }
-        Some((&TAG_SEGMENTS, rest)) => match rest.split_at_checked(CRC_LEN) {
-            Some((_, segments)) => (segments, None),
-            None => (&rope[..0], Some(RopeError::Malformed("truncated checksum"))),
+        Some((&TAG_SEGMENTS, rest)) => match header(rest) {
+            Ok((_, _, segments)) => (segments, None),
+            Err(e) => (&rope[..0], Some(e)),
         },
         Some(_) => (&rope[..0], Some(RopeError::Malformed("unknown rope tag"))),
     };
@@ -154,14 +161,35 @@ pub fn segments(rope: &[u8]) -> Segments<'_> {
     }
 }
 
+/// Splits what follows the tag of a rope with cuts into the checksum, the
+/// recorded length of the value and the segments.
+fn header(rest: &[u8]) -> Result<(u32, u64, &[u8]), RopeError> {
+    let Some((crc, mut segments)) = rest.split_at_checked(CRC_LEN) else {
+        return Err(RopeError::Malformed("truncated checksum"));
+    };
+    let len = get_varint(&mut segments)?;
+    let crc = u32::from_le_bytes(crc.try_into().expect("4 bytes"));
+    Ok((crc, len, segments))
+}
+
+/// The length a rope with cuts says its value has: the segments must add up
+/// to it. `Ok(None)` for a rope without cuts or an empty one, which carry no
+/// length; an error for a rope whose header is cut short or whose tag is
+/// unknown.
+pub fn recorded_len(rope: &[u8]) -> Result<Option<u64>, RopeError> {
+    match rope.split_first() {
+        None | Some((&TAG_INLINE, _)) => Ok(None),
+        Some((&TAG_SEGMENTS, rest)) => header(rest).map(|(_, len, _)| Some(len)),
+        Some(_) => Err(RopeError::Malformed("unknown rope tag")),
+    }
+}
+
 /// The checksum a rope with cuts carries: the CRC-32C of the value it
 /// rebuilds to. `None` for a rope without cuts, an empty one, or one too
 /// short to hold it.
 pub fn checksum(rope: &[u8]) -> Option<u32> {
     match rope.split_first() {
-        Some((&TAG_SEGMENTS, rest)) => rest
-            .first_chunk::<CRC_LEN>()
-            .map(|c| u32::from_le_bytes(*c)),
+        Some((&TAG_SEGMENTS, rest)) => header(rest).ok().map(|(crc, _, _)| crc),
         _ => None,
     }
 }
@@ -188,9 +216,9 @@ pub enum Mapped<'a> {
 }
 
 /// Appends to `out` a rope for the same value as `rope`, in which every
-/// reference is replaced as `map` says. Nothing is rebuilt: the checksum the
-/// rope carries is the CRC-32C of the value, which does not change, so it is
-/// copied as it is, and a reader of the result checks it exactly as it would
+/// reference is replaced as `map` says. Nothing is rebuilt: the checksum and
+/// the length the rope carries are those of the value, which does not change,
+/// so they are copied as they are, and a reader of the result checks it exactly as it would
 /// for a rope written from the value. A wrong `map` is therefore caught when
 /// the value is read, not trusted.
 ///
@@ -216,6 +244,7 @@ pub fn translate<'m>(
     let start = out.len();
     out.push(TAG_SEGMENTS);
     out.extend_from_slice(&crc.to_le_bytes());
+    put_varint(out, recorded_len(rope)?.unwrap_or(0));
     let mut any_piece = false;
     for segment in segments(rope) {
         let put_inline = |out: &mut Vec<u8>, b: &[u8]| {
@@ -297,18 +326,27 @@ impl<'a> Iterator for Segments<'a> {
 /// the piece with the given id to the vector it is given. If the rope carries
 /// a checksum and the rebuilt value does not match it, the result is
 /// [`RopeError::Checksum`] and `out` holds the bytes that failed: the caller
-/// must not use them.
+/// must not use them. If the value grows past the length the rope carries,
+/// the result is [`RopeError::Length`] as soon as the segment that did it has
+/// been appended, and at the end if it falls short.
 pub fn decode(
     rope: &[u8],
     mut piece: impl FnMut(u32, &mut Vec<u8>) -> Result<(), Error>,
     out: &mut Vec<u8>,
 ) -> Result<(), RopeError> {
     let start = out.len();
+    let recorded = recorded_len(rope)?;
     for seg in segments(rope) {
         match seg? {
             Segment::Inline(b) => out.extend_from_slice(b),
             Segment::Piece(id) => piece(id, out).map_err(RopeError::Piece)?,
         }
+        if recorded.is_some_and(|n| (out.len() - start) as u64 > n) {
+            return Err(RopeError::Length);
+        }
+    }
+    if recorded.is_some_and(|n| (out.len() - start) as u64 != n) {
+        return Err(RopeError::Length);
     }
     match checksum(rope) {
         Some(want) if crc32c::crc32c(&out[start..]) != want => Err(RopeError::Checksum),
@@ -317,19 +355,29 @@ pub fn decode(
 }
 
 /// The length of the value a rope stands for, without reading any piece:
-/// `piece_len` gives the length of one piece.
+/// `piece_len` gives the length of one piece. A rope with cuts must add up to
+/// the length it carries ([`RopeError::Length`]); the sum is not carried past
+/// that length, so a damaged rope cannot make the walk do more than add up to
+/// it.
 pub fn logical_len(
     rope: &[u8],
     mut piece_len: impl FnMut(u32) -> Result<u64, Error>,
 ) -> Result<u64, RopeError> {
+    let recorded = recorded_len(rope)?;
     let mut total = 0u64;
     for seg in segments(rope) {
         total = total.saturating_add(match seg? {
             Segment::Inline(b) => b.len() as u64,
             Segment::Piece(id) => piece_len(id).map_err(RopeError::Piece)?,
         });
+        if recorded.is_some_and(|n| total > n) {
+            return Err(RopeError::Length);
+        }
     }
-    Ok(total)
+    match recorded {
+        Some(n) if n != total => Err(RopeError::Length),
+        _ => Ok(total),
+    }
 }
 
 #[cfg(test)]
@@ -391,11 +439,12 @@ mod tests {
         assert_eq!(out.len(), 1001);
         out.clear();
         encode_cut(&[7u8; 1000], &[0..1000], &[5], &mut out);
-        // The tag, the checksum of the value, one reference.
-        assert_eq!(out.len(), 1 + 4 + 1);
+        // The tag, the checksum of the value, its length, one reference.
+        assert_eq!(out.len(), 1 + 4 + 2 + 1);
         assert_eq!(out[0], TAG_SEGMENTS);
         assert_eq!(checksum(&out), Some(crc32c::crc32c(&[7u8; 1000])));
-        assert_eq!(out[5], 11);
+        assert_eq!(recorded_len(&out).unwrap(), Some(1000));
+        assert_eq!(out[7], 11);
         assert_eq!(checksum(b""), None);
         assert_eq!(checksum(&[TAG_INLINE, 1, 2, 3, 4, 5]), None);
         assert_eq!(piece_ids(&out).collect::<Vec<_>>().len(), 1);
@@ -470,7 +519,7 @@ mod tests {
             assert!(
                 matches!(
                     rebuild(&r, &store),
-                    Err(RopeError::Checksum | RopeError::Piece(_))
+                    Err(RopeError::Checksum | RopeError::Piece(_) | RopeError::Length)
                 ),
                 "{what}"
             );
@@ -484,6 +533,49 @@ mod tests {
             rebuild(&[TAG_SEGMENTS, 1, 2], &store),
             Err(RopeError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn the_recorded_length_is_checked_before_the_rope_is_rebuilt() {
+        let store = store();
+        let value = [&store[0][..], &store[1][..]].concat();
+        let mut good = Vec::new();
+        encode_cut(&value, &[0..8, 8..16], &[0, 1], &mut good);
+        assert_eq!(recorded_len(&good).unwrap(), Some(16));
+        assert_eq!(
+            logical_len(&good, |id| Ok(store[id as usize].len() as u64)).unwrap(),
+            16
+        );
+        // The same segments under a length that is too short or too long.
+        for wrong in [15u8, 17, 0] {
+            let mut bad = good.clone();
+            bad[5] = wrong;
+            assert!(matches!(rebuild(&bad, &store), Err(RopeError::Length)));
+            assert!(matches!(
+                logical_len(&bad, |id| Ok(store[id as usize].len() as u64)),
+                Err(RopeError::Length)
+            ));
+        }
+        // The walk stops as soon as it is past the length: the piece that
+        // would have been fetched next is not.
+        let mut bad = good.clone();
+        bad[5] = 8;
+        let mut fetched = 0;
+        let r = decode(
+            &bad,
+            |_, out| {
+                fetched += 1;
+                out.extend_from_slice(&[0; 8]);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert!(matches!(r, Err(RopeError::Length)));
+        assert_eq!(fetched, 2);
+        // Ropes without cuts carry no length.
+        assert_eq!(recorded_len(b"").unwrap(), None);
+        assert_eq!(recorded_len(&[TAG_INLINE, 1]).unwrap(), None);
+        assert!(recorded_len(&[TAG_SEGMENTS, 0, 0, 0, 0]).is_err());
     }
 
     #[test]
@@ -526,9 +618,9 @@ mod tests {
             &[3],
             &[3, 0, 0, 0],
             &[3, 0, 0, 0, 0, 0x80],
-            &[3, 0, 0, 0, 0, 20, 1],
-            &[3, 0, 0, 0, 0, 0],
-            &[3, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f],
+            &[3, 0, 0, 0, 0, 20, 20, 1],
+            &[3, 0, 0, 0, 0, 0, 0],
+            &[3, 0, 0, 0, 0, 5, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f],
         ] {
             assert!(matches!(
                 decode(bad, none, &mut Vec::new()),
@@ -582,7 +674,7 @@ mod tests {
         translate(&rope, |_| Ok(Mapped::Piece(0)), &mut wrong).unwrap();
         assert!(matches!(
             rebuild(&wrong, &new_store),
-            Err(RopeError::Checksum)
+            Err(RopeError::Checksum | RopeError::Length)
         ));
     }
 
@@ -618,7 +710,7 @@ mod tests {
             &[2u8][..],
             &[3, 0, 0],
             &[3, 0, 0, 0, 0, 0x80],
-            &[3, 0, 0, 0, 0, 20, 1],
+            &[3, 0, 0, 0, 0, 20, 20, 1],
         ] {
             let r = translate(bad, |_| Ok(Mapped::Piece(0)), &mut Vec::new());
             assert!(matches!(r, Err(RopeError::Malformed(_))), "{bad:?}");

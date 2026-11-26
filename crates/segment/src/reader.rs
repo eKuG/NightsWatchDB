@@ -54,7 +54,7 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData};
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, Read};
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
@@ -188,8 +188,16 @@ fn rope_error(e: RopeError) -> Error {
             format!("a stored value is malformed ({what}): the file is damaged"),
         ),
         RopeError::Checksum => value_checksum_error(),
+        RopeError::Length => value_length_error(),
         RopeError::Piece(e) => e,
     }
+}
+
+fn value_length_error() -> Error {
+    corrupt(
+        SPANS_FILE,
+        "a stored value does not add up to the length it carries: the file is damaged",
+    )
 }
 
 fn value_checksum_error() -> Error {
@@ -210,12 +218,16 @@ struct RopeSize {
     count: usize,
 }
 
-/// Measures a rope without reading any piece. The bytes it refers to are
-/// refused if they add up to more than the store records for the whole part:
-/// no honest value refers to more than every reference of the part together,
-/// and a damaged or doctored rope must not decide how much is allocated.
+/// Measures a rope without reading any piece. A rope with references carries
+/// the length of its value: the segments must add up to it, and the walk stops
+/// at the segment that goes past it, so a damaged run length that makes text
+/// parse as many references is refused after a few of them, not after the sum
+/// of all. The bytes it refers to are also refused if they add up to more than
+/// the store records for the whole part. A damaged or doctored rope must not
+/// decide how much is allocated.
 fn rope_size(store: &PieceReader, rope: &[u8]) -> Result<RopeSize> {
     let limit = store.totals().logical_bytes;
+    let recorded = rope::recorded_len(rope).map_err(rope_error)?;
     let mut size = RopeSize {
         inline: 0,
         refs: 0,
@@ -233,6 +245,12 @@ fn rope_size(store: &PieceReader, rope: &[u8]) -> Result<RopeSize> {
                 size.count += 1;
             }
         }
+        if recorded.is_some_and(|n| size.inline + size.refs > n) {
+            return Err(value_length_error());
+        }
+    }
+    if recorded.is_some_and(|n| size.inline + size.refs != n) {
+        return Err(value_length_error());
     }
     Ok(size)
 }
@@ -1048,6 +1066,10 @@ impl Iterator for Scan {
 /// working (on Unix) after the part directory has been deleted.
 pub struct PartReader {
     dir: PathBuf,
+    /// `traces.idx`, kept open so that `verify` reads the file the part was
+    /// opened with, as the other files are, even after the directory is gone.
+    index_file: File,
+    index_len: u64,
     entries: Vec<TraceEntry>,
     checksums: FileChecksums,
     spans: Arc<Table>,
@@ -1072,10 +1094,13 @@ impl PartReader {
     /// here; see [`verify`](Self::verify).
     pub fn open(part_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = part_dir.as_ref();
-        let index_bytes = fs::read(dir.join(INDEX_FILE)).map_err(|e| match e.kind() {
+        let mut index_file = File::open(dir.join(INDEX_FILE)).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => corrupt(INDEX_FILE, "file is missing from the part"),
             _ => Error::Io(e),
         })?;
+        let mut index_bytes = Vec::new();
+        index_file.read_to_end(&mut index_bytes)?;
+        let index_len = index_bytes.len() as u64;
         let decoded = index::decode(&index_bytes)?;
         let (entries, checksums) = (decoded.entries, decoded.checksums);
         let mut spans = Table::open(dir, SPANS_FILE, &span_schema(), checksums.spans.len)?;
@@ -1109,6 +1134,8 @@ impl PartReader {
         }
         Ok(Self {
             dir: dir.to_path_buf(),
+            index_file,
+            index_len,
             entries,
             checksums,
             spans: Arc::new(spans),
@@ -1142,13 +1169,16 @@ impl PartReader {
         self.checksums.summary
     }
 
-    /// Re-reads all four data files in full and compares their length and
+    /// Re-reads `traces.idx` and compares it with what was decoded at open,
+    /// re-reads all four data files in full and compares their length and
     /// CRC-32C with the values recorded in `traces.idx`, reads every block of
     /// the piece store, and then walks every rope of every row against the
     /// store: each must be well formed, refer to pieces that exist, rebuild to
     /// the checksum it carries, and together the ropes must refer to exactly the
     /// bytes of pieces that `pieces.idx` records. Fails with [`Error::Corrupt`]
-    /// naming the file on a mismatch. A part that passes can be read.
+    /// naming the file on a mismatch. A part that passes can be read, and can
+    /// be opened again: whatever `open` checks, this checks against the files
+    /// as they are now, including the trailing checksum of `pieces.idx`.
     ///
     /// This costs a sequential read of the part and a rebuild of every value,
     /// so [`open`](Self::open) does not do it; compaction and a scrubber
@@ -1166,6 +1196,7 @@ impl PartReader {
     /// with, which is all a caller that carries them over unchanged needs to
     /// know; it costs a sequential read and no rebuild of values.
     pub(crate) fn verify_files(&self) -> Result<()> {
+        self.verify_index()?;
         self.spans.verify(self.checksums.spans)?;
         self.summary.verify(self.checksums.summary)?;
         let (blk, idx) = self.store.file_sums()?;
@@ -1180,6 +1211,34 @@ impl PartReader {
             check_sum(name, now.len, now, recorded)?;
         }
         self.store.verify()
+    }
+
+    /// Reads `traces.idx` again and requires it to decode to what was read at
+    /// open. Everything `open` checks, `verify` checks again, so that a part
+    /// that passes is a part that opens. It reads the handle kept from open,
+    /// like every other file, and refuses a file whose length has changed
+    /// before it reads it.
+    fn verify_index(&self) -> Result<()> {
+        let now = self.index_file.metadata()?.len();
+        if now != self.index_len {
+            return Err(corrupt(
+                INDEX_FILE,
+                format!(
+                    "file has {now} bytes but had {} when it was opened",
+                    self.index_len
+                ),
+            ));
+        }
+        let mut bytes = vec![0u8; now as usize];
+        self.index_file.read_exact_at(&mut bytes, 0)?;
+        let now = index::decode(&bytes)?;
+        if now.entries != self.entries || now.checksums != self.checksums {
+            return Err(corrupt(
+                INDEX_FILE,
+                "file differs from what it was when opened",
+            ));
+        }
+        Ok(())
     }
 
     /// The directory the part was opened from, to name it in an error.
@@ -1526,5 +1585,164 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Corrupt(_)));
         assert_eq!(guard("x", || Ok(5)).unwrap(), 5);
+    }
+
+    use arrow_schema::{DataType as Type, Field as Col, Schema as Cols};
+    use nwdb_payload::{PieceWriter, PieceWriterOptions};
+    use rand::rngs::StdRng;
+    use rand::{RngCore, SeedableRng};
+
+    /// A store of `pieces`, each referenced `refs` times in total, so that the
+    /// store records `refs` times their length as the part's references.
+    fn store_of(dir: &Path, pieces: &[Vec<u8>], refs: usize) -> PieceReader {
+        let mut w = PieceWriter::create(dir, PieceWriterOptions::default()).unwrap();
+        for p in pieces {
+            w.add(p).unwrap();
+            for _ in 1..refs {
+                w.find(p).unwrap();
+            }
+        }
+        w.finish().unwrap();
+        PieceReader::open(dir).unwrap()
+    }
+
+    fn random(seed: u64, len: usize) -> Vec<u8> {
+        let mut v = vec![0u8; len];
+        StdRng::seed_from_u64(seed).fill_bytes(&mut v);
+        v
+    }
+
+    /// A batch with the one raw column `name`, holding `ropes`.
+    fn batch_of(name: &str, ropes: &[Vec<u8>]) -> RecordBatch {
+        let schema = Arc::new(Cols::new(vec![Col::new(name, Type::LargeBinary, true)]));
+        let column = LargeBinaryArray::from_iter_values(ropes.iter());
+        RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()
+    }
+
+    fn message(e: Error) -> String {
+        match e {
+            Error::Corrupt(m) => m,
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    /// One piece shared by many spans, so that the part records a total far
+    /// larger than any value. A damaged length of an inline run of control
+    /// bytes makes the text after it parse as references to the large piece:
+    /// the references add up to less than the part's total, so only the length
+    /// the rope records can refuse the value, and it must do so while the rope
+    /// is measured, before the output is allocated.
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // one cut, on purpose
+    fn a_damaged_run_length_is_refused_when_the_rope_is_measured() {
+        const PIECE: usize = 64 << 10;
+        const SPANS: usize = 200;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_of(tmp.path(), &[random(1, PIECE)], SPANS);
+        assert_eq!(store.totals().logical_bytes, (SPANS * PIECE) as u64);
+
+        // 300 bytes that parse as references to piece 0, then the piece.
+        let mut value = vec![1u8; 300];
+        value.extend_from_slice(&random(1, PIECE));
+        let mut good = Vec::new();
+        rope::encode_cut(&value, &[300..300 + PIECE], &[0], &mut good);
+        let size = rope_size(&store, &good).unwrap();
+        assert_eq!((size.inline, size.refs, size.count), (300, PIECE as u64, 1));
+
+        let mut as_references = 0;
+        for at in 0..good.len() {
+            for bit in 0..8 {
+                let mut bad = good.clone();
+                bad[at] ^= 1 << bit;
+                let parsed: Vec<_> = rope::segments(&bad).collect();
+                let refs = parsed
+                    .iter()
+                    .filter(|s| matches!(s, Ok(Segment::Piece(_))))
+                    .count();
+                match rope_size(&store, &bad) {
+                    Ok(size) => assert_eq!(
+                        size.inline + size.refs,
+                        value.len() as u64,
+                        "byte {at} bit {bit}"
+                    ),
+                    Err(e) => {
+                        if refs > 1 && parsed.iter().all(|s| s.is_ok()) {
+                            // Text turned into references, every one of them
+                            // valid, together under the part's total.
+                            let m = message(e);
+                            if m.contains("length it carries") {
+                                as_references += 1;
+                            } else {
+                                // The other ways to refuse such a rope: more
+                                // bytes than the whole part, or a piece that
+                                // does not exist.
+                                assert!(
+                                    m.contains("more bytes") || m.contains("refers to piece"),
+                                    "{m}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(as_references > 0, "no flip turned text into references");
+
+        // The same in a batch of many spans: one damaged rope refuses the
+        // batch, and the undamaged batch is rebuilt.
+        let mut ropes = vec![good.clone(); SPANS - 1];
+        let part = batch_of("attrs", &ropes);
+        let rebuilt = rebuild(&store, &part).unwrap();
+        assert_eq!(rebuilt.column(0).as_binary::<i64>().value(7), &value[..]);
+        let mut bad = good.clone();
+        bad[8] ^= 0x40;
+        ropes[100] = bad;
+        let m = message(rebuild(&store, &batch_of("attrs", &ropes)).unwrap_err());
+        assert!(m.contains("length it carries"), "{m}");
+    }
+
+    /// Every single-bit flip of a rope with references, in each of the three
+    /// raw columns, is refused or rebuilds to the original bytes, never to
+    /// others.
+    #[test]
+    fn a_flipped_bit_in_a_rope_is_refused_or_harmless_in_every_raw_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pieces: Vec<Vec<u8>> = (0..4).map(|i| random(10 + i, 40)).collect();
+        let store = store_of(tmp.path(), &pieces, 3);
+        let mut value = b"head ".to_vec();
+        let mut cuts = Vec::new();
+        for (i, p) in pieces.iter().enumerate() {
+            if i % 2 == 0 {
+                value.extend_from_slice(b"-gap-");
+            }
+            cuts.push(value.len()..value.len() + p.len());
+            value.extend_from_slice(p);
+        }
+        value.extend_from_slice(b" tail");
+        let mut good = Vec::new();
+        rope::encode_cut(&value, &cuts, &[0, 1, 2, 3], &mut good);
+        for name in RAW_NAMES {
+            let ok = rebuild(&store, &batch_of(name, std::slice::from_ref(&good))).unwrap();
+            assert_eq!(ok.column(0).as_binary::<i64>().value(0), &value[..]);
+            let mut refused = 0;
+            for at in 0..good.len() {
+                for bit in 0..8 {
+                    let mut bad = good.clone();
+                    bad[at] ^= 1 << bit;
+                    match rebuild(&store, &batch_of(name, &[bad])) {
+                        Err(e) => {
+                            message(e);
+                            refused += 1;
+                        }
+                        Ok(got) => assert_eq!(
+                            got.column(0).as_binary::<i64>().value(0),
+                            &value[..],
+                            "{name}: byte {at} bit {bit}"
+                        ),
+                    }
+                }
+            }
+            assert!(refused > good.len(), "{name}: {refused}");
+        }
     }
 }

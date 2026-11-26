@@ -43,6 +43,7 @@ decided and whatever the bytes are.
 empty value         ->  (no bytes)
 value with no cuts  ->  0x00, the value
 value with cuts     ->  0x03, CRC-32C of the value (u32 little endian),
+                        varint(length of the value),
                         then segments until the end:
                           varint(len << 1)       followed by len inline bytes
                           varint(id << 1 | 1)    a reference to piece `id`
@@ -50,8 +51,8 @@ value with cuts     ->  0x03, CRC-32C of the value (u32 little endian),
 
 Varints are little-endian base 128. A value without cuts costs one byte more
 than the value; an empty value costs nothing; a value with cuts costs five
-bytes more than its inline bytes and references, and a reference costs one to
-five bytes. Inline segments are never empty.
+bytes plus the varint of the value's length more than its inline bytes and
+references, and a reference costs one to five bytes. Inline segments are never empty.
 
 The checksum is the CRC-32C of the value the rope rebuilds to. Parquet pages
 carry no checksum and a read does not run `verify`, so without it one flipped
@@ -62,8 +63,17 @@ itself, so damage to it changes only that row, as it always did, and costs
 nothing extra. The two tags differ in two bits, so one flipped bit in the tag
 never turns a rope with references into one that is taken as its own bytes.
 
-A decoder refuses an unknown first byte, a tag 1 rope too short for its
-checksum, a truncated or over-long number, an inline run longer than the rope,
+The length is the length of the rebuilt value. A reader adds up the segments
+(the length of a piece is in the store's tables, no piece is read) and compares
+the sum with it before it allocates anything, stopping at the first segment that
+goes past it: one flipped bit in an inline run's length can turn text into
+hundreds of references to a large piece, and without the length the reader would
+reserve all of it before the checksum rejected the value. `rope::recorded_len`
+gives it; `rope::decode` and `rope::logical_len` check it and return
+`RopeError::Length` on a mismatch.
+
+A decoder refuses an unknown first byte, a tag 3 rope too short for its
+checksum and length, a truncated or over-long number, an inline run longer than the rope,
 and an empty inline run (`RopeError::Malformed`); `rope::decode` returns
 `RopeError::Checksum` when the rebuilt value does not match; a reference to a
 piece that does not exist is an error from the store. A decoder never allocates
@@ -72,7 +82,7 @@ from a length it has not compared with the bytes it has.
 `rope::translate(rope, map, out)` writes a rope for the same value with each
 reference replaced as `map` says: a piece id of another store (`Mapped::Piece`),
 or the piece's bytes (`Mapped::Inline`) when that store cannot take it. The
-value is not rebuilt, so the checksum is copied as it is, and a wrong `map` is
+value is not rebuilt, so the checksum and the length are copied as they are, and a wrong `map` is
 caught by the reader exactly as a damaged reference is; a rope whose references
 all became inline bytes is written as the rope of a value with no cuts.
 
@@ -138,9 +148,12 @@ the last four, the file's own checksum: the CRC-32C of a message with its
 CRC-32C appended is the same for every message, so over the whole file it would
 tell one store from another not at all; `FileSum::crc32c` is defined that way for
 `pieces.idx`). `pieces.idx` holds
-the checksum of every block, so this binds the blocks to the part: piece files
-taken from another part are refused at open (`Corrupt`, naming `pieces.idx`)
-even when their lengths are equal. `PieceReader::open(dir)` is the same
+the checksum of every block, so this binds the blocks to the part: piece index
+taken from another part is refused at open (`Corrupt`, naming `pieces.idx`)
+because their checksum differs. A `pieces.blk` of the same length alone, with
+this store's `pieces.idx`, is not refused by open, which does not read the
+blocks: its blocks are caught by their checksums when they are read and by
+`verify`. `PieceReader::open(dir)` is the same
 without a record to compare with. Either way `pieces.idx` is checked completely
 and the length of `pieces.blk` is compared with what the table says. A block is
 read with a positioned read, its CRC-32C is checked every time it is
@@ -148,7 +161,10 @@ decompressed, and the decompressed length must equal the recorded one: any
 damage is `Error::Corrupt` naming `pieces.blk` or `pieces.idx`, never a panic
 and never wrong bytes. The reader keeps no mutable state and serves many
 threads at once. `verify` reads every block; `file_sums` gives the length and
-CRC-32C of both files for comparison with the part's header.
+CRC-32C of both files for comparison with the part's header, and also checks
+the last four bytes of `pieces.idx` against the rest of the file, which the
+recorded checksum leaves out and `open` checks: a store that passes `file_sums`
+and `verify` is one that opens.
 
 **What an open store costs in memory.** The reader keeps the piece table as it
 is on disk (the varints) and finds a piece through a small index over it: the

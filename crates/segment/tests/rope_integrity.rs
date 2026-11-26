@@ -231,7 +231,13 @@ fn a_value_of_a_size_that_cannot_be_allocated_is_an_error_not_an_abort() {
     if let Some(dir) = std::env::var_os(CHILD) {
         let reader = PartReader::open(Path::new(&dir)).unwrap();
         let m = corrupt(reader.read_trace(TraceId([1; 16]), None).unwrap_err());
-        assert!(m.contains("cannot be allocated"), "{m}");
+        // The rope records the length of the value it was written for, so the
+        // doctored store is refused when the rope is measured; the fallible
+        // allocation behind it is a second line of defence.
+        assert!(
+            m.contains("length it carries") || m.contains("cannot be allocated"),
+            "{m}"
+        );
         // `verify` rebuilds every value too, so it cannot pass either.
         corrupt(reader.verify().unwrap_err());
         return;

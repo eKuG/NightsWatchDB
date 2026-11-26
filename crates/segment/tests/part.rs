@@ -855,15 +855,60 @@ fn scan_summary_rev_reads_newest_groups_first_and_lazily() {
     let (lo, hi) = (1_000_000 + 700_000, 1_000_000 + 900_000);
     let mut scan = reader.scan_summary_rev(Some(lo), Some(hi)).unwrap();
     assert_eq!(scan.row_groups_read(), 0);
-    let mut rows = 0;
-    while scan.next_group().unwrap().is_some() {
-        rows += 1;
+    let (mut groups, mut rows) = (0, 0);
+    while let Some(group) = scan.next_group().unwrap() {
+        groups += 1;
+        rows += summaries(&group).len();
     }
-    assert_eq!(rows, reader.scan_summary(Some(lo), Some(hi)).unwrap().len());
-    assert!(rows < 10);
+    assert_eq!(scan.row_groups_read(), groups);
+    let forward = summaries(&reader.scan_summary(Some(lo), Some(hi)).unwrap());
+    assert_eq!(rows, forward.len());
+    assert!(groups < 10);
     let mut scan = reader.scan_summary_rev(Some(i64::MAX - 1), None).unwrap();
     assert!(scan.next_upper_bound().is_none());
     assert!(scan.next_group().unwrap().is_none());
+}
+
+/// A summary row group of more rows than one batch (8,192) is returned as
+/// several batches: what is counted as groups must be groups and what is
+/// counted as rows must be rows, whatever the number of batches.
+#[test]
+fn scan_summary_rev_counts_groups_and_rows_when_a_group_is_several_batches() {
+    const TRACES: usize = 9_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let spans = generate(&Gen {
+        spans_per_trace: 1..=1,
+        ..default_gen(12, TRACES)
+    });
+    let options = WriterOptions {
+        summary_row_group_rows: 20_000,
+        ..WriterOptions::default()
+    };
+    write_part(tmp.path(), 1, &spans, 500, options);
+    let reader = PartReader::open(part_dir(tmp.path(), 1)).unwrap();
+    assert_eq!(reader.summary_row_group_count(), 1);
+
+    let mut scan = reader.scan_summary_rev(None, None).unwrap();
+    let group = scan.next_group().unwrap().unwrap();
+    assert!(group.len() > 1, "the group is {} batch", group.len());
+    let rows = summaries(&group);
+    assert_eq!(rows.len(), TRACES);
+    assert!(rows.windows(2).all(|w| w[0].start_ns <= w[1].start_ns));
+    assert_eq!(scan.row_groups_read(), 1);
+    assert!(scan.next_group().unwrap().is_none());
+
+    // A range that overlaps the one group returns all of its rows (statistics
+    // prune groups, not rows), counted in rows and not in batches.
+    let mut scan = reader
+        .scan_summary_rev(Some(1_000_000 + 1_000), Some(1_000_000 + 2_000))
+        .unwrap();
+    let group = scan.next_group().unwrap().unwrap();
+    let forward = reader
+        .scan_summary(Some(1_000_000 + 1_000), Some(1_000_000 + 2_000))
+        .unwrap();
+    assert!(group.len() > 1 && forward.len() > 1);
+    assert_eq!(summaries(&group).len(), summaries(&forward).len());
+    assert_eq!(summaries(&group).len(), TRACES);
 }
 
 #[test]

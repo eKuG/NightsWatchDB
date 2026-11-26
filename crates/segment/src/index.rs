@@ -21,7 +21,9 @@ const CRC_LEN: usize = 4;
 pub struct FileChecksum {
     /// Length of the file in bytes.
     pub len: u64,
-    /// CRC-32C of every byte of the file.
+    /// CRC-32C of every byte of the file, except for `pieces.idx`, where it
+    /// is of every byte but the last four (the file's own checksum: over the
+    /// whole file the value would be the same for every part).
     pub crc32c: u32,
 }
 
