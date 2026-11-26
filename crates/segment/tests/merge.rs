@@ -890,28 +890,6 @@ fn one_trace_larger_than_a_chunk_is_split_across_chunks_and_stays_one_run() {
     merged.verify().unwrap();
 }
 
-#[test]
-fn a_small_piece_ceiling_changes_nothing_a_reader_sees() {
-    for max_pieces in [0usize, 1, 5, 40] {
-        let inputs = generate(1234, 4, true);
-        let tmp = tempfile::tempdir().unwrap();
-        let readers = write_inputs(tmp.path(), &inputs, 4);
-        let want = expected(&inputs);
-        let mut opts = merge_options(2_000);
-        opts.writer.max_pieces = max_pieces;
-        let (meta, stats) = merge(&readers, tmp.path(), 30, opts).unwrap();
-        assert!(meta.payload.pieces <= max_pieces as u64, "{max_pieces}");
-        let merged = PartReader::open(part_path(tmp.path(), 30)).unwrap();
-        merged.verify().unwrap();
-        assert_holds(&merged, &want, &format!("ceiling {max_pieces}"));
-        if max_pieces == 0 {
-            assert_eq!(meta.payload.pieces, 0);
-            assert_eq!(meta.payload.logical_bytes, 0);
-            assert!(stats.payload_in.pieces > 0);
-        }
-    }
-}
-
 struct Heard(std::sync::Mutex<Vec<(u32, Vec<u8>)>>);
 
 impl PieceObserver for Heard {

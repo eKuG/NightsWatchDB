@@ -24,17 +24,15 @@ use nwdb_core::{
     TraceId, col,
 };
 use nwdb_payload::rope::{self, Mapped, RopeError};
-use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The default for [`MergeOptions::chunk_bytes`]: 32 MiB.
 pub const DEFAULT_MERGE_CHUNK_BYTES: usize = 32 << 20;
 
 /// Translation table entry of an input piece not yet carried over.
 const UNSET: u32 = u32::MAX;
-/// Translation table entry of an input piece that went inline into the rows
-/// that use it, because the output could not take one more piece.
-const INLINE: u32 = u32::MAX - 1;
 /// The most rows whose keys one chunk holds (32 bytes each), unless a single
 /// trace has more.
 const MAX_CHUNK_ROWS: usize = 1 << 19;
@@ -67,6 +65,13 @@ pub struct MergeOptions {
     /// Without it, only what the merge reads is checked, and a damaged
     /// Parquet page that still decodes is carried over as data.
     pub verify_inputs: bool,
+    /// Set by the caller to stop the merge. It is checked before each chunk;
+    /// when it is set, the temporary output is removed and the merge returns
+    /// [`Error::Unavailable`], which says nothing is wrong with the inputs
+    /// or the output and the merge may be run again. A chunk that has begun
+    /// is finished first, so the merge stops within about one chunk of work.
+    /// Default `None`.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for MergeOptions {
@@ -76,6 +81,7 @@ impl Default for MergeOptions {
             chunk_bytes: DEFAULT_MERGE_CHUNK_BYTES,
             level: 1,
             verify_inputs: true,
+            stop: None,
         }
     }
 }
@@ -190,9 +196,8 @@ fn rope_error(inputs: &[&PartReader], i: usize, e: RopeError) -> Error {
 /// - Every value of every kept row reads back byte for byte as the input
 ///   returns it. Text is not rebuilt: a rope keeps its checksum and has its
 ///   piece references translated, each piece is copied from an input's store at
-///   most once, and text that several inputs hold is stored once. If the output
-///   cannot take another piece (`max_pieces`), the piece's bytes go into the
-///   rope; the value is unchanged.
+///   most once, and text that several inputs hold is stored once as far as the
+///   output's dedup window reaches.
 ///
 /// `window_start_ns` and `window_ns` are recorded in the returned
 /// [`PartMeta`] as for any part; the merge does not check that the rows lie
@@ -209,9 +214,16 @@ fn rope_error(inputs: &[&PartReader], i: usize, e: RopeError) -> Error {
 /// for [`PartWriter::finish`]). Damage found in an input is
 /// [`Error::Corrupt`] naming the input by its position and directory.
 ///
+/// The pieces of the inputs, added up, must not exceed
+/// `options.writer.max_pieces`: the sum is an upper bound of the output's
+/// pieces, and a part past the ceiling would store text inline, where search
+/// cannot find it. A merge never changes what a search finds, so it refuses
+/// such inputs before it writes anything.
+///
 /// Fails with [`Error::InvalidArgument`] if `inputs` is empty or has more than
-/// 65,535 parts, or `options.chunk_bytes` is 0, or the writer options or the
-/// window are invalid.
+/// 65,535 parts, or their pieces add up to more than `max_pieces`, or
+/// `options.chunk_bytes` is 0, or the writer options or the window are
+/// invalid. Fails with [`Error::Unavailable`] if `options.stop` was set.
 pub fn merge_parts(
     inputs: &[&PartReader],
     parts_dir: &Path,
@@ -232,6 +244,14 @@ pub fn merge_parts(
         return Err(Error::invalid_argument(
             "chunk_bytes must be greater than 0",
         ));
+    }
+    let pieces: u64 = inputs.iter().map(|r| r.piece_store().totals().pieces).sum();
+    if pieces > options.writer.max_pieces as u64 {
+        return Err(Error::invalid_argument(format!(
+            "the inputs hold {pieces} pieces together, more than the {} a part may hold; \
+             merging them would leave text out of the text index",
+            options.writer.max_pieces
+        )));
     }
     if options.verify_inputs {
         for (i, input) in inputs.iter().enumerate() {
@@ -263,12 +283,18 @@ pub fn merge_parts(
         next_source: 0,
         chunk_bytes: options.chunk_bytes as u64,
         dropped: 0,
-        inline: HashMap::new(),
         ropes: [Vec::new(), Vec::new(), Vec::new()],
     };
 
     let mut next = 0;
     while next < order.len() {
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Relaxed))
+        {
+            return Err(Error::unavailable("the merge was stopped"));
+        }
         let begin = next;
         let (mut parts, mut bytes, mut rows) = (Vec::new(), 0u64, 0usize);
         while next < order.len() {
@@ -371,16 +397,13 @@ fn trace_order(inputs: &[&PartReader]) -> (Vec<OrderKey>, u64) {
 struct Merger<'a> {
     inputs: &'a [&'a PartReader],
     writer: PartWriter,
-    /// For each input, the id in the output of each of its pieces, `UNSET` or
-    /// `INLINE`.
+    /// For each input, the id in the output of each of its pieces, or `UNSET`.
     tables: Vec<Vec<u32>>,
     builder: SpanBatchBuilder,
     /// Numbers the batches read from inputs, for the builder's origin cache.
     next_source: usize,
     chunk_bytes: u64,
     dropped: u64,
-    /// Bytes of the pieces of the current unit that the output holds inline.
-    inline: HashMap<(u16, u32), Vec<u8>>,
     /// The translated `attrs`, `events` and `links` of the row in hand.
     ropes: [Vec<u8>; 3],
 }
@@ -589,9 +612,9 @@ impl Merger<'_> {
         Ok(())
     }
 
-    /// Makes sure every piece the rows of `unit` refer to is in the output (or
-    /// marked for inline) and, for those that go inline, has its bytes at
-    /// hand. Each input's pieces are read in the order of their ids, which is
+    /// Makes sure every piece the rows of `unit` refer to is in the output.
+    /// The inputs' pieces add up to no more than the output may hold, so the
+    /// output always takes them. Each input's pieces are read in the order of their ids, which is
     /// the order of its blocks, so a block is decompressed once.
     fn carry_pieces(
         &mut self,
@@ -623,7 +646,7 @@ impl Merger<'_> {
                                 ),
                             ));
                         }
-                        Some(&UNSET | &INLINE) => {
+                        Some(&UNSET) => {
                             need.push((key.input, id));
                             // Many references name few pieces: keep the list
                             // as long as the distinct pieces, not the references.
@@ -641,7 +664,6 @@ impl Merger<'_> {
         need.sort_unstable();
         need.dedup();
 
-        self.inline.clear();
         let mut at = 0;
         while at < need.len() {
             let input = need[at].0;
@@ -653,7 +675,6 @@ impl Merger<'_> {
             let i = usize::from(input);
             let table = &mut self.tables[i];
             let writer = &mut self.writer;
-            let inline = &mut self.inline;
             let mut failure = None;
             inputs[i]
                 .piece_store()
@@ -661,22 +682,18 @@ impl Merger<'_> {
                     if failure.is_some() {
                         return;
                     }
-                    let id = ids[n];
-                    let slot = &mut table[id as usize];
+                    let slot = &mut table[ids[n] as usize];
                     if *slot == UNSET {
                         match writer.intern_piece(bytes) {
-                            Ok(Some(out)) => {
-                                *slot = out;
-                                return;
+                            Ok(Some(out)) => *slot = out,
+                            Ok(None) => {
+                                failure = Some(Error::fatal(
+                                    "the output refused a piece below its piece ceiling",
+                                ));
                             }
-                            Ok(None) => *slot = INLINE,
-                            Err(e) => {
-                                failure = Some(e);
-                                return;
-                            }
+                            Err(e) => failure = Some(e),
                         }
                     }
-                    inline.insert((input, id), bytes.to_vec());
                 })
                 .map_err(|e| named(inputs, i, e))?;
             if let Some(e) = failure {
@@ -698,7 +715,6 @@ impl Merger<'_> {
             let Some(value) = value else { continue };
             let table = &self.tables[i];
             let writer = &mut self.writer;
-            let inline = &self.inline;
             let unexpected = |id: u32| {
                 Error::corrupt(format!("piece {id} was not carried over before its rows"))
             };
@@ -707,10 +723,6 @@ impl Merger<'_> {
                 |id| {
                     let len = inputs[i].piece_store().piece_len(id)?;
                     match table.get(id as usize).copied() {
-                        Some(INLINE) => inline
-                            .get(&(input, id))
-                            .map(|b| Mapped::Inline(b))
-                            .ok_or_else(|| unexpected(id)),
                         Some(UNSET) | None => Err(unexpected(id)),
                         Some(out) => {
                             writer.add_references(len);

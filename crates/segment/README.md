@@ -521,20 +521,27 @@ How it works:
   keeps its checksum (the CRC-32C of the value, which does not change) and has
   its piece references translated from the numbering of the input's store to the
   output's (`nwdb_payload::rope::translate`). A piece is read from an input store
-  once per input, in the order of its blocks, and added to the output's store
-  through the same path a flush uses, so text that two inputs hold is stored
-  once and `unique_bytes` of the output is that of a flush of the same rows. The
-  references are counted as the ropes are written, so `verify` finds the part
+  once, in the order of its blocks, and added to the output's store through the
+  same path a flush uses, with the same de-duplication window
+  (`WriterOptions::dedup_window_bytes`). Pieces go in by input and piece id, a
+  flush's by row, so what the window still holds when a piece arrives differs:
+  equal text that two inputs hold is stored once only if the first copy is still
+  in the window when the second arrives, and `unique_bytes` of the output can be
+  more or less than that of a flush of the same rows. What does hold: an input
+  piece is never split, the output has no more pieces than its inputs together,
+  and every piece of the output is referenced. The references are counted as the ropes are written, so `verify` finds the part
   consistent. Because the checksum is carried and not recomputed, a wrong
   translation is not trusted: a reader finds that the value does not rebuild
   to its checksum and returns `Corrupt` (`tests/merge.rs` swaps the pieces of a
   merged part and shows it).
-- If the output cannot take a piece (`max_pieces` was reached and no equal piece
-  exists), the piece's bytes go into the rope of every row that uses it, as
-  inline bytes; the value is unchanged. Such a piece is read from its input
-  again by each unit of work that needs it (see below), the one case where a
-  piece is read more than once per input; the bytes of these pieces are held for
-  the unit and are not counted in its size.
+- **The piece ceiling.** Text past `max_pieces` in a part is stored inline and
+  cannot be searched, and a merge must not change what a search finds. The
+  pieces of the inputs added up are an upper bound of the output's pieces, so
+  `merge_parts` refuses with `Error::InvalidArgument`, before it writes
+  anything, when that sum is more than `WriterOptions::max_pieces`; refusing on
+  the bound, not on the exact count after de-duplication, is intended. A sum
+  exactly at the ceiling is merged, and no piece of it goes inline. The caller
+  chooses inputs that fit.
 - The same writer. Rows go through the part writer's row groups, dictionary
   columns (`SpanBatchBuilder::append_from_with_raw`, the dictionaries of
   batches are merged by value), summary and index and file checksums. The
@@ -565,6 +572,12 @@ How it works:
   (each is sorted by its own traces' starts), so the reading is close to
   sequential, with a few extra runs for traces that are split.
 
+**Stopping.** `MergeOptions::stop` is an optional `Arc<AtomicBool>`. The merge
+reads it before each chunk; when it is set, the merge removes its temporary
+directory and returns `Error::Unavailable`, which is not damage: nothing was
+changed and the merge may be run again. A chunk that has begun is finished, so
+a merge stops within about one chunk of work, not at the end of its inputs.
+
 Durability and failure are those of any part: the part is built in
 `<id>.tmp`, every file is synced, the directory is renamed and the parts
 directory synced; any error removes the temporary directory (a merge that
@@ -591,15 +604,16 @@ chunk for its keys (at most 16 MiB unless one trace has more rows than that), th
 output batch (the chunk size, between 1 and 16 MiB), and what the writer
 itself holds, which is what a flush holds: a row group, the de-duplication
 window, one entry per trace written (index entry, summary, finished id) and one
-or two bytes per piece. Nothing depends on the size of the inputs.
-`tests/merge_memory.rs` merges eight inputs of 90 MiB in all (96 KiB of text left in
-the row and 196 KiB cut into pieces per row, 40 rows per part) with a chunk and a
-window of 4 MiB in a child process, once as eight traces stitched from all inputs
-and once as a single trace, and compares the peak resident memory (`VmHWM`) with
-that at the start of the merge. The peak rose by 31 MiB when merging the first four
-inputs (45 MiB) and by 33 MiB when merging all eight, for eight traces; by 33 MiB for
-both with a single trace of 320 spans. That is a few times the chunk, and it does not
-grow with the inputs.
+or two bytes per piece. Nothing depends on the size of the inputs. Each input
+has a small cost of its own (its open readers and buffers, about 0.5 to 1.5 MiB),
+so a merge of more inputs raises the peak a little: measured with the same
+data split over four and over eight parts, the peak rose by 30 to 32 MiB and by
+34 to 37 MiB. `tests/merge_memory.rs` merges eight inputs (96 KiB of text left in
+the row and 196 KiB cut into pieces per row) with a chunk and a window of 4 MiB in
+a child process, once as eight traces stitched from all inputs and once as a
+single trace, with inputs of half the size and of the full size, and compares the
+peak resident memory (`VmHWM`) with that at the start of the merge: it must not
+grow with the size.
 
 Cost: a merge reads each input once for the keys (two small columns), once for
 the rows, once for the pieces it needs, and once more for the up-front check; it

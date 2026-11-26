@@ -223,10 +223,12 @@ pub enum Mapped<'a> {
 /// the value is read, not trusted.
 ///
 /// A rope without references is copied. A rope whose references all became
-/// inline bytes becomes the rope of a value with no cuts. `map` is called once
-/// per reference, in order. Fails with [`RopeError::Malformed`] on a rope that
-/// is not well formed, and with `map`'s error as [`RopeError::Piece`]; `out`
-/// is then unspecified.
+/// inline bytes becomes the rope of a value with no cuts, which carries no
+/// checksum and length, so they are checked on the rebuilt value first:
+/// [`RopeError::Checksum`] or [`RopeError::Length`] if `map` was wrong. `map`
+/// is called once per reference, in order. Fails with [`RopeError::Malformed`]
+/// on a rope that is not well formed, and with `map`'s error as
+/// [`RopeError::Piece`]; `out` is then unspecified.
 pub fn translate<'m>(
     rope: &[u8],
     mut map: impl FnMut(u32) -> Result<Mapped<'m>, Error>,
@@ -272,6 +274,13 @@ pub fn translate<'m>(
             }
         }
         out.truncate(start);
+        // The result carries neither, so a wrong map is caught here.
+        if value.len() as u64 != recorded_len(rope)?.unwrap_or(0) {
+            return Err(RopeError::Length);
+        }
+        if crc32c::crc32c(&value) != crc {
+            return Err(RopeError::Checksum);
+        }
         encode_inline(&value, out);
     }
     Ok(())

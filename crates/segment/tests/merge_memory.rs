@@ -1,5 +1,8 @@
 //! The memory of a merge follows the chunk and the writer's window, not the
-//! size of the inputs.
+//! size of the inputs. The claim is measured with the number of inputs held
+//! fixed and their size doubled: each input has a cost of its own (its
+//! readers and buffers), so a merge of more inputs does use somewhat more
+//! memory, and mixing the two in one comparison made the test unstable.
 //!
 //! The peak is the kernel's high-water mark of a process's resident memory
 //! (`VmHWM`, read from `/proc`; a counting allocator needs `unsafe`, which the
@@ -23,12 +26,12 @@ use std::sync::Arc;
 
 const MIB: usize = 1 << 20;
 const CHILD: &str = "NWDB_MERGE_MEMORY_PARTS";
-const CHILD_INPUTS: &str = "NWDB_MERGE_MEMORY_INPUTS";
 const NAME: &str = "merge_memory_follows_the_chunk_not_the_inputs";
 const WINDOW_NS: i64 = 900_000_000_000;
 
 const PARTS: u64 = 8;
-const ROWS_PER_PART: usize = 40;
+/// Rows per part, for the smaller and the larger set of inputs.
+const ROWS_PER_PART: [usize; 2] = [24, 48];
 /// Cut into pieces of 4 KiB: 192 KiB of text of its own, 4 KiB that every row
 /// of every part shares.
 const ATTRS: usize = 196 * 1024;
@@ -84,7 +87,7 @@ fn resident() -> (usize, usize) {
 
 /// Writes the inputs: every part holds rows of every trace, so every trace is
 /// stitched from all the parts. With `one_trace` there is a single trace.
-fn write_inputs(dir: &Path, one_trace: bool) -> u64 {
+fn write_inputs(dir: &Path, one_trace: bool, rows_per_part: usize) -> u64 {
     let mut rng = StdRng::seed_from_u64(1);
     let mut shared = vec![0u8; 4096];
     rng.fill_bytes(&mut shared);
@@ -99,7 +102,7 @@ fn write_inputs(dir: &Path, one_trace: bool) -> u64 {
                 max_rows: 64,
                 max_bytes: 32 * MIB,
             });
-            for r in 0..ROWS_PER_PART / traces {
+            for r in 0..rows_per_part / traces {
                 let mut attrs = shared.clone();
                 let mut own = vec![0u8; ATTRS - 4096];
                 rng.fill_bytes(&mut own);
@@ -139,8 +142,8 @@ fn dir_size(dir: &Path) -> u64 {
 }
 
 /// The child: opens the inputs, merges them, and reports the peak.
-fn child(dir: PathBuf, inputs: u64) {
-    let readers: Vec<PartReader> = (1..=inputs)
+fn child(dir: PathBuf) {
+    let readers: Vec<PartReader> = (1..=PARTS)
         .map(|p| PartReader::open(dir.join(part_dir_name(p))).unwrap())
         .collect();
     let refs: Vec<&PartReader> = readers.iter().collect();
@@ -158,11 +161,10 @@ fn child(dir: PathBuf, inputs: u64) {
     );
 }
 
-fn run_child(dir: &Path, inputs: u64) -> (usize, usize) {
+fn run_child(dir: &Path) -> usize {
     let out = Command::new(std::env::current_exe().unwrap())
         .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD, dir)
-        .env(CHILD_INPUTS, inputs.to_string())
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -179,28 +181,28 @@ fn run_child(dir: &Path, inputs: u64) -> (usize, usize) {
             .parse()
             .unwrap()
     };
-    (field("before="), field("peak="))
+    field("peak=") - field("before=")
 }
 
 #[test]
 fn merge_memory_follows_the_chunk_not_the_inputs() {
     if let Some(dir) = std::env::var_os(CHILD) {
-        let inputs = std::env::var(CHILD_INPUTS).unwrap().parse().unwrap();
-        child(PathBuf::from(dir), inputs);
+        child(PathBuf::from(dir));
         return;
     }
     for one_trace in [false, true] {
-        let tmp = tempfile::tempdir().unwrap();
-        let input_bytes = write_inputs(tmp.path(), one_trace);
+        let small = tempfile::tempdir().unwrap();
+        let large = tempfile::tempdir().unwrap();
+        write_inputs(small.path(), one_trace, ROWS_PER_PART[0]);
+        let input_bytes = write_inputs(large.path(), one_trace, ROWS_PER_PART[1]);
         assert!(input_bytes as usize > 70 * MIB);
-        // Half of the inputs, and all of them.
-        let (before_half, peak_half) = run_child(tmp.path(), PARTS / 2);
-        std::fs::remove_dir_all(tmp.path().join(part_dir_name(99))).unwrap();
-        let (before, peak) = run_child(tmp.path(), PARTS);
-        let (grew_half, grew) = (peak_half - before_half, peak - before);
+        // The same number of inputs, half the size and the full size.
+        let grew_half = run_child(small.path());
+        let grew = run_child(large.path());
         eprintln!(
             "one trace: {one_trace}; {} MiB of inputs on disk, chunk {} MiB, window {} MiB; the \
-             merge raised the resident peak by {} MiB for half of them and {} MiB for all",
+             merge raised the resident peak by {} MiB for inputs of half the size and {} MiB for \
+             all of it",
             input_bytes as usize / MIB,
             CHUNK / MIB,
             WINDOW / MIB,
@@ -216,15 +218,15 @@ fn merge_memory_follows_the_chunk_not_the_inputs() {
             input_bytes as usize / MIB,
             grew / MIB
         );
-        // Twice the inputs, the same memory.
+        // Twice the size, the same memory.
         assert!(
             grew <= grew_half + 6 * MIB,
-            "{} MiB for half the inputs, {} MiB for all",
+            "{} MiB for inputs of half the size, {} MiB for all of it",
             grew_half / MIB,
             grew / MIB
         );
-        let merged = PartReader::open(tmp.path().join(part_dir_name(99))).unwrap();
-        assert_eq!(merged.row_count(), PARTS * ROWS_PER_PART as u64);
+        let merged = PartReader::open(large.path().join(part_dir_name(99))).unwrap();
+        assert_eq!(merged.row_count(), PARTS * ROWS_PER_PART[1] as u64);
         merged.verify().unwrap();
     }
 }
