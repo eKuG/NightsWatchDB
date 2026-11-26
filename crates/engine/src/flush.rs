@@ -27,6 +27,20 @@ struct Written<'a> {
 }
 
 impl Inner {
+    /// The settings every part of this engine is written with. A flush and a
+    /// merge both use it, so a merged part is written exactly as a flushed
+    /// one: the same text cuts, the same sharing window, the same index
+    /// budgets.
+    pub(crate) fn writer_options(&self) -> WriterOptions {
+        WriterOptions {
+            splitter: self.opts.splitter.clone(),
+            dedup_window_bytes: self.opts.dedup_window_bytes,
+            text_index_budget_bytes: self.opts.text_index_budget_bytes,
+            row_list_budget_bytes: self.opts.row_list_budget_bytes,
+            ..WriterOptions::default()
+        }
+    }
+
     /// Flushes the whole active buffer: one frozen buffer, one part per
     /// window, one manifest commit that also moves `wal_flushed_lsn`, and then
     /// (if `trim`) the log is trimmed.
@@ -219,19 +233,8 @@ impl Inner {
         let mut gate = None;
         let result: Result<()> = (|| {
             for ((w, range), id) in windows.iter().zip(ids) {
-                let mut writer = PartWriter::create(
-                    &self.parts_dir,
-                    id,
-                    *w,
-                    window_ns,
-                    WriterOptions {
-                        splitter: self.opts.splitter.clone(),
-                        dedup_window_bytes: self.opts.dedup_window_bytes,
-                        text_index_budget_bytes: self.opts.text_index_budget_bytes,
-                        row_list_budget_bytes: self.opts.row_list_budget_bytes,
-                        ..WriterOptions::default()
-                    },
-                )?;
+                let mut writer =
+                    PartWriter::create(&self.parts_dir, id, *w, window_ns, self.writer_options())?;
                 let mut builder = SpanBatchBuilder::new(self.opts.batch_limits);
                 for t in &grouped.traces[range.clone()] {
                     for e in &grouped.entries[t.from..t.to] {

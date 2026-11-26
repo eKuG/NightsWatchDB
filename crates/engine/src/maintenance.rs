@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nwdb_core::{Error, Result, part_dir_name};
 use nwdb_manifest::Edit;
-use nwdb_segment::{MergeOptions, PartReader, WriterOptions, merge_parts};
+use nwdb_segment::{MergeOptions, PartReader, merge_parts};
 
 use crate::compaction::{MergePlan, PartInfo, WindowKey, choose_merge};
 use crate::engine::{Inner, LivePart, Stage, run_hook, sync_dir};
@@ -437,11 +437,7 @@ impl Inner {
         let readers: Vec<&PartReader> = inputs.iter().map(|p| &p.reader).collect();
         // The same writer settings a flush uses.
         let options = MergeOptions {
-            writer: WriterOptions {
-                splitter: self.opts.splitter.clone(),
-                dedup_window_bytes: self.opts.dedup_window_bytes,
-                ..WriterOptions::default()
-            },
+            writer: self.writer_options(),
             level,
             ..MergeOptions::default()
         };
