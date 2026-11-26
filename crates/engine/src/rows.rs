@@ -82,3 +82,35 @@ pub(crate) fn group_traces(cols: &[SpanColumns<'_>]) -> Grouped {
     traces.sort_unstable_by_key(|t| (t.start_ns, t.trace_id));
     Grouped { entries, traces }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nwdb_core::{BatchLimits, SpanBatchBuilder, SpanId, SpanRecord};
+
+    fn batch(span: u8, arrival: u64, start_ns: i64) -> arrow_array::RecordBatch {
+        let mut b = SpanBatchBuilder::new(BatchLimits::DEFAULT);
+        b.append(&SpanRecord {
+            trace_id: TraceId([1; 16]),
+            span_id: SpanId([span; 8]),
+            start_ns,
+            arrival,
+            ..SpanRecord::default()
+        });
+        b.finish()
+    }
+
+    /// The copy with the smallest `arrival` is kept even when it comes later
+    /// in batch order; batch order decides only among equal arrivals.
+    #[test]
+    fn the_smallest_arrival_is_kept_whatever_the_batch_order() {
+        let batches = [batch(7, 9, 100), batch(7, 3, 200), batch(7, 3, 300)];
+        let cols: Vec<_> = batches
+            .iter()
+            .map(|b| SpanColumns::try_new(b).unwrap())
+            .collect();
+        let g = group_traces(&cols);
+        assert_eq!(g.entries.len(), 1);
+        assert_eq!((g.entries[0].arrival, g.entries[0].start_ns), (3, 200));
+    }
+}
