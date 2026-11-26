@@ -22,6 +22,7 @@ import (
 type summary struct {
 	TraceID     string   `json:"trace_id"`
 	StartNs     int64    `json:"start_ns"`
+	EndNs       int64    `json:"end_ns"`
 	RootService string   `json:"root_service"`
 	Models      []string `json:"models"`
 }
@@ -53,6 +54,27 @@ func parseTokens(b []byte) (spans uint64, truncated bool, err error) {
 		spans += m.Count
 	}
 	return spans, r.Truncated, nil
+}
+
+// parseTokenCounts reads the body of the token endpoint as span counts per
+// request model. Spans without a model have no name and are left out.
+func parseTokenCounts(b []byte) (map[string]int, error) {
+	var r struct {
+		Models []struct {
+			Model string `json:"model"`
+			Count int    `json:"count"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, err
+	}
+	counts := map[string]int{}
+	for _, m := range r.Models {
+		if m.Model != "" {
+			counts[m.Model] += m.Count
+		}
+	}
+	return counts, nil
 }
 
 // percentile is the nearest-rank percentile of a sorted slice.
@@ -95,22 +117,31 @@ func (c *client) get(path string, q url.Values) ([]byte, error) {
 	return b, nil
 }
 
+// found is what paging through the traces learns: the ids, how many traces
+// each root service has, how many traces list each model, the earliest and
+// latest trace start, and the latest span end.
+type found struct {
+	ids                        []string
+	services, models           map[string]int
+	minStart, maxStart, maxEnd int64
+}
+
 // discover pages the list endpoint from the newest trace back to `from`. The
 // endpoint has no cursor, so each page asks for traces that start before the
 // oldest one seen; a trace that shares that start time is seen twice, which
 // the set absorbs.
-func (c *client) discover(from, to int64) (ids []string, services, models map[string]int, err error) {
+func (c *client) discover(from, to int64) (found, error) {
+	f := found{services: map[string]int{}, models: map[string]int{}}
 	seen := map[string]bool{}
-	services, models = map[string]int{}, map[string]int{}
 	for {
 		q := url.Values{"from": {strconv.FormatInt(from, 10)}, "to": {strconv.FormatInt(to, 10)}, "limit": {"1000"}}
 		b, err := c.get("/api/v1/traces", q)
 		if err != nil {
-			return nil, nil, nil, err
+			return found{}, err
 		}
 		page, err := parseList(b)
 		if err != nil {
-			return nil, nil, nil, err
+			return found{}, err
 		}
 		fresh := 0
 		oldest := to
@@ -123,14 +154,23 @@ func (c *client) discover(from, to int64) (ids []string, services, models map[st
 			}
 			seen[s.TraceID] = true
 			fresh++
-			ids = append(ids, s.TraceID)
-			services[s.RootService]++
+			if len(f.ids) == 0 || s.StartNs < f.minStart {
+				f.minStart = s.StartNs
+			}
+			if len(f.ids) == 0 || s.StartNs > f.maxStart {
+				f.maxStart = s.StartNs
+			}
+			if len(f.ids) == 0 || s.EndNs > f.maxEnd {
+				f.maxEnd = s.EndNs
+			}
+			f.ids = append(f.ids, s.TraceID)
+			f.services[s.RootService]++
 			for _, m := range s.Models {
-				models[m]++
+				f.models[m]++
 			}
 		}
 		if len(page) < 1000 {
-			return ids, services, models, nil
+			return f, nil
 		}
 		// Ask again from the oldest start time (to is exclusive, so +1 keeps
 		// traces that share it) unless that would repeat the same page; then
@@ -141,7 +181,7 @@ func (c *client) discover(from, to int64) (ids []string, services, models map[st
 			to = oldest + 1
 		}
 		if to <= from {
-			return ids, services, models, nil
+			return f, nil
 		}
 	}
 }
@@ -156,6 +196,100 @@ func busiest(m map[string]int) string {
 		}
 	}
 	return best
+}
+
+// expParams are the filter values of the exp_* kinds, derived by the rule the
+// experiment used: S is the most frequent root service, M the most frequent
+// request model, and the window is the middle half of the span start-time
+// range.
+type expParams struct {
+	Service string `json:"service"`
+	Model   string `json:"model"`
+	FromNs  int64  `json:"from_ns"`
+	ToNs    int64  `json:"to_ns"`
+	// The range the window comes from, printed so a reader can check it.
+	MinSpanStartNs int64 `json:"min_span_start_ns"`
+	MaxSpanStartNs int64 `json:"max_span_start_ns"`
+}
+
+// middleHalf is [min+(max-min)/4, min+3*(max-min)/4) in integer nanoseconds,
+// the experiment's window; the end is exclusive.
+func middleHalf(min, max int64) (from, to int64) {
+	d := max - min
+	return min + d/4, min + 3*d/4
+}
+
+// firstTrue returns the smallest t in [lo, hi] for which ok(t) holds, given
+// that ok is false below some point and true from it on. It fails if ok(hi)
+// is false.
+func firstTrue(lo, hi int64, ok func(int64) (bool, error)) (int64, error) {
+	good, err := ok(hi)
+	if err != nil {
+		return 0, err
+	}
+	if !good {
+		return 0, fmt.Errorf("the condition does not hold at the upper bound %d", hi)
+	}
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		good, err := ok(mid)
+		if err != nil {
+			return 0, err
+		}
+		if good {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo, nil
+}
+
+// spanCount returns how many spans start in [from, to) and how many of them
+// each request model has, from the token endpoint.
+func (c *client) spanCount(from, to int64) (uint64, map[string]int, error) {
+	q := url.Values{"from": {strconv.FormatInt(from, 10)}, "to": {strconv.FormatInt(to, 10)}, "limit": {"10000"}}
+	b, err := c.get("/api/v1/tokens", q)
+	if err != nil {
+		return 0, nil, err
+	}
+	n, truncated, err := parseTokens(b)
+	if err != nil {
+		return 0, nil, err
+	}
+	if truncated {
+		return 0, nil, fmt.Errorf("more than 10000 models, so the counts are cut")
+	}
+	counts, err := parseTokenCounts(b)
+	return n, counts, err
+}
+
+// deriveExp finds the experiment's parameters from what the server returns.
+// The list has trace starts only. The earliest span start is the earliest
+// trace start. The latest span start is found by asking the token endpoint
+// how many spans start before a time, and searching for the first time by
+// which all of them have. Model counts are span counts, as the experiment
+// counted them, so they come from the token endpoint as well.
+func (c *client) deriveExp(f found) (expParams, error) {
+	var p expParams
+	total, models, err := c.spanCount(f.minStart, math.MaxInt64)
+	if err != nil {
+		return p, err
+	}
+	t, err := firstTrue(f.maxStart+1, f.maxEnd+1, func(t int64) (bool, error) {
+		n, _, err := c.spanCount(f.minStart, t)
+		return n == total, err
+	})
+	if err != nil {
+		return p, fmt.Errorf("finding the latest span start: %w", err)
+	}
+	p.MinSpanStartNs, p.MaxSpanStartNs = f.minStart, t-1
+	p.FromNs, p.ToNs = middleHalf(p.MinSpanStartNs, p.MaxSpanStartNs)
+	p.Service, p.Model = busiest(f.services), busiest(models)
+	if p.Service == "" || p.Model == "" {
+		return p, fmt.Errorf("the data has no root service or no request model to filter by")
+	}
+	return p, nil
 }
 
 type kindResult struct {
@@ -292,16 +426,23 @@ func realMain() error {
 		Transport: &http.Transport{MaxIdleConnsPerHost: *conc},
 	}}
 	t0 := time.Now()
-	ids, services, models, err := c.discover(*from, *to)
+	disc, err := c.discover(*from, *to)
 	if err != nil {
 		return fmt.Errorf("discovering trace ids: %w", err)
 	}
+	ids := disc.ids
 	if len(ids) == 0 {
 		return fmt.Errorf("no traces in the range")
 	}
 	discoverMs := float64(time.Since(t0)) / 1e6
-	service, model := busiest(services), busiest(models)
+	service, model := busiest(disc.services), busiest(disc.models)
 	fmt.Fprintf(os.Stderr, "discovered %d traces in %.0f ms; service %q, model %q\n", len(ids), discoverMs, service, model)
+	// Kept out of the timings, like the discovery above.
+	exp, err := c.deriveExp(disc)
+	if err != nil {
+		return fmt.Errorf("deriving the experiment parameters: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "experiment parameters: service %q, model %q, window [%d, %d)\n", exp.Service, exp.Model, exp.FromNs, exp.ToNs)
 
 	rng := rand.New(rand.NewSource(*seed))
 	pick := make([]string, *warm+*n)
@@ -309,20 +450,26 @@ func realMain() error {
 		pick[i] = ids[rng.Intn(len(ids))]
 	}
 	ns := func(v int64) string { return strconv.FormatInt(v, 10) }
-	list := func(extra url.Values) func(int) (string, url.Values) {
+	listIn := func(f, t int64, extra url.Values) func(int) (string, url.Values) {
 		return func(int) (string, url.Values) {
-			q := url.Values{"from": {ns(*from)}, "to": {ns(*to)}, "limit": {"50"}}
+			q := url.Values{"from": {ns(f)}, "to": {ns(t)}, "limit": {"50"}}
 			for k, v := range extra {
 				q[k] = v
 			}
 			return "/api/v1/traces", q
 		}
 	}
-	tokens := func(f, t int64) func(int) (string, url.Values) {
+	list := func(extra url.Values) func(int) (string, url.Values) { return listIn(*from, *to, extra) }
+	tokensOp := func(f, t int64, op string) func(int) (string, url.Values) {
 		return func(int) (string, url.Values) {
-			return "/api/v1/tokens", url.Values{"from": {ns(f)}, "to": {ns(t)}, "limit": {"10000"}}
+			q := url.Values{"from": {ns(f)}, "to": {ns(t)}, "limit": {"10000"}}
+			if op != "" {
+				q.Set("operation", op)
+			}
+			return "/api/v1/tokens", q
 		}
 	}
+	tokens := func(f, t int64) func(int) (string, url.Values) { return tokensOp(f, t, "") }
 	var kinds []kindResult
 	add := func(k string, req func(int) (string, url.Values)) {
 		kinds = append(kinds, run(c, k, *warm, *n, *conc, req))
@@ -334,6 +481,10 @@ func realMain() error {
 	add("list_error_50", list(url.Values{"error": {"true"}}))
 	add("tokens_range", tokens(*from, *to))
 	add("tokens_hour", tokens(*hourFrom, *hourFrom+hourNs))
+	// The queries of the earlier experiment, with its parameters.
+	add("exp_list1", listIn(exp.FromNs, exp.ToNs, url.Values{"service": {exp.Service}}))
+	add("exp_list2", listIn(exp.FromNs, exp.ToNs, url.Values{"model": {exp.Model}, "error": {"true"}}))
+	add("exp_agg", tokensOp(exp.FromNs, exp.ToNs, "chat"))
 
 	// One more token query, not timed, gives the number of spans the server
 	// holds in the range, for the caller to compare with what it sent.
@@ -349,6 +500,8 @@ func realMain() error {
 	// One line per kind, so a shell script can read the numbers with awk.
 	fmt.Printf("{\"config\":{\"addr\":%q,\"from_ns\":%d,\"to_ns\":%d,\"hour_start_ns\":%d,\"n\":%d,\"warmup\":%d,\"seed\":%d,\"concurrency\":%d,\"service\":%q,\"model\":%q},\n",
 		*addr, *from, *to, *hourFrom, *n, *warm, *seed, *conc, service, model)
+	pj, _ := json.Marshal(exp)
+	fmt.Printf("\"exp_params\":%s,\n", pj)
 	fmt.Printf("\"discovered_traces\":%d,\"discovery_ms\":%.1f,\"server_span_count\":%d,\"token_rows_truncated\":%v,\n\"kinds\":[\n", len(ids), discoverMs, spans, truncated)
 	for i, k := range kinds {
 		line, _ := json.Marshal(k)

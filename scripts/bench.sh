@@ -343,6 +343,13 @@ mb() { awk -v b="$1" 'BEGIN {if (b == "null" || b == "") print "n/a"; else print
   echo "| Query | Count | Errors | p50 ms | p95 ms | p99 ms | max ms | Bytes received |"
   echo "|---|---|---|---|---|---|---|---|"
   sed -n 's/^{"kind":"\([a-z_0-9]*\)","count":\([0-9]*\),"errors":\([0-9]*\),"p50_ms":\([^,]*\),"p95_ms":\([^,]*\),"p99_ms":\([^,]*\),"max_ms":\([^,]*\),"bytes":\([0-9]*\).*/| \1 | \2 | \3 | \4 | \5 | \6 | \7 | \8 |/p' "$OUT/querybench.json"
+  echo
+  # The three exp_* rows are the earlier experiment's list1, list2 and agg,
+  # run with the parameters it derives (also in result.json, queries.exp_params).
+  sed -n 's/^"exp_params":{"service":"\([^"]*\)","model":"\([^"]*\)","from_ns":\([0-9]*\),"to_ns":\([0-9]*\),"min_span_start_ns":\([0-9]*\),"max_span_start_ns":\([0-9]*\)}.*/Parameters of the exp_* rows: service=\1, model=\2, window [\3, \4) ns, the middle half of the span start range [\5, \6]./p' "$OUT/querybench.json"
+  echo "- exp_list1: the 50 newest traces whose root span is from that service, starting in the window."
+  echo "- exp_list2: the 50 newest traces in the window with an error and at least one span with that request model."
+  echo "- exp_agg: token totals by model of the chat spans that start in the window."
 } > "$OUT/result.md"
 
 echo "PASS: $DATASET on $PROFILE, results in $OUT" >&2

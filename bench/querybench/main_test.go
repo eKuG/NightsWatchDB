@@ -70,18 +70,103 @@ func TestDiscover(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := &client{base: srv.URL, http: srv.Client()}
-	ids, services, _, err := c.discover(0, 200000)
+	f, err := c.discover(0, 200000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ids) != 2500 || services["s"] != 2500 {
-		t.Errorf("found %d ids", len(ids))
+	if len(f.ids) != 2500 || f.services["s"] != 2500 {
+		t.Errorf("found %d ids", len(f.ids))
+	}
+	if f.minStart != 100000-833 || f.maxStart != 100000 {
+		t.Errorf("start range %d..%d", f.minStart, f.maxStart)
 	}
 }
 
 func TestBusiest(t *testing.T) {
 	if got := busiest(map[string]int{"b": 2, "a": 2, "c": 1, "": 9}); got != "a" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestMostFrequentTieBreak(t *testing.T) {
+	// Equal counts go to the smaller name, whatever the map order; spans
+	// without a model never win.
+	counts, err := parseTokenCounts([]byte(`{"models":[{"model":"b","count":4},{"model":"a","count":4},{"count":9},{"model":"c","count":3}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		if got := busiest(counts); got != "a" {
+			t.Fatalf("got %q", got)
+		}
+	}
+	if busiest(map[string]int{}) != "" {
+		t.Error("no data gives no name")
+	}
+}
+
+func TestMiddleHalf(t *testing.T) {
+	for _, c := range []struct{ min, max, from, to int64 }{
+		{0, 100, 25, 75},         // divisible by 4
+		{0, 101, 25, 75},         // odd: 101/4 = 25, 303/4 = 75
+		{0, 102, 25, 76},         // even, not divisible by 4: 3*102/4 = 76
+		{0, 103, 25, 77},         // 309/4 = 77
+		{1000, 1000, 1000, 1000}, // one instant: empty window
+		{1767225600000000007, 1767311999999999999, 1767247200000000005, 1767290400000000001},
+	} {
+		from, to := middleHalf(c.min, c.max)
+		if from != c.from || to != c.to {
+			t.Errorf("middleHalf(%d, %d) = %d, %d; want %d, %d", c.min, c.max, from, to, c.from, c.to)
+		}
+	}
+}
+
+func TestFirstTrue(t *testing.T) {
+	for _, edge := range []int64{10, 11, 57, 99, 100} {
+		got, err := firstTrue(10, 100, func(x int64) (bool, error) { return x >= edge, nil })
+		if err != nil || got != edge {
+			t.Errorf("edge %d: got %d, %v", edge, got, err)
+		}
+	}
+	if _, err := firstTrue(10, 100, func(int64) (bool, error) { return false, nil }); err == nil {
+		t.Error("a condition that never holds must fail")
+	}
+}
+
+// The whole derivation against a fake server: spans start at 1000, 1010 and
+// 1990 (the last one in a trace that starts earlier), so the latest span
+// start is 1990 although no trace starts there and the latest trace start is
+// 1010.
+func TestDeriveExp(t *testing.T) {
+	spans := []int64{1000, 1010, 1990}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		from, _ := strconv.ParseInt(q.Get("from"), 10, 64)
+		to, _ := strconv.ParseInt(q.Get("to"), 10, 64)
+		n := 0
+		for _, s := range spans {
+			if s >= from && s < to {
+				n++
+			}
+		}
+		// Two spans have model m1, one has m2.
+		m1 := n
+		if n > 0 {
+			m1 = n - 1
+		}
+		json.NewEncoder(w).Encode(map[string]any{"models": []map[string]any{{"model": "m1", "count": m1}, {"model": "m2", "count": n - m1}}})
+	}))
+	defer srv.Close()
+	c := &client{base: srv.URL, http: srv.Client()}
+	f := found{services: map[string]int{"svc": 2, "other": 1}, minStart: 1000, maxStart: 1010, maxEnd: 2000}
+	p, err := c.deriveExp(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Range 1000..1990, so the window is [1247, 1742).
+	want := expParams{Service: "svc", Model: "m1", FromNs: 1247, ToNs: 1742, MinSpanStartNs: 1000, MaxSpanStartNs: 1990}
+	if p != want {
+		t.Errorf("got %+v, want %+v", p, want)
 	}
 }
 
