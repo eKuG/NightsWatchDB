@@ -274,3 +274,22 @@ fn a_tiny_budget_and_a_huge_budget_give_the_same_answers() {
         }
     }
 }
+
+/// A word that occurs all through a document that spans many segments is in
+/// the list of every one of them; the answer names the document once.
+#[test]
+fn a_word_in_every_segment_of_a_split_document_is_found_once() {
+    let mut text = String::new();
+    for i in 0..30_000 {
+        text.push_str(&format!("common a{i:06} "));
+    }
+    let docs: Docs = vec![(3, text.into_bytes()), (4, b"common".to_vec())];
+    let (r, meta) = index(&docs, SMALL);
+    assert!(meta.segments >= 3, "{meta:?}");
+    assert_eq!(r.term("common").unwrap().ids.as_slice(), [3, 4]);
+    assert_eq!(r.prefix("comm", 100).unwrap().as_slice(), [3, 4]);
+    assert_eq!(
+        r.intersect(&["common", "a000010"]).unwrap().ids.as_slice(),
+        [3]
+    );
+}
