@@ -14,9 +14,10 @@
 //! the same span twice. Within one flush, and in [`Snapshot::get_trace`],
 //! duplicate `(trace id, span id)` pairs are removed. Duplicates that landed
 //! in different parts are not removed from [`Snapshot::list_traces`] counts or
-//! [`Snapshot::aggregate_tokens`] in this checkpoint; removing them is the
-//! compactor's job.
+//! [`Snapshot::aggregate_tokens`] until the window they are in is merged (see
+//! [`CompactionOptions`]); a merge keeps one copy.
 
+mod compaction;
 mod engine;
 mod flush;
 mod maintenance;
@@ -29,6 +30,7 @@ extern crate self as nwdb_engine;
 #[cfg(test)]
 mod replace_tests;
 
+pub use compaction::{CompactionOptions, MergePlan, PartInfo, Rule, choose_merge};
 pub use engine::{Clock, Engine, EngineOptions, EngineStats, Stage, StageHook};
 pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
 

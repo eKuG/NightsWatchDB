@@ -67,6 +67,16 @@ scripts/bench.sh [--dataset d1|d2|smoke] [--profile small|standard] [--out DIR]
   reach the host; data stays in Docker volumes.
 - `BENCH_QUERIES`, `BENCH_WARMUP` and `BENCH_CONCURRENCY` change the query
   phase (defaults 200, 20, 1).
+- Compaction runs in the server while the data loads. After the load the script
+  waits until the buffer is flushed, no merge is running and no window has more
+  than one part (`BENCH_COMPACTION_TIMEOUT`, default 3600 seconds), and records
+  how long that took, the server CPU it used and the compaction statistics;
+  storage is measured after that. The server runs with a short quiet period,
+  `BENCH_COMPACTION_QUIET` (default `5s`; production defaults to 60 seconds), so
+  the wait is short. `BENCH_NO_COMPACTION=1` starts the server with
+  `--no-compaction` and skips the wait, to see what compaction saves.
+- `BENCH_CORPUS_DIR` is the host directory that fills the corpus volume (the
+  first time only; default `.data/corpus`).
 - It removes its containers, network and data volume on exit. The images and
   the corpus volume stay. It refuses to start while another `nwdb-bench-*`
   container is running.

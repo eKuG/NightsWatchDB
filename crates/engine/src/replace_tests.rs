@@ -62,7 +62,7 @@ fn merged(e: &Engine, from: &[u64]) -> LivePart {
     }
     let meta = w.finish().unwrap();
     let reader = PartReader::open(inner.parts_dir.join(part_dir_name(id))).unwrap();
-    LivePart { meta, reader }
+    LivePart::new(meta, reader)
 }
 
 fn part_ids(e: &Engine) -> Vec<u64> {
@@ -523,5 +523,65 @@ fn a_flush_and_a_replacement_never_interleave_their_commit_and_publish() {
         check_split(&e.snapshot(), "after both");
         m.check(&e, "after both");
         e.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn an_error_returned_before_the_commit_is_honoured_and_a_fatal_one_stops_the_engine() {
+    for fatal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let hook: StageHook = Arc::new(move |s| match s {
+            Stage::BeforeReplaceCommit if fatal => Err(Error::fatal("injected fatal failure")),
+            Stage::BeforeReplaceCommit => Err(Error::other("injected failure")),
+            _ => Ok(()),
+        });
+        let mut o = opts(dir.path());
+        o.stage_hook = Some(hook);
+        let e = open(o);
+        let mut m = Model::default();
+        populated(&e, &mut m);
+        let ids = part_ids(&e);
+        let version = e.inner().manifest.current().version;
+        let remove: Vec<u64> = windows_of(&e)
+            .into_iter()
+            .filter(|(_, w)| *w < 4_000)
+            .map(|(id, _)| id)
+            .collect();
+        let new_part = merged(&e, &remove);
+        let new_dir = dir
+            .path()
+            .join("parts")
+            .join(part_dir_name(new_part.meta.part_id));
+
+        let err = e
+            .inner()
+            .replace_parts(&remove, vec![new_part])
+            .unwrap_err();
+        // Nothing changed: the list, the manifest, the old directories and the
+        // data. The new directory is the caller's to delete.
+        assert_eq!(matches!(err, Error::Fatal(_)), fatal, "{err}");
+        assert_eq!(part_ids(&e), ids);
+        assert_eq!(e.inner().manifest.current().version, version);
+        assert_eq!(dirs_on_disk(dir.path()).len(), ids.len() + 1);
+        assert!(new_dir.is_dir());
+        m.check(&e, "after the refused replacement");
+        assert_eq!(e.stats().fatal, fatal);
+        if fatal {
+            // The engine is stopped: another replacement is refused, reads
+            // work, and a restart recovers everything and deletes the new
+            // directory.
+            let again = e.inner().replace_parts(&[], Vec::new());
+            assert!(matches!(again, Err(Error::Fatal(_))));
+            let _ = e.shutdown();
+            drop(e);
+            let e = open(opts(dir.path()));
+            m.check(&e, "after the restart");
+            assert_eq!(part_ids(&e), ids);
+            assert_eq!(dirs_on_disk(dir.path()), ids);
+            e.shutdown().unwrap();
+        } else {
+            std::fs::remove_dir_all(new_dir).unwrap();
+            e.shutdown().unwrap();
+        }
     }
 }

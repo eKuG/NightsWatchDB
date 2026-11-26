@@ -38,6 +38,14 @@ pub struct PartMeta {
     pub payload: PayloadTotals,
 }
 
+impl PartMeta {
+    /// Bytes the part takes on disk: the sum of its files. Compaction sizes
+    /// its choices by this.
+    pub fn size_bytes(&self) -> u64 {
+        self.files.values().fold(0u64, |a, b| a.saturating_add(*b))
+    }
+}
+
 /// Directory name of a part: the id zero-padded to 20 digits, the width of
 /// `u64::MAX`, so names sort in id order.
 pub fn part_dir_name(part_id: u64) -> String {

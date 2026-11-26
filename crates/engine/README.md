@@ -29,7 +29,7 @@ engine.shutdown()?;
 4. The flusher thread writes the buffer into parts when it reaches
    `buffer_bytes`, or when its oldest data is `flush_interval` old; `flush()`
    does it on demand. The maintenance thread removes parts that retention has
-   expired (see Retention).
+   expired (see Retention) and merges the parts of a window (see Compaction).
 5. After a crash `open` loads the manifest, opens the parts and replays the log
    from the position the manifest records through the registered decoders.
 
@@ -120,7 +120,7 @@ failure, not a refusal, and the next start continues from where it stopped.
 | log thread (in `nwdb-wal`) | writes and syncs groups, runs callbacks in order; its callbacks only push to a queue |
 | applier (`nwdb-applier`) | pops results in log order, inserts into the buffer, calls `on_durable` outside every lock |
 | flusher (`nwdb-flusher`) | waits for the size or age trigger, then flushes; after a failed flush waits one second before retrying |
-| maintenance (`nwdb-maintenance`) | wakes every `maintenance_interval` (default 10 s) and after every flush, and runs one pass: it retries directory deletions that failed, then applies retention; the place where parts will be chosen and merged is marked in the pass and does nothing yet |
+| maintenance (`nwdb-maintenance`) | wakes every `maintenance_interval` (default 10 s) and after every flush, and runs one pass: it retries directory deletions that failed, applies retention, then merges parts until the policy finds nothing to merge (see Compaction) |
 | callers | `flush()` runs on the calling thread, serialised with the flusher by a gate; it checks the closing state after taking the gate. `run_maintenance()` runs one pass on the calling thread, serialised with the thread |
 
 One mutex (`Core`) holds the visible state and counters, and is held only to
@@ -147,15 +147,21 @@ last handle is dropped by a callback running on an engine thread, the cleanup
 runs on a separate thread rather than joining itself.
 
 **How long shutdown can wait for maintenance.** A pass looks at the stop flag
-between its steps, and shutdown sets it first, so shutdown waits for the step
-in progress and no more. A step is one manifest commit together with the
-publish that follows it (a file write and two syncs, plus the rebuild of the
-split map described under Replacing parts, which is in memory), or the deletion
-of one part directory. If shutdown arrives while a replacement is deleting its
-directories, the ones not yet reached stay on disk, unreferenced; the next
-start-up deletes them. A pass that is waiting for the publish gate waits for a
-flush's commit and publish, which is the same order of time. Nothing in a pass
-waits for ingest, for queries or for a flush's writing of parts.
+between its steps (and compaction between its merges), and shutdown sets it
+first, so shutdown waits for the step in progress and no more. A step is one
+manifest commit together with the publish that follows it (a file write and two
+syncs, plus the rebuild of the split map described under Replacing parts, which
+is in memory), or the deletion of one part directory, or **one merge**. A merge
+in progress is finished, not abandoned (see Compaction for why): shutdown
+waits for the call to `merge_parts` that is running, which is bounded by
+`max_input_bytes` of input (4 GiB by default; the segment crate measured a
+debug build at about 16,000 rows a second, a release build is much faster),
+and then for one open, one commit and one publish. No further merge is started.
+If shutdown arrives while a replacement is deleting its directories, the ones
+not yet reached stay on disk, unreferenced; the next start-up deletes them. A
+pass that is waiting for the publish gate waits for a flush's commit and
+publish, which is the same order of time. Nothing in a pass waits for ingest,
+for queries or for a flush's writing of parts.
 
 ## The flush
 
@@ -240,7 +246,7 @@ from the log. A panic in the stage hook after the commit is ignored.
 ## Replacing parts
 
 Parts are immutable and a flush only adds them. Everything that takes parts
-away (retention now, merging later) goes through one internal operation,
+away (retention and merging) goes through one internal operation,
 `Inner::replace_parts(remove: &[u64], add: Vec<LivePart>) -> Result<Replaced>`:
 the ids of live parts to remove and zero or more new parts, each already
 written to `parts/` with its `PartMeta` and an open `PartReader` (ids reserved
@@ -268,7 +274,11 @@ Rules:
   last).
 - **Before the commit an error changes nothing.** An id in `remove` that is not
   live, or listed twice, is `InvalidArgument`, and so is anything the manifest
-  refuses (such as a new part whose id is live). The new parts are then not
+  refuses (such as a new part whose id is live). The stage hook is called at
+  `BeforeReplaceCommit` after these checks, with the publish gate held and
+  just before the commit; an error it returns is handled as if the commit had
+  failed with that error (a panic in it is a panic of the pass, which is
+  fatal). The new parts are then not
   live; their directories stay the caller's to delete, and a restart deletes
   them otherwise. `Fatal` from the manifest puts the engine in the fatal state
   as it does in a flush.
@@ -306,7 +316,7 @@ disk is never reused, so no new rule is needed:
 
 | Crash at / during | On disk | Recovery |
 |---|---|---|
-| before the commit | the new parts' directories, unreferenced; the old parts live | the new directories are deleted at start-up; nothing was removed |
+| before the commit (`BeforeReplaceCommit`, or any earlier step of a merge) | the new parts' directories, unreferenced; the old parts live | the new directories are deleted at start-up; nothing was removed |
 | `ReplaceCommitted` (after the commit, before the publish) | the manifest has the new list; the removed parts' directories still exist, unreferenced | the manifest decides: the removed parts are gone, the new ones live; the leftover directories are deleted at start-up |
 | `ReplacePublished` (before any deletion) | as above | as above |
 | `PartDirDeleted` (once per directory; in the middle of deleting several) | some of the removed directories deleted, the rest unreferenced | the rest are deleted at start-up |
@@ -362,10 +372,131 @@ records its error there (a later success does not clear it, like `last_error`)
 and the next pass tries again; a failed step does not keep the later steps of
 the pass from running.
 
-**Where merging will go.** `choose_and_merge_parts` in the pass is empty: a
-later step chooses parts there, writes the merged part with the merge function
-of `nwdb-segment`, and publishes it with `replace_parts`. Nothing else is
-prepared.
+## Compaction
+
+Every flush writes one small part per window, so a window that keeps receiving
+data ends up as many small parts and every query opens all of them, while a
+window that has stopped receiving data should be one part. A merge is
+`nwdb_segment::merge_parts`: the parts of one window become one part in which a
+trace split over the inputs is one run, a span that occurs more than once is
+kept once (the earliest input wins) and text is shared across the inputs and
+never rebuilt. `EngineOptions::compaction` (`CompactionOptions`, validated by
+`open`) holds the settings; `compaction.rs` holds the policy.
+
+**The policy** is a pure function of the live parts: for each part its id,
+window, size on disk (the sum of the files in its metadata), level and how long
+ago it became live in this process (parts the manifest listed at start-up count
+from start-up, and a merged part from the moment it was published). It returns
+at most one merge, of parts of one window; a merge never crosses windows.
+
+- **Tiered.** Within a window, sort the parts by size. If some run of at least
+  `min_parts` (4) parts has its largest at most `size_ratio` (4) times its
+  smallest, merge the first such run (the smallest parts), at most `max_parts`
+  (32) of them, smallest first. Each byte is then rewritten once per tier it
+  climbs, about `log(window size / flush size)` times, not once per later
+  flush: a simulation of 4,096 flushes into one window (the unit test) rewrites
+  5.9 bytes per byte ingested and never holds more than 13 parts.
+- **Final.** If a window has at least two parts and none became live less than
+  `quiet` (60 s) ago, merge all of them (at most 65,535) into one. This leaves
+  one part per window once the window has stopped receiving data. It does not
+  look at the event time of the window: data may be loaded long after it
+  happened.
+- **Byte cap.** No merge takes more than `max_input_bytes` (4 GiB) of inputs:
+  the largest candidates are dropped until it fits, and a window with fewer
+  than two left is skipped.
+- Among the windows that qualify, the one with the most parts goes first (the
+  oldest on a tie). Windows that are backing off or damaged are left out.
+
+One huge part and many tiny ones: the tiny ones are merged among themselves and
+climb tiers; the huge one is in a run only when `min_parts - 1` other parts are
+within `size_ratio` of it, so it is rewritten once per roughly three quarters
+of its own size in new data (the simulation: a part of 1 MB with 10 MB of late
+data in parts of 1 KB is rewritten twice, and 6.1 bytes are rewritten per byte
+ingested). The final rule rewrites it once more when the window goes quiet.
+**A late small part for a window that was merged into one is merged into it
+after the quiet period, which rewrites the whole window: late data that
+arrives less often than `quiet` costs one rewrite of the window each time.**
+That is the price of one part per window; lengthen `quiet` to batch late data,
+or switch compaction off for a database that is loaded in arbitrary order.
+
+**The pass.** Retention runs first, so a merge never works on an expired
+window (one that expires during a merge is removed by the next pass). Then,
+until the policy returns nothing or shutdown asks maintenance to stop:
+
+1. the policy chooses a merge; an id is reserved;
+2. `merge_parts` is called with the inputs oldest first (by part id), the
+   window of the inputs, the writer options a flush uses (`splitter`,
+   `dedup_window_bytes`) and a level one above the highest input level;
+3. a reader is opened on the result and the stage `MergeWritten` is called;
+4. `replace_parts(inputs, [result])` replaces them (see Replacing parts).
+
+A merge holds no lock while it reads and writes; only step 4's commit and
+publish hold the publish gate, as a flush does. Flushes, queries and retention
+go on during a merge (a part a flush added meanwhile to the same window is not
+an input and is merged by the next round of the loop). The inputs stay live
+throughout, because only maintenance removes parts and passes run one at a
+time. Snapshots taken before the replacement keep reading the inputs from open
+files.
+
+**Crash points of a merge and its replacement.** Nothing needs a rule beyond
+those of Replacing parts: a part id that reached the disk is never reused and
+start-up deletes the directories the manifest does not reference.
+
+| Crash at / during | On disk | Recovery |
+|---|---|---|
+| inside `merge_parts` | `<id>.tmp` and the live inputs | the temporary directory is deleted at start-up |
+| `MergeWritten`, `BeforeReplaceCommit` | the finished merged part, unreferenced; every input live | the merged part is deleted at start-up; nothing was replaced |
+| the commit | the new manifest version exists or not | not there: as above. There: as below |
+| `ReplaceCommitted`, `ReplacePublished` | the manifest lists the merged part; the inputs' directories remain, unreferenced | the manifest decides; the directories are deleted at start-up |
+| `PartDirDeleted` | some input directories deleted | the rest are deleted at start-up |
+
+A merge does not touch the log or `wal_flushed_lsn`, so every acknowledged
+record is in live parts or in the log whichever side of the commit the crash
+fell on; the crash tests abort at each stage and check that the reopened
+database holds each acknowledged record exactly once.
+
+**Failures.** An error before the commit leaves the database as it was and
+removes the new directory (after `Fatal`, which includes a panic, the outcome is
+not known and the directory is left for the next start). It is recorded in
+`last_compaction_error` (and the pass returns it, so it is also
+`last_maintenance_error`). The window is left alone for `retry_backoff` (30 s,
+doubling with each failure in a row up to 64 times that; zero retries
+at the next pass) and for the rest of the pass, so a failure that persists
+neither spins in a pass nor holds back the other windows. Damage found in an
+input is `Corrupt` (`merge_parts` checks every input in full before it starts
+and names the input and its directory); the message also says which parts, the
+window is not tried again until the next start, the inputs stay live and
+readable as far as they are, and the engine is not put in the fatal state. A
+failure to delete an input directory after the commit is not a failed merge:
+the merge counts, and the pass records the deletion error and retries it.
+
+**Shutdown during a merge.** A merge in progress is finished, not abandoned.
+`merge_parts` has no way to be interrupted, so it has run to its end by the time
+any decision could be made, and dropping its output would throw the work away to
+save one manifest commit; after it, no further merge is started and the
+directories of the replaced parts are left for the next start. The wait is the
+rest of one `merge_parts` call, bounded by `max_input_bytes`, plus an open and a
+commit. Lower `max_input_bytes` to shorten it. A merge that is abandoned for
+another reason (the stage hook returns an error at `MergeWritten` or
+`BeforeReplaceCommit`) deletes its output and leaves nothing behind; tests do
+both.
+
+**What a merge changes for queries.** A trace that was split over parts is one
+run in one part and leaves the split map; a duplicate span (a sender's retry
+that crossed a flush) is counted once by `list_traces` and `aggregate_tokens`
+from then on (`get_trace` removed it all along). The spans of a trace are
+grouped into a part by the window of the trace's earliest span in one flush, so
+a trace whose spans reached the engine in different windows can have copies of
+one span in different windows; those are not in one merge and stay duplicates.
+
+Statistics (`EngineStats`, `/api/v1/stats`): `merges_done`,
+`parts_merged_away`, `duplicate_spans_dropped`, `merge_input_bytes` and
+`merge_output_bytes` (bytes on disk) since the engine opened;
+`windows_with_many_parts` (windows that now have more than one live part, so
+`0` means every window is settled); `merging` (a merge is being written or
+replaced); `last_compaction_error`. `Engine::run_maintenance()` runs a pass,
+merges included. `CompactionOptions::background` false (a test facility) keeps
+the thread from merging so a test decides when.
 
 ## Stored text
 
@@ -391,7 +522,14 @@ unique.
 - A flush: `FlushFrozen`, `PartWritten` (once per part), `AllPartsWritten`
   (before the commit), `Committed` (before publishing), `Published`
   (before the log is rotated), `LogRotated` (before the trim), `Trimmed`.
-- A replacement of parts: `ReplaceCommitted` (before publishing),
+- A merge: `MergeWritten` (its output is written and open; nothing is
+  replaced yet). An error returned here abandons the merge: its directory is
+  deleted and nothing else changes (`Fatal` puts the engine in the fatal
+  state and the directory is left for the next start).
+- A replacement of parts: `BeforeReplaceCommit` (arguments checked, publish
+  gate held, just before the manifest commit; an error returned here is
+  honoured, nothing changes, and `Fatal` puts the engine in the fatal state),
+  `ReplaceCommitted` (before publishing),
   `ReplacePublished` (before any directory is deleted), `PartDirDeleted`
   (after each directory).
 
@@ -476,8 +614,10 @@ root, not the earliest.
   moment of a query, and within one flush. A duplicate that landed in a part and
   again in the buffers, or in two different parts (a sender retry that crossed
   a flush), is removed by `get_trace` but still counted by `list_traces`
-  (`span_count`, token sums) and `aggregate_tokens`. The compactor will remove
-  the rest.
+  (`span_count`, token sums) and `aggregate_tokens` until the window is merged
+  (the merge keeps one copy), and, if the two copies are in the buffer and a
+  part, until that flush has happened too. Copies in parts of different
+  windows (see Compaction) are never merged together.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few
@@ -494,10 +634,16 @@ root, not the earliest.
   request larger than the limit is admitted only when nothing else is
   buffered.
 - Flush is one part per window per flush: many windows in one buffer make many
-  small parts. Compaction is a later checkpoint.
+  small parts, which compaction merges.
 - Retention removes whole parts and nothing else: the buffer and the log are
-  not touched by it. There is no compaction yet (the merge is a later step),
-  and no object store.
+  not touched by it. There is no object store.
+- A merge cannot be interrupted (`merge_parts` has no cancellation), so
+  shutdown waits for it, up to `max_input_bytes` of input. A window that gets a
+  small late part more rarely than `quiet` is rewritten whole each time.
+- The inputs of a merge are ordered by part id, which is the order of flushes,
+  not of the data they hold (a merged part has a newer id than a flush
+  published before it was merged). Only which of two identical copies is kept
+  depends on it.
 - The age limit counts from the first batch that entered an empty buffer.
 - A callback that panics is caught and ignored; a panic anywhere else on the
   applier thread would leave `shutdown` waiting.
@@ -535,7 +681,15 @@ byte as it was and that restoring what was lost lets it open;
 once. `tests/log_rotation.rs` checks the size of `wal/` after a flush and
 opens a copy of the directory taken at each stage of a flush, with records
 acknowledged after the freeze, to see that exactly the records not in parts are
-replayed. `tests/retention.rs` runs retention against a model with a clock the
+replayed. `tests/compaction.rs` tests merging end to end (a resent span counted twice
+and then once, a trace split over flushes in one part afterwards, the quiet
+rule and late data, errors before the commit, a failing window that backs off
+without holding back another, a damaged input, a flush and queries during a
+merge, shutdown during a merge, the size of span-only data before and after,
+and ingest, flush, queries, retention and merging at once); `tests/model.rs`
+also runs the random walk with compaction and retention, in which spans are sent
+again across flushes; `tests/crash_stages.rs` aborts the child at each stage of
+a merge and its replacement. `tests/retention.rs` runs retention against a model with a clock the
 test moves (across flushes and restarts), checks the boundaries, the thread,
 shutdown during a pass, and ingest, flush, queries and maintenance at once for
 a few seconds. The replace operation itself, which no public call reaches, is

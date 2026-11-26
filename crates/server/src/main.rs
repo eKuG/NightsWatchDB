@@ -52,6 +52,10 @@ async fn run(config: Config) -> ExitCode {
     options.api_allowed_hosts = config.api_allowed_hosts;
     options.engine.accept_lost_log = config.accept_lost_log;
     options.engine.retention = config.retention;
+    options.engine.compaction.enabled = !config.no_compaction;
+    if let Some(quiet) = config.compaction_quiet {
+        options.engine.compaction.quiet = quiet;
+    }
     eprintln!(
         "nightswatchdb {}: opening {}",
         env!("CARGO_PKG_VERSION"),

@@ -112,7 +112,7 @@ impl Inner {
                 let added = metas
                     .into_iter()
                     .zip(readers)
-                    .map(|(meta, reader)| Arc::new(LivePart { meta, reader }))
+                    .map(|(meta, reader)| Arc::new(LivePart::new(meta, reader)))
                     .collect();
                 let (parts, split) = change_parts(&old_parts, &old_split, &[], added);
                 let split = Arc::new(split);

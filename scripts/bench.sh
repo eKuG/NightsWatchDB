@@ -9,6 +9,15 @@
 # Everything it creates (containers, network, data volume) is removed on exit;
 # the images and the text corpus volume stay. Generated data never touches the
 # host: only the small result files are written to DIR.
+#
+# Compaction runs in the server as it does in production, with a short quiet
+# period (BENCH_COMPACTION_QUIET, default 5s) so that the wait for it is short.
+# After the load the script waits until the buffer is flushed, no merge is
+# running and no time window has more than one part, and records how long that
+# took and the CPU the server used meanwhile. BENCH_NO_COMPACTION=1 runs the
+# server without compaction (and skips the wait) to measure what it saves.
+# BENCH_CORPUS_DIR is the host directory the corpus volume is filled from
+# (default .data/corpus).
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -58,6 +67,10 @@ GEN=$NAME-gen
 QB_N=${BENCH_QUERIES:-200}
 QB_WARMUP=${BENCH_WARMUP:-20}
 QB_CONC=${BENCH_CONCURRENCY:-1}
+QUIET=${BENCH_COMPACTION_QUIET:-5s}
+NO_COMPACTION=${BENCH_NO_COMPACTION:-0}
+COMPACT_TIMEOUT=${BENCH_COMPACTION_TIMEOUT:-3600}
+CORPUS_DIR=${BENCH_CORPUS_DIR:-$ROOT/.data/corpus}
 
 fail() {
   echo "FAIL: $*" >&2
@@ -80,15 +93,15 @@ if [ "$NEEDS_CORPUS" = 1 ]; then
   # Inspect first: mounting a missing volume would create it empty.
   if ! docker volume inspect "$CORPUS_VOL" >/dev/null 2>&1 ||
     ! docker run --rm -v "$CORPUS_VOL":/corpus:ro "$TOOLS" test -f /corpus/.copied 2>/dev/null; then
-    [ -d "$ROOT/.data/corpus" ] || {
-      echo "dataset $DATASET needs the text corpus in .data/corpus, which is missing." >&2
+    [ -d "$CORPUS_DIR" ] || {
+      echo "dataset $DATASET needs the text corpus in $CORPUS_DIR, which is missing." >&2
       echo "Build it with bench/corpusprep (see bench/corpusprep/README.md)." >&2
       exit 1
     }
     echo "== copying the corpus into the volume $CORPUS_VOL (once)" >&2
     # The only time a host directory is mounted, read-only, to fill the volume.
     # The marker is written last, so an interrupted copy is redone.
-    docker run --rm -v "$CORPUS_VOL":/corpus -v "$ROOT/.data/corpus":/src:ro "$TOOLS" \
+    docker run --rm -v "$CORPUS_VOL":/corpus -v "$CORPUS_DIR":/src:ro "$TOOLS" \
       sh -c 'cp -a /src/. /corpus/ && touch /corpus/.copied'
   fi
 fi
@@ -113,8 +126,9 @@ docker volume create "$NAME" >/dev/null
 
 # --- helpers ---------------------------------------------------------------
 
-start_server() { # first start
+start_server() { # first start; the settings stay for every restart
   docker run -d --name "$SERVER" --network "$NAME" --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" \
+    -e NWDB_COMPACTION_QUIET="$QUIET" -e NWDB_NO_COMPACTION="$NO_COMPACTION" \
     -v "$NAME":/var/lib/nightswatchdb -p 127.0.0.1::4320 "$SERVER_IMG" >/dev/null
   wait_ready
 }
@@ -190,6 +204,25 @@ server_spans() {
 }
 stat_field() { curl -fsS "http://$API/api/v1/stats" | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
 
+# Waits until the buffer is flushed, no merge is running and no window has more
+# than one part (two polls in a row), then sets SETTLE_S to how long that took
+# (whole seconds). Fails after COMPACT_TIMEOUT seconds.
+wait_compaction() {
+  t0=$(date +%s); ok=0
+  while :; do
+    st=$(curl -fsS "http://$API/api/v1/stats") || fail "the server did not answer /api/v1/stats"
+    if echo "$st" | grep -q '"merging":false' && echo "$st" | grep -q '"windows_with_many_parts":0[,}]' &&
+      echo "$st" | grep -q '"buffered_bytes":0[,}]'; then
+      ok=$((ok + 1)); [ "$ok" -lt 2 ] || break
+    else
+      ok=0
+    fi
+    [ $(($(date +%s) - t0)) -le "$COMPACT_TIMEOUT" ] || fail "compaction did not settle within ${COMPACT_TIMEOUT}s: $st"
+    sleep 0.5
+  done
+  SETTLE_S=$(($(date +%s) - t0))
+}
+
 # --- the run -----------------------------------------------------------------
 
 echo "== start the server ($PROFILE: $CPUS CPUs, $MEM)" >&2
@@ -220,6 +253,23 @@ else
   CPU_S=null; CPU_USER_S=null; CPU_SYS_S=null; CG=docker-stats
 fi
 if [ -n "$RX0" ] && [ -n "$RX1" ]; then WIRE_BYTES=$((RX1 - RX0)); else WIRE_BYTES=null; fi
+
+PARTS_AT_LOAD_END=$(stat_field parts)
+if [ "$NO_COMPACTION" = 1 ]; then
+  echo "== compaction is off" >&2
+  SETTLE_S=0
+else
+  echo "== waiting for compaction to settle (quiet period $QUIET)" >&2
+  wait_compaction
+fi
+CPU2=$(cpu_field usage_usec)
+if [ -n "$CPU1" ] && [ -n "$CPU2" ]; then
+  SETTLE_CPU_S=$(awk -v a="$CPU1" -v b="$CPU2" 'BEGIN {printf "%.2f", (b - a) / 1e6}')
+else
+  SETTLE_CPU_S=null
+fi
+ENGINE_STATS=$(curl -fsS "http://$API/api/v1/stats")
+PARTS_SETTLED=$(stat_field parts)
 
 echo "== clean restart" >&2
 docker stop "$SERVER" >/dev/null
@@ -300,6 +350,12 @@ cat > "$OUT/result.json" <<EOF
     "server_cpu_s": $CPU_S, "server_cpu_user_s": $CPU_USER_S, "server_cpu_sys_s": $CPU_SYS_S,
     "server_cpu_s_per_million_spans": $CPU_PER_MSPAN, "server_peak_memory_bytes": $(nn "$PEAK_LOAD")
   },
+  "compaction": {
+    "enabled": $([ "$NO_COMPACTION" = 1 ] && echo false || echo true), "quiet": "$QUIET",
+    "settle_s": $SETTLE_S, "settle_cpu_s": $SETTLE_CPU_S,
+    "parts_at_end_of_load": $PARTS_AT_LOAD_END, "parts_settled": $PARTS_SETTLED,
+    "engine_stats_settled": $ENGINE_STATS
+  },
   "storage": {
     "parts_bytes": $PARTS_B, "wal_bytes": $WAL_B, "manifest_bytes": $MANIFEST_B, "total_bytes": $TOTAL_B,
     "parts": $PARTS, "bytes_per_span": $BYTES_PER_SPAN, "parts_bytes_per_span": $PARTS_PER_SPAN
@@ -310,6 +366,7 @@ cat > "$OUT/result.json" <<EOF
 }
 EOF
 
+json_num() { echo "$ENGINE_STATS" | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
 mb() { awk -v b="$1" 'BEGIN {if (b == "null" || b == "") print "n/a"; else printf "%.1f", b / 1048576}'; }
 {
   echo "# $DATASET on $PROFILE ($CPUS CPUs, $MEM), commit $COMMIT, $DATE"
@@ -328,11 +385,20 @@ mb() { awk -v b="$1" 'BEGIN {if (b == "null" || b == "") print "n/a"; else print
   echo "| Server CPU seconds per million spans | $CPU_PER_MSPAN |"
   echo "| Server peak memory during load (MiB) | $(mb "$(nn "$PEAK_LOAD")") |"
   echo
+  echo "| Compaction (quiet period $QUIET) | |"
+  echo "|---|---|"
+  echo "| Wait after the load until settled (s) / server CPU in it (s) | $SETTLE_S / $SETTLE_CPU_S |"
+  echo "| Parts at the end of the load / settled | $PARTS_AT_LOAD_END / $PARTS_SETTLED |"
+  echo "| Merges done / parts merged away | $(json_num merges_done) / $(json_num parts_merged_away) |"
+  echo "| Duplicate spans dropped | $(json_num duplicate_spans_dropped) |"
+  echo "| Bytes of merge inputs / outputs | $(json_num merge_input_bytes) / $(json_num merge_output_bytes) |"
+  echo "| Last compaction error | $(echo "$ENGINE_STATS" | grep -q '"last_compaction_error":null' && echo none || echo "see result.json") |"
+  echo
   echo "| Storage and restart | |"
   echo "|---|---|"
   echo "| parts/ / wal/ / manifest/ (bytes) | $PARTS_B / $WAL_B / $MANIFEST_B |"
   echo "| Total on the volume (bytes) | $TOTAL_B |"
-  echo "| Parts | $PARTS |"
+  echo "| Parts (after the restart; at the end of the load: $PARTS_AT_LOAD_END) | $PARTS |"
   echo "| Bytes per span, whole volume / parts/ only | $BYTES_PER_SPAN / $PARTS_PER_SPAN |"
   echo "| Clean restart to /healthz (ms) | $CLEAN_MS |"
   echo "| Crash restart to /healthz (ms), after $EXTRA_SPANS more spans | $CRASH_MS |"

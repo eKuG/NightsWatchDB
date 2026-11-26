@@ -1,7 +1,7 @@
 //! The engine handle: options, start-up, ingest, the applier and flusher
 //! threads, and shutdown.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, TryLockError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -21,6 +21,7 @@ use nwdb_manifest::{
 use nwdb_segment::PartReader;
 use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
 
+use crate::compaction::CompactionOptions;
 use crate::lock;
 use crate::query::{AggQuery, ListQuery, Snapshot, TokenAgg};
 use crate::split::SplitMap;
@@ -100,6 +101,8 @@ pub struct EngineOptions {
     /// The clock retention reads, Unix nanoseconds. A test facility, in the
     /// manner of [`stage_hook`](Self::stage_hook); `None` is the system clock.
     pub clock: Option<Clock>,
+    /// When and how parts are merged (see [`CompactionOptions`]).
+    pub compaction: CompactionOptions,
 }
 
 /// The type of [`EngineOptions::stage_hook`].
@@ -142,6 +145,15 @@ pub enum Stage {
     LogRotated,
     /// The log was trimmed (only in a flush that trims).
     Trimmed,
+    /// A merge wrote and opened its output part; nothing is replaced yet. An
+    /// error returned here abandons the merge: the output is deleted and
+    /// nothing else changes.
+    MergeWritten,
+    /// A replacement of parts has checked its arguments and holds the publish
+    /// gate, just before the manifest commit. An error returned here is
+    /// handled as if the commit had failed with it: nothing changes (`Fatal`
+    /// puts the engine in the fatal state).
+    BeforeReplaceCommit,
     /// A replacement of parts committed to the manifest, before the new part
     /// list is published to queries.
     ReplaceCommitted,
@@ -177,6 +189,7 @@ impl std::fmt::Debug for EngineOptions {
             .field("maintenance_interval", &self.maintenance_interval)
             .field("retention", &self.retention)
             .field("clock", &self.clock.as_ref().map(|_| "<clock>"))
+            .field("compaction", &self.compaction)
             .finish()
     }
 }
@@ -203,6 +216,7 @@ impl EngineOptions {
             maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
             retention: None,
             clock: None,
+            compaction: CompactionOptions::default(),
         }
     }
 }
@@ -250,12 +264,43 @@ pub struct EngineStats {
     /// later pass that succeeds does not clear it (like `last_error`); the
     /// pass count shows that passes go on.
     pub last_maintenance_error: Option<String>,
+    /// Merges that replaced parts since the engine was opened.
+    pub merges_done: u64,
+    /// Parts removed by those merges (the parts they took in).
+    pub parts_merged_away: u64,
+    /// Spans dropped by merges because the same `(trace id, span id)` was in
+    /// an earlier input.
+    pub duplicate_spans_dropped: u64,
+    /// Bytes on disk of the inputs of those merges.
+    pub merge_input_bytes: u64,
+    /// Bytes on disk of their outputs.
+    pub merge_output_bytes: u64,
+    /// Windows that now have more than one live part.
+    pub windows_with_many_parts: usize,
+    /// True while a merge is being written or replaced.
+    pub merging: bool,
+    /// The most recent compaction failure, if any, naming the window (and the
+    /// part, for damage). A later success does not clear it.
+    pub last_compaction_error: Option<String>,
 }
 
 /// A live part: its metadata and an open reader.
 pub(crate) struct LivePart {
     pub meta: nwdb_core::PartMeta,
     pub reader: PartReader,
+    /// When the part became live in this process (start-up for the parts the
+    /// manifest listed): compaction waits for a window to be quiet by it.
+    pub live_since: Instant,
+}
+
+impl LivePart {
+    pub(crate) fn new(meta: nwdb_core::PartMeta, reader: PartReader) -> Self {
+        Self {
+            meta,
+            reader,
+            live_since: Instant::now(),
+        }
+    }
 }
 
 /// What queries can see, replaced whole under the core lock.
@@ -300,6 +345,7 @@ pub(crate) struct Core {
     pub maintenance_passes: u64,
     pub retention_removed: u64,
     pub last_maintenance_error: Option<String>,
+    pub compaction: crate::maintenance::CompactionState,
 }
 
 struct Pending {
@@ -476,6 +522,7 @@ impl Engine {
                 "retention must be positive (None keeps everything)",
             ));
         }
+        options.compaction.validate()?;
         let mut decoder_map = HashMap::new();
         for (tag, d) in decoders {
             if decoder_map.insert(tag, d).is_some() {
@@ -551,10 +598,7 @@ impl Engine {
             // files.
             nwdb_segment::check_format_version(meta.format_version)?;
             let reader = PartReader::open(parts_dir.join(nwdb_core::part_dir_name(meta.part_id)))?;
-            parts.push(Arc::new(LivePart {
-                meta: meta.clone(),
-                reader,
-            }));
+            parts.push(Arc::new(LivePart::new(meta.clone(), reader)));
         }
 
         // 3. The log, which must reach back to the manifest's position and
@@ -667,6 +711,7 @@ impl Engine {
                 maintenance_passes: 0,
                 retention_removed: 0,
                 last_maintenance_error: None,
+                compaction: Default::default(),
             }),
             flusher_cv: Condvar::new(),
             maintenance_cv: Condvar::new(),
@@ -897,6 +942,24 @@ impl Engine {
             maintenance_passes: c.maintenance_passes,
             retention_parts_removed: c.retention_removed,
             last_maintenance_error: c.last_maintenance_error.clone(),
+            merges_done: c.compaction.merges_done,
+            parts_merged_away: c.compaction.parts_merged_away,
+            duplicate_spans_dropped: c.compaction.duplicates_dropped,
+            merge_input_bytes: c.compaction.input_bytes,
+            merge_output_bytes: c.compaction.output_bytes,
+            windows_with_many_parts: {
+                let mut seen = HashSet::new();
+                let mut many = HashSet::new();
+                for p in c.vis.parts.iter() {
+                    let key = (p.meta.window_start_ns, p.meta.window_ns);
+                    if !seen.insert(key) {
+                        many.insert(key);
+                    }
+                }
+                many.len()
+            },
+            merging: c.compaction.merging,
+            last_compaction_error: c.compaction.last_error.clone(),
         }
     }
 
@@ -908,7 +971,7 @@ impl Engine {
     /// [`Error::Unavailable`] once the engine is shut down, [`Error::Fatal`]
     /// in the fatal state.
     pub fn run_maintenance(&self) -> Result<()> {
-        self.inner().run_pass()
+        self.inner().run_pass(true)
     }
 
     /// Stops accepting requests, waits for every accepted request to be

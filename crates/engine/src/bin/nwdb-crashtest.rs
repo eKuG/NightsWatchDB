@@ -30,6 +30,14 @@
 //!   clock fixed at `t` (Unix nanoseconds), so the maintenance pass that runs
 //!   at start-up removes the parts that are expired at `t` by a replacement
 //!   whose stages the abort variable can name.
+//! - `NWDB_COMPACT=<n>` turns compaction on with `min_parts` n and no quiet
+//!   period, so the maintenance thread merges the parts of a window as soon
+//!   as it has n of them (the first pass runs at start-up), and the stages of
+//!   a merge can be named by the abort variable.
+//! - `NWDB_COMPACT=<n>` turns compaction on with `min_parts` n and no quiet
+//!   period, so the maintenance thread merges the parts of a window as soon
+//!   as it has n of them (the first pass runs at start-up), and the stages of
+//!   a merge can be named by the abort variable.
 
 #[path = "../../tests/common/mod.rs"]
 mod common;
@@ -94,6 +102,20 @@ fn main() {
             .parse()
             .expect("NWDB_CLOCK_NS");
         o.clock = Some(Arc::new(move || now));
+    }
+    if let Ok(n) = std::env::var("NWDB_COMPACT") {
+        o.compaction.enabled = true;
+        o.compaction.min_parts = n.parse().expect("NWDB_COMPACT");
+        o.compaction.max_parts = o.compaction.max_parts.max(o.compaction.min_parts);
+        o.compaction.quiet = Duration::ZERO;
+        o.compaction.retry_backoff = Duration::ZERO;
+    }
+    if let Ok(n) = std::env::var("NWDB_COMPACT") {
+        o.compaction.enabled = true;
+        o.compaction.min_parts = n.parse().expect("NWDB_COMPACT");
+        o.compaction.max_parts = o.compaction.max_parts.max(o.compaction.min_parts);
+        o.compaction.quiet = Duration::ZERO;
+        o.compaction.retry_backoff = Duration::ZERO;
     }
     let seen = AtomicU64::new(0);
     o.stage_hook = Some(Arc::new(move |stage: Stage| {

@@ -15,7 +15,9 @@ use nwdb_core::{
     BatchLimits, Error, PayloadSplitter, RawColumn, RecordDecoder, Result, SpanBatchBuilder,
     SpanColumns, SpanId, SpanRecord, TraceId, TraceSummary,
 };
-use nwdb_engine::{AggQuery, Engine, EngineOptions, ListQuery, Snapshot, TokenAgg};
+use nwdb_engine::{
+    AggQuery, CompactionOptions, Engine, EngineOptions, ListQuery, Snapshot, TokenAgg,
+};
 use nwdb_wal::{SyncMode, WalOptions};
 
 /// The log tag of the test encoding.
@@ -331,7 +333,39 @@ pub fn opts(dir: &Path) -> EngineOptions {
     o.max_buffered_bytes = 2 << 30;
     o.flush_interval = Duration::from_secs(3600);
     o.splitter = Some(Arc::new(ChunkSplitter));
+    // Merging is off unless a test turns it on, so parts stay as they were
+    // flushed.
+    o.compaction.enabled = false;
     o
+}
+
+/// [`opts`] with compaction on, as a test wants it: a window is quiet at
+/// once, a failed merge is tried again at the next pass, and merges happen
+/// only when the test calls `run_maintenance`.
+pub fn compact_opts(dir: &Path) -> EngineOptions {
+    let mut o = opts(dir);
+    o.compaction = CompactionOptions {
+        enabled: true,
+        quiet: Duration::ZERO,
+        retry_backoff: Duration::ZERO,
+        background: false,
+        ..CompactionOptions::default()
+    };
+    o
+}
+
+/// Runs maintenance passes until no window has more than one part, and
+/// returns how many passes it took.
+pub fn compact_fully(e: &Engine) -> usize {
+    for pass in 1..=300 {
+        e.run_maintenance().unwrap();
+        if e.stats().windows_with_many_parts == 0 {
+            return pass;
+        }
+        // A short quiet period needs a moment to pass.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("still more than one part in a window after 300 passes");
 }
 
 pub fn open(o: EngineOptions) -> Engine {
@@ -490,6 +524,16 @@ impl Model {
 
     /// Checks every query against the answers of one snapshot.
     pub fn check_snapshot(&self, snap: &Snapshot, what: &str) {
+        self.check_snapshot_ignoring(snap, what, &BTreeSet::new());
+    }
+
+    /// Like [`check_snapshot`](Self::check_snapshot), for a state in which
+    /// the traces in `unmerged` have spans that were sent again across a
+    /// flush and are not merged yet: `get_trace` must still be exact (it
+    /// removes duplicates), the listing must be exact for every other trace
+    /// and count at least the model's spans for these, and the token sums
+    /// are not compared.
+    pub fn check_snapshot_ignoring(&self, snap: &Snapshot, what: &str, unmerged: &BTreeSet<u128>) {
         for t in self.trace_ids() {
             let got = snap.get_trace(TraceId(t.to_be_bytes())).unwrap();
             assert_eq!(
@@ -510,8 +554,22 @@ impl Model {
             error: None,
             limit: usize::MAX,
         };
-        let listed = snap.list_traces(&all).unwrap();
-        let want = self.list(&all);
+        let mut listed = snap.list_traces(&all).unwrap();
+        let mut want = self.list(&all);
+        let is_unmerged = |t: &TraceSummary| unmerged.contains(&u128::from_be_bytes(t.trace_id.0));
+        for w in want.iter().filter(|w| is_unmerged(w)) {
+            let g = listed
+                .iter()
+                .find(|g| g.trace_id == w.trace_id)
+                .unwrap_or_else(|| panic!("{what}: unmerged trace {} is not listed", w.trace_id));
+            assert!(
+                g.span_count >= w.span_count,
+                "{what}: unmerged trace {} lost spans",
+                w.trace_id
+            );
+        }
+        listed.retain(|t| !is_unmerged(t));
+        want.retain(|t| !is_unmerged(t));
         assert_eq!(listed.len(), want.len(), "{what}: list all, trace count");
         for (got, want) in listed.iter().zip(&want) {
             assert_eq!(got.trace_id, want.trace_id, "{what}: list all, order");
@@ -559,6 +617,9 @@ impl Model {
                 got.trace_id
             );
         }
+        if !unmerged.is_empty() {
+            return;
+        }
         assert_eq!(
             snap.aggregate_tokens(&AggQuery {
                 from_ns: i64::MIN,
@@ -574,6 +635,36 @@ impl Model {
             "{what}: aggregate all"
         );
     }
+}
+
+/// Part directories on disk (final or temporary), by name.
+pub fn part_dir_names(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("parts"))
+        .into_iter()
+        .flatten()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Bytes the files under `dir/parts` take.
+pub fn parts_bytes(dir: &Path) -> u64 {
+    fn walk(p: &Path) -> u64 {
+        std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .map(|e| {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    walk(&e.path())
+                } else {
+                    e.metadata().unwrap().len()
+                }
+            })
+            .sum()
+    }
+    walk(&dir.join("parts"))
 }
 
 /// Lists the files in a directory whose name starts with `prefix`.

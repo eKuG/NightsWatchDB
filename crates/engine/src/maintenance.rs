@@ -1,12 +1,12 @@
-//! Taking parts away: the replace operation, the maintenance thread and
-//! retention.
+//! Taking parts away: the replace operation, the maintenance thread,
+//! retention and compaction.
 //!
 //! Parts are immutable and only ever added by a flush. Everything that removes
-//! them (retention now, merging later) goes through [`Inner::replace_parts`],
-//! which removes some live parts and adds zero or more new ones in one step.
-//! The README walks through what a crash at each point leaves.
+//! them (retention and merging) goes through [`Inner::replace_parts`], which
+//! removes some live parts and adds zero or more new ones in one step. The
+//! README walks through what a crash at each point leaves.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,11 +14,47 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nwdb_core::{Error, Result, part_dir_name};
 use nwdb_manifest::Edit;
+use nwdb_segment::{MergeOptions, PartReader, WriterOptions, merge_parts};
 
-use crate::engine::{Inner, LivePart, Stage, sync_dir};
+use crate::compaction::{MergePlan, PartInfo, WindowKey, choose_merge};
+use crate::engine::{Inner, LivePart, Stage, run_hook, sync_dir};
 use crate::flush::panic_message;
 use crate::lock;
 use crate::split::change_parts;
+
+/// What compaction has done and what it is leaving alone, under the core lock.
+#[derive(Default)]
+pub(crate) struct CompactionState {
+    pub merges_done: u64,
+    pub parts_merged_away: u64,
+    pub duplicates_dropped: u64,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub merging: bool,
+    pub last_error: Option<String>,
+    /// Windows whose merge failed: how many times in a row, and when to try
+    /// again. Other windows are not held back by them.
+    failing: HashMap<WindowKey, (u32, Instant)>,
+    /// Windows with a damaged input: left alone until a restart.
+    damaged: HashSet<WindowKey>,
+}
+
+/// Sets the "a merge is running" flag for as long as it lives, also when the
+/// merge panics.
+struct Merging<'a>(&'a Inner);
+
+impl<'a> Merging<'a> {
+    fn new(inner: &'a Inner) -> Self {
+        lock(&inner.core).compaction.merging = true;
+        Merging(inner)
+    }
+}
+
+impl Drop for Merging<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.core).compaction.merging = false;
+    }
+}
 
 /// What a replacement did after its commit.
 #[derive(Debug, Default)]
@@ -93,6 +129,14 @@ impl Inner {
             }
             if remove.is_empty() && add.is_empty() {
                 return Ok(Replaced::default());
+            }
+            // The last point where nothing has changed yet.
+            if let Err(e) = run_hook(&self.opts.stage_hook, Stage::BeforeReplaceCommit) {
+                if matches!(e, Error::Fatal(_)) {
+                    let mut c = lock(&self.core);
+                    self.set_fatal_locked(&mut c, e.to_string());
+                }
+                return Err(e);
             }
 
             // 1. The commit.
@@ -188,13 +232,13 @@ impl Inner {
             }
             // The outcome is in the statistics; there is nobody to return it
             // to, and the next pass tries again.
-            let _ = self.run_pass();
+            let _ = self.run_pass(self.opts.compaction.background);
         }
     }
 
     /// One maintenance pass, one at a time. The outcome is also recorded in
     /// the statistics.
-    pub(crate) fn run_pass(&self) -> Result<()> {
+    pub(crate) fn run_pass(&self, merge: bool) -> Result<()> {
         let _pass = lock(&self.maintenance_gate);
         {
             let c = lock(&self.core);
@@ -206,7 +250,7 @@ impl Inner {
             }
         }
         let outcome =
-            catch_unwind(AssertUnwindSafe(|| self.pass_steps())).unwrap_or_else(|panic| {
+            catch_unwind(AssertUnwindSafe(|| self.pass_steps(merge))).unwrap_or_else(|panic| {
                 // Whether the panic fell between a commit and its publish
                 // cannot be told, and a manifest ahead of the visible parts
                 // must not be built on: a restart recovers.
@@ -234,7 +278,7 @@ impl Inner {
 
     /// The steps of a pass. A step that fails does not keep the later ones
     /// from running; the first error is the pass's.
-    fn pass_steps(&self) -> Result<()> {
+    fn pass_steps(&self, merge: bool) -> Result<()> {
         let mut result = self.retry_deletions();
         let mut then = |r: Result<()>| {
             if result.is_ok() {
@@ -244,7 +288,7 @@ impl Inner {
         if !self.maintenance_stopping() {
             then(self.apply_retention());
         }
-        if !self.maintenance_stopping() {
+        if merge && !self.maintenance_stopping() {
             then(self.choose_and_merge_parts());
         }
         result
@@ -283,14 +327,191 @@ impl Inner {
         replaced.into_result()
     }
 
-    /// The place where merging will go: choose parts that are worth merging
-    /// (for example several small parts of one window), write the merged part
-    /// with the merge function of `nwdb-segment`, reserve its id with
-    /// `self.manifest.reserve_part_ids`, open it, and publish it with
-    /// [`replace_parts`](Self::replace_parts), removing the parts it replaces.
-    /// Nothing is merged yet.
+    /// Merges parts while the policy finds something to merge, one merge at a
+    /// time, and stops between merges when shutdown asks. A merge that is
+    /// running when shutdown asks is finished: `merge_parts` cannot be
+    /// interrupted, and what it wrote costs only a commit to keep (the README
+    /// has the bound this puts on shutdown).
+    ///
+    /// A merge that fails is recorded and its window is left alone for a
+    /// while (until a restart if the cause is damage in an input); the other
+    /// windows go on. The first error is the step's result.
     fn choose_and_merge_parts(&self) -> Result<()> {
-        Ok(())
+        if !self.opts.compaction.enabled {
+            return Ok(());
+        }
+        let mut first_error = None;
+        // A window that failed is left alone for the rest of the pass, so a
+        // failure that persists ends the pass instead of repeating in it,
+        // whatever the backoff.
+        let mut failed_now = HashSet::new();
+        while !self.maintenance_stopping() {
+            let parts = lock(&self.core).vis.parts.clone();
+            let Some(plan) = self.next_merge(&parts, &failed_now) else {
+                break;
+            };
+            match self.merge_one(&parts, &plan) {
+                Ok(replaced) => {
+                    if let Err(e) = replaced.into_result() {
+                        first_error.get_or_insert(e);
+                    }
+                }
+                Err(e) => {
+                    failed_now.insert((plan.window_start_ns, plan.window_ns));
+                    self.note_merge_failure(&plan, &e);
+                    if matches!(e, Error::Fatal(_)) {
+                        return Err(e);
+                    }
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// The policy's choice for the parts that are live now, leaving out the
+    /// windows that are backing off or damaged.
+    fn next_merge(
+        &self,
+        parts: &[Arc<LivePart>],
+        failed_now: &HashSet<WindowKey>,
+    ) -> Option<MergePlan> {
+        let infos: Vec<PartInfo> = parts
+            .iter()
+            .map(|p| PartInfo {
+                id: p.meta.part_id,
+                window_start_ns: p.meta.window_start_ns,
+                window_ns: p.meta.window_ns,
+                size_bytes: p.meta.size_bytes(),
+                level: p.meta.level,
+                live_for: p.live_since.elapsed(),
+            })
+            .collect();
+        let now = Instant::now();
+        let (damaged, waiting) = {
+            let mut c = lock(&self.core);
+            let live: HashSet<WindowKey> = infos
+                .iter()
+                .map(|p| (p.window_start_ns, p.window_ns))
+                .collect();
+            // A window that is gone (expired) has nothing to remember.
+            c.compaction.failing.retain(|k, _| live.contains(k));
+            let waiting: HashSet<WindowKey> = c
+                .compaction
+                .failing
+                .iter()
+                .filter(|(_, (_, retry_at))| *retry_at > now)
+                .map(|(k, _)| *k)
+                .collect();
+            (c.compaction.damaged.clone(), waiting)
+        };
+        choose_merge(&self.opts.compaction, &infos, &|start, width| {
+            let key = (start, width);
+            damaged.contains(&key) || waiting.contains(&key) || failed_now.contains(&key)
+        })
+    }
+
+    /// Merges the parts of `plan` into one and replaces them by it. On any
+    /// error before the commit the database is as it was and the new
+    /// directory is gone (except after `Fatal`, where whether the commit
+    /// happened is not known and a restart decides).
+    fn merge_one(&self, live: &[Arc<LivePart>], plan: &MergePlan) -> Result<Replaced> {
+        // Oldest first: ids grow with time.
+        let mut inputs: Vec<&Arc<LivePart>> = live
+            .iter()
+            .filter(|p| plan.parts.contains(&p.meta.part_id))
+            .collect();
+        inputs.sort_by_key(|p| p.meta.part_id);
+        if inputs.len() != plan.parts.len() {
+            return Err(Error::other("a part chosen for a merge is not live"));
+        }
+        let _busy = Merging::new(self);
+        let id = self.manifest.reserve_part_ids(1)?.start;
+        let dir = self.parts_dir.join(part_dir_name(id));
+        let level = inputs
+            .iter()
+            .map(|p| p.meta.level)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let readers: Vec<&PartReader> = inputs.iter().map(|p| &p.reader).collect();
+        // The same writer settings a flush uses.
+        let options = MergeOptions {
+            writer: WriterOptions {
+                splitter: self.opts.splitter.clone(),
+                dedup_window_bytes: self.opts.dedup_window_bytes,
+                ..WriterOptions::default()
+            },
+            level,
+            ..MergeOptions::default()
+        };
+        let (meta, stats) = merge_parts(
+            &readers,
+            &self.parts_dir,
+            id,
+            plan.window_start_ns,
+            plan.window_ns,
+            options,
+        )?;
+
+        // From here the output exists on disk. Until the commit an error
+        // removes it.
+        let abandon = |e: Error| {
+            if !matches!(e, Error::Fatal(_)) {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            e
+        };
+        let reader = PartReader::open(&dir).map_err(abandon)?;
+        let output_bytes = meta.size_bytes();
+        let part = LivePart::new(meta, reader);
+        run_hook(&self.opts.stage_hook, Stage::MergeWritten).map_err(abandon)?;
+        let remove: Vec<u64> = inputs.iter().map(|p| p.meta.part_id).collect();
+        let replaced = self.replace_parts(&remove, vec![part]).map_err(abandon)?;
+
+        let input_bytes: u64 = inputs.iter().map(|p| p.meta.size_bytes()).sum();
+        let mut c = lock(&self.core);
+        c.compaction.merges_done += 1;
+        c.compaction.parts_merged_away += remove.len() as u64;
+        c.compaction.duplicates_dropped += stats.duplicates_dropped;
+        c.compaction.input_bytes += input_bytes;
+        c.compaction.output_bytes += output_bytes;
+        c.compaction
+            .failing
+            .remove(&(plan.window_start_ns, plan.window_ns));
+        Ok(replaced)
+    }
+
+    /// Records a failed merge in the statistics and decides when its window
+    /// is tried again: not before a restart for damage, otherwise after a
+    /// backoff that doubles with every failure in a row. A `Fatal` error also
+    /// puts the engine in the fatal state.
+    fn note_merge_failure(&self, plan: &MergePlan, e: &Error) {
+        let key = (plan.window_start_ns, plan.window_ns);
+        let mut c = lock(&self.core);
+        let damaged = matches!(e, Error::Corrupt(_));
+        c.compaction.last_error = Some(format!(
+            "merging parts {:?} of the window starting at {}: {e}{}",
+            plan.parts,
+            plan.window_start_ns,
+            if damaged {
+                " (damaged data: this window is left alone until the next start)"
+            } else {
+                ""
+            }
+        ));
+        if matches!(e, Error::Fatal(_)) {
+            self.set_fatal_locked(&mut c, e.to_string());
+        } else if damaged {
+            c.compaction.damaged.insert(key);
+        } else {
+            let n = c.compaction.failing.get(&key).map_or(0, |(n, _)| *n) + 1;
+            let factor = 1u32 << (n - 1).min(6);
+            let delay = self.opts.compaction.retry_backoff * factor;
+            c.compaction
+                .failing
+                .insert(key, (n, Instant::now() + delay));
+        }
     }
 
     fn now_ns(&self) -> i64 {

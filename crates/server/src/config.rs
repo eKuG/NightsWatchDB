@@ -32,6 +32,11 @@ pub struct Config {
     pub accept_lost_log: bool,
     /// How long data is kept; `None` keeps everything (see the README).
     pub retention: Option<Duration>,
+    /// Do not merge parts (see the README).
+    pub no_compaction: bool,
+    /// How long a window must go without a new part before its parts are
+    /// merged into one; `None` is the engine's default (see the README).
+    pub compaction_quiet: Option<Duration>,
 }
 
 /// The text printed by `--help`.
@@ -53,6 +58,12 @@ Options (each also reads an environment variable; a flag wins):
   --retention DURATION     NWDB_RETENTION        [keep everything]
                            a positive whole number and a unit s, m, h or d,
                            for example 7d; older data is removed
+  --no-compaction          NWDB_NO_COMPACTION    [off]
+                           do not merge the parts of a time window
+  --compaction-quiet DURATION NWDB_COMPACTION_QUIET [60s]
+                           same syntax as --retention; a time window that has
+                           received no new part for this long is merged into
+                           one part
   --help                   print this text
   --version                print the version
 
@@ -72,7 +83,9 @@ pub fn parse(
     let mut api = None;
     let mut hosts = None;
     let mut retention = None;
+    let mut quiet = None;
     let mut accept_lost_log = false;
+    let mut no_compaction = false;
     let mut args = args.into_iter().map(|a| {
         a.into_string()
             .map_err(|a| format!("argument {a:?} is not valid UTF-8"))
@@ -90,6 +103,13 @@ pub fn parse(
             accept_lost_log = true;
             continue;
         }
+        if name == "--no-compaction" {
+            if inline.is_some() {
+                return Err("`--no-compaction` takes no value".into());
+            }
+            no_compaction = true;
+            continue;
+        }
         let slot = match name.as_str() {
             "--help" | "-h" => return Ok(Command::Help),
             "--version" | "-V" => return Ok(Command::Version),
@@ -98,6 +118,7 @@ pub fn parse(
             "--api-addr" => &mut api,
             "--api-allowed-hosts" => &mut hosts,
             "--retention" => &mut retention,
+            "--compaction-quiet" => &mut quiet,
             _ => return Err(format!("unknown argument `{name}`")),
         };
         let value = match inline {
@@ -127,12 +148,27 @@ pub fn parse(
     };
     // A flag is parsed as given, so `--retention ""` is an error; an empty
     // variable counts as unset, like the others.
-    let retention = match retention {
-        Some(v) => Some(parse_retention(&v)?),
-        None => match pick(None, "NWDB_RETENTION", "")?.as_str() {
-            "" => None,
-            v => Some(parse_retention(v)?),
-        },
+    let duration =
+        |flag: Option<String>, var: &str, what: &str| -> Result<Option<Duration>, String> {
+            match flag {
+                Some(v) => Ok(Some(parse_duration(&v, what)?)),
+                None => match pick(None, var, "")?.as_str() {
+                    "" => Ok(None),
+                    v => Ok(Some(parse_duration(v, what)?)),
+                },
+            }
+        };
+    let retention = duration(retention, "NWDB_RETENTION", "retention")?;
+    let compaction_quiet = duration(quiet, "NWDB_COMPACTION_QUIET", "compaction quiet period")?;
+    let switch = |flag: bool, var: &str| -> Result<bool, String> {
+        if flag {
+            return Ok(true);
+        }
+        match pick(None, var, "false")?.as_str() {
+            "1" | "true" => Ok(true),
+            "0" | "false" => Ok(false),
+            other => Err(format!("{var} `{other}` is not one of 1, true, 0, false")),
+        }
     };
     Ok(Command::Run(Config {
         data_dir: pick(data_dir, "NWDB_DATA_DIR", "./data")?.into(),
@@ -141,17 +177,10 @@ pub fn parse(
             "OTLP gRPC address",
         )?,
         api_addr: addr(pick(api, "NWDB_API_ADDR", "127.0.0.1:4320")?, "API address")?,
-        accept_lost_log: accept_lost_log
-            || match pick(None, "NWDB_ACCEPT_LOST_LOG", "false")?.as_str() {
-                "1" | "true" => true,
-                "0" | "false" => false,
-                other => {
-                    return Err(format!(
-                        "NWDB_ACCEPT_LOST_LOG `{other}` is not one of 1, true, 0, false"
-                    ));
-                }
-            },
+        accept_lost_log: switch(accept_lost_log, "NWDB_ACCEPT_LOST_LOG")?,
         retention,
+        no_compaction: switch(no_compaction, "NWDB_NO_COMPACTION")?,
+        compaction_quiet,
         api_allowed_hosts: pick(hosts, "NWDB_API_ALLOWED_HOSTS", "")?
             .split(',')
             .map(str::trim)
@@ -163,10 +192,10 @@ pub fn parse(
 
 /// A positive whole number followed by `s`, `m`, `h` or `d`, such as `7d`.
 /// Nothing else is accepted: no sign, no space, no fraction, no zero.
-fn parse_retention(text: &str) -> Result<Duration, String> {
+fn parse_duration(text: &str, what: &str) -> Result<Duration, String> {
     let bad = || {
         format!(
-            "retention `{text}` is not a positive whole number followed by s, m, h or d \
+            "{what} `{text}` is not a positive whole number followed by s, m, h or d \
              (for example 7d)"
         )
     };
@@ -187,7 +216,7 @@ fn parse_retention(text: &str) -> Result<Duration, String> {
     }
     n.checked_mul(unit)
         .map(Duration::from_secs)
-        .ok_or_else(|| format!("retention `{text}` is too large"))
+        .ok_or_else(|| format!("{what} `{text}` is too large"))
 }
 
 #[cfg(test)]
@@ -312,6 +341,53 @@ mod tests {
                 assert!(get(&[], &[("NWDB_RETENTION", bad)]).is_err(), "env `{bad}`");
             }
         }
+    }
+
+    #[test]
+    fn compaction_flags() {
+        let get = |args: &[&str], env: &[(&str, &str)]| match run(args, env) {
+            Ok(Command::Run(c)) => Ok((c.no_compaction, c.compaction_quiet)),
+            Ok(_) => panic!(),
+            Err(e) => Err(e),
+        };
+        let secs = |n| Some(Duration::from_secs(n));
+        assert_eq!(get(&[], &[]), Ok((false, None)));
+        assert_eq!(get(&["--no-compaction"], &[]), Ok((true, None)));
+        assert!(get(&["--no-compaction=1"], &[]).is_err());
+        assert_eq!(get(&[], &[("NWDB_NO_COMPACTION", "1")]), Ok((true, None)));
+        assert_eq!(get(&[], &[("NWDB_NO_COMPACTION", "0")]), Ok((false, None)));
+        assert!(get(&[], &[("NWDB_NO_COMPACTION", "yes")]).is_err());
+        assert_eq!(
+            get(&["--no-compaction"], &[("NWDB_NO_COMPACTION", "0")]),
+            Ok((true, None))
+        );
+        assert_eq!(
+            get(&["--compaction-quiet", "2s"], &[]),
+            Ok((false, secs(2)))
+        );
+        assert_eq!(get(&["--compaction-quiet=5m"], &[]), Ok((false, secs(300))));
+        assert_eq!(
+            get(&[], &[("NWDB_COMPACTION_QUIET", "1h")]),
+            Ok((false, secs(3600)))
+        );
+        assert_eq!(
+            get(
+                &["--compaction-quiet=2s"],
+                &[("NWDB_COMPACTION_QUIET", "x")]
+            ),
+            Ok((false, secs(2)))
+        );
+        assert_eq!(
+            get(&[], &[("NWDB_COMPACTION_QUIET", "")]),
+            Ok((false, None))
+        );
+        for bad in ["", "0", "0s", "5", "s", "1.5s", "-1s", "5w"] {
+            assert!(
+                get(&["--compaction-quiet", bad], &[]).is_err(),
+                "flag `{bad}`"
+            );
+        }
+        assert!(get(&[], &[("NWDB_COMPACTION_QUIET", "0s")]).is_err());
     }
 
     #[test]

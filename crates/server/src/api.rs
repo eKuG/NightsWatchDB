@@ -416,6 +416,14 @@ async fn stats(State(api): State<Api>) -> Response {
             "maintenance_passes": s.maintenance_passes,
             "retention_parts_removed": s.retention_parts_removed,
             "last_maintenance_error": s.last_maintenance_error,
+            "merges_done": s.merges_done,
+            "parts_merged_away": s.parts_merged_away,
+            "duplicate_spans_dropped": s.duplicate_spans_dropped,
+            "merge_input_bytes": s.merge_input_bytes,
+            "merge_output_bytes": s.merge_output_bytes,
+            "windows_with_many_parts": s.windows_with_many_parts,
+            "merging": s.merging,
+            "last_compaction_error": s.last_compaction_error,
         }),
     )
 }

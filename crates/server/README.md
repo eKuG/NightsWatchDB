@@ -74,6 +74,8 @@ Both `--flag value` and `--flag=value` work.
 | `--api-allowed-hosts` | `NWDB_API_ALLOWED_HOSTS` | none; comma-separated host names |
 | `--accept-lost-log` | `NWDB_ACCEPT_LOST_LOG` | off; a switch (the variable is `1`, `true`, `0` or `false`) |
 | `--retention` | `NWDB_RETENTION` | unset: keep everything; otherwise a positive whole number and a unit `s`, `m`, `h` or `d`, such as `7d` |
+| `--no-compaction` | `NWDB_NO_COMPACTION` | off; a switch like `--accept-lost-log`: do not merge parts |
+| `--compaction-quiet` | `NWDB_COMPACTION_QUIET` | `60s`; the same syntax as `--retention` |
 | `--help` | | print the options |
 | `--version` | | print the version |
 
@@ -100,6 +102,25 @@ whose spans arrived in different windows can lose its older part and keep the
 newer one. Data still in the memory buffer is removed after it has been
 written, not before. Removed data is deleted from disk; the log is rotated
 after each flush, so `wal/` does not keep records that are already stored.
+
+### Compaction
+
+Every flush writes one small part per 15-minute time window, so a window that
+keeps receiving data is many small parts and queries must open them all. A
+background thread merges them: parts of similar size are merged once there are
+four of them (so data that keeps arriving is rewritten a logarithmic number of
+times, not once per flush), and a window that has received no new part for the
+quiet period (60 seconds by default, counted from when the part became live in
+this process, not from the event time of the data) is merged into one part.
+The merge drops a span that was delivered twice, so a retry that crossed a
+flush stops being counted twice, and it reuses the stored text of the inputs
+instead of rebuilding it, so the merged part is a good deal smaller than its
+inputs. Queries and ingest go on during a merge; a merge never crosses a window
+and takes at most 4 GiB of inputs. Retention runs first in each pass.
+`--no-compaction` turns it off; `--compaction-quiet 5m` waits longer before
+merging a window into one part. Shutdown waits for a merge that is running to
+finish (the engine README gives the bound); `/api/v1/stats` reports what
+compaction has done.
 
 ### A lost log
 
@@ -294,7 +315,11 @@ curl http://127.0.0.1:4320/healthz
 `bytes_ingested`, `acked_lsn`, `flushed_lsn`, `buffered_bytes`, `parts`,
 `flushes`, `flushing`, `fatal`, `last_error`, `payload_logical_bytes`,
 `payload_unique_bytes`, `payload_stored_bytes`, `maintenance_passes`,
-`retention_parts_removed` and `last_maintenance_error`. The three `payload_*`
+`retention_parts_removed`, `last_maintenance_error` and the compaction
+counters `merges_done`, `parts_merged_away`, `duplicate_spans_dropped`,
+`merge_input_bytes`, `merge_output_bytes`, `windows_with_many_parts` (windows
+that now have more than one part), `merging` (a merge is running) and
+`last_compaction_error`. The three `payload_*`
 fields are for the flushed parts: the large text (prompts, completions, tool definitions and
 results, and other long values) their spans hold, counting every use; the same
 text with each distinct piece counted once per part; and what that takes on

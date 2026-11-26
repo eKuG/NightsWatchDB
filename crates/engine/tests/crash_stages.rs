@@ -261,3 +261,105 @@ fn every_replace_stage_leaves_a_recoverable_directory() {
         assert!(unreferenced.is_empty(), "{stage}: {unreferenced:?}");
     }
 }
+
+/// A crash at each stage of a merge and its replacement, in the child's
+/// maintenance thread (compaction is on with `min_parts` 2 and no quiet
+/// period, so the pass at start-up merges the parts of the base directory
+/// that share a window). Before the commit the manifest still lists every
+/// base part and the merged directory is an unreferenced leftover; after it the
+/// merged part replaces them; either way the reopened database holds every
+/// acknowledged record once and no directory is left over.
+#[test]
+fn every_merge_stage_leaves_a_recoverable_directory() {
+    let base = tempfile::tempdir().unwrap();
+    let acked_before: BTreeSet<u64> = crash_at(base.path(), 0, "Trimmed", 8).into_iter().collect();
+    let (base_state, _) = disk_state(base.path());
+    let base_ids: BTreeSet<u64> = base_state.parts.iter().map(|p| p.part_id).collect();
+    let mut per_window = std::collections::BTreeMap::<i64, Vec<u64>>::new();
+    for p in &base_state.parts {
+        per_window
+            .entry(p.window_start_ns)
+            .or_default()
+            .push(p.part_id);
+    }
+    let mergeable: usize = per_window
+        .values()
+        .filter(|v| v.len() >= 2)
+        .map(Vec::len)
+        .sum();
+    assert!(
+        per_window.values().any(|v| v.len() >= 2),
+        "the base has no window with two parts: {per_window:?}"
+    );
+    let env = |stage: &str| {
+        let mut env = abort_env(stage, 1);
+        env.push(("NWDB_COMPACT", "2".to_string()));
+        // No flush of the child's own while the merge runs, so every
+        // directory the checks find belongs to the merge.
+        env.push(("NWDB_BUFFER_BYTES", (1u64 << 30).to_string()));
+        env
+    };
+
+    for (i, stage) in [
+        "MergeWritten",
+        "BeforeReplaceCommit",
+        "ReplaceCommitted",
+        "ReplacePublished",
+        "PartDirDeleted",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(base.path(), dir.path());
+        let run = run_child(dir.path(), 5_000_000, 0, &env(stage), None);
+        run.assert_aborted_at(stage);
+
+        let (state, unreferenced) = disk_state(dir.path());
+        let live: BTreeSet<u64> = state.parts.iter().map(|p| p.part_id).collect();
+        let removed: Vec<u64> = base_ids.difference(&live).copied().collect();
+        let merged_live = state.parts.iter().filter(|p| p.level > 0).count();
+        match stage {
+            "MergeWritten" | "BeforeReplaceCommit" => {
+                assert!(removed.is_empty(), "{stage}: {removed:?} were removed");
+                assert_eq!(merged_live, 0, "{stage}");
+                // The merged part is on disk, finished, and nobody lists it.
+                assert!(!unreferenced.is_empty(), "{stage}");
+                assert!(
+                    unreferenced.iter().all(|n| !n.ends_with(".tmp")),
+                    "{stage}: {unreferenced:?}"
+                );
+            }
+            "ReplaceCommitted" | "ReplacePublished" => {
+                assert!(
+                    removed.len() >= 2 && removed.len() <= mergeable,
+                    "{stage}: {removed:?}"
+                );
+                assert_eq!(merged_live, 1, "{stage}");
+                let names: Vec<String> = removed
+                    .iter()
+                    .map(|id| nwdb_core::part_dir_name(*id))
+                    .collect();
+                assert_eq!(
+                    unreferenced, names,
+                    "{stage}: the replaced directories remain"
+                );
+            }
+            _ => {
+                // The abort came right after the first directory was deleted.
+                assert!(removed.len() >= 2, "{stage}: {removed:?}");
+                assert_eq!(
+                    unreferenced.len(),
+                    removed.len() - 1,
+                    "{stage}: {unreferenced:?}"
+                );
+            }
+        }
+
+        let acked: BTreeSet<u64> = acked_before.iter().chain(&run.acked).copied().collect();
+        let e = recover_and_check(dir.path(), &acked, i % 2 == 0, stage, 300 + i as u128);
+        e.shutdown().unwrap();
+        let (_, unreferenced) = disk_state(dir.path());
+        assert!(unreferenced.is_empty(), "{stage}: {unreferenced:?}");
+    }
+}
