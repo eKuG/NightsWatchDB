@@ -985,6 +985,13 @@ fn concurrent_ingest_flush_queries_retention_and_merging_agree_with_the_model() 
 
     let t = now.load(Ordering::SeqCst);
     assert!(t > 30 * W, "the clock did not move: {t}");
+    // The clock has stopped. On a loaded machine the writers can have been
+    // held back for longer than the retention period, and everything they
+    // wrote would then be expired: one span in the window of the final time
+    // makes sure that something is kept, whatever the timing was.
+    let last = TSpan::new(1 << 100, 1 << 40, t / W * W + 1);
+    ingest_retry(&e, std::slice::from_ref(&last)).unwrap();
+    model.lock().unwrap().add(std::slice::from_ref(&last));
     e.flush().unwrap();
     compact_fully(&e);
     let mut m = model.lock().unwrap().clone();
