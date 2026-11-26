@@ -163,6 +163,10 @@ pub enum Stage {
     LogRotated,
     /// The log was trimmed (only in a flush that trims).
     Trimmed,
+    /// A merge has its inputs and its part id and is about to call
+    /// `merge_parts`; nothing is written. An error returned here is the
+    /// merge's own error: it fails as any merge does, and nothing changes.
+    MergeStarting,
     /// A merge wrote and opened its output part; nothing is replaced yet. An
     /// error returned here abandons the merge: the output is deleted and
     /// nothing else changes.

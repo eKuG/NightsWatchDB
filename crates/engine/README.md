@@ -151,12 +151,12 @@ between its steps (and compaction between its merges), and shutdown sets it
 first, so shutdown waits for the step in progress and no more. A step is one
 manifest commit together with the publish that follows it (a file write and two
 syncs; the split map is rebuilt before the gate, see Replacing parts), or the
-deletion of one part directory, or **one merge**. A merge
-in progress is finished, not abandoned (see Compaction for why): shutdown
-waits for the call to `merge_parts` that is running, which is bounded by
-`max_input_bytes` of input (4 GiB by default; the segment crate measured a
-debug build at about 16,000 rows a second, a release build is much faster),
-and then for one open, one commit and one publish. No further merge is started.
+deletion of one part directory, or **one chunk of a merge**. A merge in
+progress is abandoned: `merge_parts` checks the stop flag before each chunk
+(`MergeOptions::chunk_bytes`, 32 MiB of rows by default), removes its output and
+returns `Unavailable`, so shutdown waits for the chunk that is running and no
+more. A merge that has already written its output is finished: shutdown then
+waits for one open, one commit and one publish. No further merge is started.
 If shutdown arrives while a replacement is deleting its directories, the ones
 not yet reached stay on disk, unreferenced; the next start-up deletes them. A
 pass that is waiting for the publish gate waits for a flush's commit and
@@ -490,7 +490,7 @@ stop (retention and the retry of deletions run again before a merge once
 `maintenance_interval` has passed since they last ran; see Retention):
 
 1. the policy chooses a merge; an id is reserved;
-2. `merge_parts` is called with the inputs oldest first (by part id; the order
+2. the stage `MergeStarting` is called, then `merge_parts` with the inputs oldest first (by part id; the order
    decides only between copies of a span with the same `arrival`), the
    window of the inputs, the writer options a flush uses (`splitter`,
    `dedup_window_bytes`) and a level one above the highest input level;
@@ -512,6 +512,7 @@ start-up deletes the directories the manifest does not reference.
 | Crash at / during | On disk | Recovery |
 |---|---|---|
 | inside `merge_parts` | `<id>.tmp` and the live inputs | the temporary directory is deleted at start-up |
+| `MergeStarting` | the live inputs | nothing was written |
 | `MergeWritten`, `BeforeReplaceCommit` | the finished merged part, unreferenced; every input live | the merged part is deleted at start-up; nothing was replaced |
 | the commit | the new manifest version exists or not | not there: as above. There: as below |
 | `ReplaceCommitted`, `ReplacePublished` | the manifest lists the merged part; the inputs' directories remain, unreferenced | the manifest decides; the directories are deleted at start-up |
@@ -542,19 +543,16 @@ shutdown sets before it waits for the maintenance thread. The merge loop starts
 no further merge once it is set, and a merge that returns an error while it is
 set is not counted as a failure: no backoff, no `last_compaction_error`, and
 the engine is not put in the fatal state (unless the error is `Fatal`). The
-flag is not yet handed to `merge_parts`; the line that does it is marked in
-`merge_one`.
+flag is also handed to `merge_parts` (`MergeOptions::stop`), which ends a
+merge that is running at its next chunk with `Unavailable`.
 
-**Shutdown during a merge.** A merge in progress is finished, not abandoned.
-`merge_parts` has no way to be interrupted, so it has run to its end by the time
-any decision could be made, and dropping its output would throw the work away to
-save one manifest commit; after it, no further merge is started and the
-directories of the replaced parts are left for the next start. The wait is the
-rest of one `merge_parts` call, bounded by `max_input_bytes`, plus an open and a
-commit. Lower `max_input_bytes` to shorten it. A merge that is abandoned for
-another reason (the stage hook returns an error at `MergeWritten` or
-`BeforeReplaceCommit`) deletes its output and leaves nothing behind; tests do
-both.
+**Shutdown during a merge.** A merge in progress is abandoned at its next
+chunk: its temporary output is removed, no part is added or replaced, and the
+inputs stay live; the next start merges them again. A merge that has written
+its output when shutdown begins is finished, since only an open and a commit
+are left. A merge that is abandoned for another reason (the stage hook returns
+an error at `MergeWritten` or `BeforeReplaceCommit`) deletes its output and
+leaves nothing behind; tests do both.
 
 **What a merge changes for queries.** A trace that was split over parts is one
 run in one part and leaves the split map; a duplicate span (a sender's retry
@@ -599,7 +597,8 @@ unique.
 - A flush: `FlushFrozen`, `PartWritten` (once per part), `AllPartsWritten`
   (before the commit), `Committed` (before publishing), `Published`
   (before the log is rotated), `LogRotated` (before the trim), `Trimmed`.
-- A merge: `MergeWritten` (its output is written and open; nothing is
+- A merge: `MergeStarting` (before `merge_parts`; nothing is written; an error
+  returned here is the merge's own error), `MergeWritten` (its output is written and open; nothing is
   replaced yet). An error returned here abandons the merge: its directory is
   deleted and nothing else changes (`Fatal` puts the engine in the fatal
   state and the directory is left for the next start).
@@ -790,8 +789,8 @@ lists of the parts a flush writes have the budgets
   small parts, which compaction merges.
 - Retention removes whole parts and nothing else: the buffer and the log are
   not touched by it. There is no object store.
-- A merge cannot be interrupted (`merge_parts` has no cancellation), so
-  shutdown waits for it, up to `max_input_bytes` of input. A window that gets a
+- A merge is stopped only between chunks, so shutdown waits for the chunk
+  that is running (32 MiB of rows by default). A window that gets a
   small late part more rarely than `quiet` is rewritten whole each time.
 - There is no check of free space before a merge. Its output, up to
   `max_input_bytes` of data, is written while its inputs are still on disk, so

@@ -317,3 +317,77 @@ fn shutdown_during_a_pass_starts_no_further_merge_and_a_merge_error_then_is_no_f
     assert_eq!(s.last_compaction_error, None);
     assert!(!s.fatal);
 }
+
+/// Shutdown while a merge is in progress: the merge ends without finishing,
+/// leaves no merged part and no directory behind, is no failure, and after a
+/// restart every span is there and the merge can be done. The hook starts the
+/// shutdown just before `merge_parts` is called, so the merge begins with the
+/// stop flag already set and ends at its first check.
+#[test]
+fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let slot: Arc<Mutex<Option<Engine>>> = Arc::default();
+    let shutdown: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+    let starts = Arc::new(AtomicU64::new(0));
+    let mut o = compact_opts(dir.path());
+    o.compaction.retry_backoff = Duration::from_secs(3600);
+    o.stage_hook = Some({
+        let (slot, shutdown, starts) = (slot.clone(), shutdown.clone(), starts.clone());
+        Arc::new(move |s| {
+            if s == Stage::MergeStarting && starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                let e = slot.lock().unwrap().clone().unwrap();
+                let e2 = e.clone();
+                *shutdown.lock().unwrap() = Some(std::thread::spawn(move || {
+                    let _ = e2.shutdown();
+                }));
+                // Ingest is refused once shutdown has begun, which is also
+                // when it has set the stop flag.
+                let t = Instant::now();
+                while ingest(&e, &[TSpan::new(99, 1, 5).root()]).is_ok() {
+                    assert!(
+                        t.elapsed() < Duration::from_secs(30),
+                        "shutdown did not begin"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Ok(())
+        })
+    });
+    let e = open(o);
+    *slot.lock().unwrap() = Some(e.clone());
+    let mut model = Model::default();
+    for round in 0..3u128 {
+        let spans: Vec<TSpan> = (0..5u128)
+            .map(|k| TSpan::new(round * 10 + k + 1, 1, 1 + k as i64).root())
+            .collect();
+        model.add(&spans);
+        ingest(&e, &spans).unwrap();
+        e.flush().unwrap();
+    }
+    let parts_before = part_dir_names(dir.path());
+    assert_eq!(parts_before.len(), 3);
+    let outcome = e.run_maintenance();
+    shutdown.lock().unwrap().take().unwrap().join().unwrap();
+    let s = e.stats();
+    slot.lock().unwrap().take();
+    drop(e);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(s.merges_done, 0, "{s:?}");
+    assert_eq!(s.last_compaction_error, None);
+    assert!(!s.fatal);
+    assert_eq!(
+        part_dir_names(dir.path()),
+        parts_before,
+        "the abandoned merge left a directory or removed an input"
+    );
+
+    // After a restart every span is there, and the merge can be done.
+    let e = open(compact_opts(dir.path()));
+    model.check(&e, "after the restart");
+    compact_fully(&e);
+    assert_eq!(e.stats().merges_done, 1);
+    model.check(&e, "after the merge");
+    e.shutdown().unwrap();
+}

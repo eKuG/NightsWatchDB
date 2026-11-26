@@ -391,9 +391,9 @@ impl Inner {
 
     /// Merges parts while the policy finds something to merge, one merge at a
     /// time, and stops between merges when shutdown asks. A merge that is
-    /// running when shutdown asks is finished: `merge_parts` cannot be
-    /// interrupted, and what it wrote costs only a commit to keep (the README
-    /// has the bound this puts on shutdown).
+    /// running when shutdown asks ends at its next chunk (`merge_parts` checks
+    /// the stop flag) and leaves nothing behind; the README has the bound this
+    /// puts on shutdown.
     ///
     /// A merge that fails is recorded and its window is left alone for a
     /// while (until a restart if the cause is damage in an input); the other
@@ -535,6 +535,7 @@ impl Inner {
             stop: Some(self.merge_stop.clone()),
             ..MergeOptions::default()
         };
+        run_hook(&self.opts.stage_hook, Stage::MergeStarting)?;
         let (meta, stats) = merge_parts(
             &readers,
             &self.parts_dir,
