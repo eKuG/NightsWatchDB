@@ -376,17 +376,44 @@ fn shutdown_while_a_merge_is_in_progress_abandons_it_and_loses_nothing() {
             if s == Stage::MergeStarting && starts.fetch_add(1, Ordering::SeqCst) == 0 {
                 let e = slot.lock().unwrap().clone().unwrap();
                 let e2 = e.clone();
+                // A request whose acknowledgement is held back keeps shutdown
+                // waiting for requests in flight, so a stop flag that was only
+                // set after that wait would not be set yet while this merge
+                // runs. The gate opens half a second later, long enough for a
+                // merge that was not stopped to finish.
+                let (gate, held) = std::sync::mpsc::channel::<()>();
+                let first = TSpan::new(1_000, 1, 5).root();
+                e.ingest(
+                    TAG,
+                    encode(std::slice::from_ref(&first)),
+                    to_batches(std::slice::from_ref(&first)),
+                    move |_| {
+                        let _ = held.recv_timeout(Duration::from_secs(30));
+                    },
+                )
+                .unwrap();
+                model.lock().unwrap().add(&[first]);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(500));
+                    drop(gate);
+                });
                 *shutdown.lock().unwrap() = Some(std::thread::spawn(move || {
                     let _ = e2.shutdown();
                 }));
                 // Ingest is refused once shutdown has begun, which is also
-                // when it has set the stop flag.
-                // What it accepts is in the model.
+                // when it has set the stop flag. What it accepts is in the
+                // model.
                 let t = Instant::now();
                 loop {
                     let n = starts.fetch_add(1, Ordering::SeqCst) as u128;
                     let span = TSpan::new(1_000 + n, 1, 5).root();
-                    if ingest(&e, std::slice::from_ref(&span)).is_err() {
+                    let sent = e.ingest(
+                        TAG,
+                        encode(std::slice::from_ref(&span)),
+                        to_batches(std::slice::from_ref(&span)),
+                        |_| {},
+                    );
+                    if sent.is_err() {
                         break;
                     }
                     model.lock().unwrap().add(&[span]);
