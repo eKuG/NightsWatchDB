@@ -31,7 +31,10 @@ Builds the server image (`Dockerfile`) and the load generator image
 CPUs and 1 GB, loads generated traces over OTLP gRPC (half uncompressed, half gzip, from a
 real grpc-go client) and checks the data
 through the HTTP API: the span count must equal what the generator sent, and a
-listed trace must open with as many spans as its summary says. It repeats the
+listed trace must open with as many spans as its summary says, and a word and a
+two-word phrase taken from the text of a stored trace (read through the API) must
+find that trace in `/api/v1/search` once the data is flushed (search covers
+flushed parts only, so this waits up to 150 seconds for a flush). It repeats the
 checks after `kill -9` and after a `docker stop`, which must exit with code 0.
 It prints `PASS` or `FAIL` and removes its containers, network and volume on
 exit; the two images (`nightswatchdb:e2e`, `nwdb-tracegen:e2e`) stay.

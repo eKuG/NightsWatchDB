@@ -8,7 +8,7 @@ use nwdb_core::{
 };
 use nwdb_segment::{
     INDEX_FILE, PIECES_BLK, PIECES_IDX, PartReader, PartWriter, SPANS_FILE, SUMMARY_FILE,
-    ScanOptions, WriterOptions,
+    ScanOptions, TEXT_INDEX_FILE, TEXT_ROWS_FILE, WriterOptions,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
@@ -551,11 +551,18 @@ fn index_file_known_answer() {
 
     let mut want: Vec<u8> = Vec::new();
     want.extend_from_slice(b"NWTI");
-    want.extend_from_slice(&[5, 0, 0, 0]);
+    want.extend_from_slice(&[6, 0, 0, 0]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
     // Length (u64) and CRC-32C (u32) of spans.parquet, summary.parquet,
-    // pieces.blk and pieces.idx.
-    for file in [SPANS_FILE, SUMMARY_FILE, PIECES_BLK, PIECES_IDX] {
+    // pieces.blk, pieces.idx, text.idx and text.rows.
+    for file in [
+        SPANS_FILE,
+        SUMMARY_FILE,
+        PIECES_BLK,
+        PIECES_IDX,
+        TEXT_INDEX_FILE,
+        TEXT_ROWS_FILE,
+    ] {
         let bytes = std::fs::read(dir.join(file)).unwrap();
         want.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         // pieces.idx ends with its own CRC-32C, which the recorded one leaves
@@ -567,7 +574,7 @@ fn index_file_known_answer() {
         };
         want.extend_from_slice(&crc32c::crc32c(counted).to_le_bytes());
     }
-    assert_eq!(want.len(), 64);
+    assert_eq!(want.len(), 88);
     // Trace 0x05: first row 2, one row, start -50, end 40.
     want.extend_from_slice(&[0x05; 16]);
     want.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 0]);
@@ -580,7 +587,7 @@ fn index_file_known_answer() {
     want.extend_from_slice(&[2, 0, 0, 0]);
     want.extend_from_slice(&[100, 0, 0, 0, 0, 0, 0, 0]);
     want.extend_from_slice(&[0x2C, 0x01, 0, 0, 0, 0, 0, 0]);
-    assert_eq!(want.len(), 64 + 2 * 44);
+    assert_eq!(want.len(), 88 + 2 * 44);
     // CRC-32C of everything above, little-endian. The header holds the
     // checksums of the Parquet files, so this one is computed, with the
     // algorithm pinned by the check value at the top of the test.
@@ -601,7 +608,15 @@ fn index_file_known_answer() {
 fn copy_part(src: &Path, dst_parent: &Path) -> PathBuf {
     let dst = dst_parent.join("copy");
     std::fs::create_dir_all(&dst).unwrap();
-    for f in [SPANS_FILE, INDEX_FILE, SUMMARY_FILE, PIECES_BLK, PIECES_IDX] {
+    for f in [
+        SPANS_FILE,
+        INDEX_FILE,
+        SUMMARY_FILE,
+        PIECES_BLK,
+        PIECES_IDX,
+        TEXT_INDEX_FILE,
+        TEXT_ROWS_FILE,
+    ] {
         std::fs::copy(src.join(f), dst.join(f)).unwrap();
     }
     dst
@@ -658,7 +673,7 @@ fn corrupt_parts_are_rejected_at_open() {
         &|b| {
             // The first record's row count, made one larger, with a valid
             // checksum: the ranges no longer tile the Parquet rows.
-            b[64 + 24] = b[64 + 24].wrapping_add(1);
+            b[88 + 24] = b[88 + 24].wrapping_add(1);
             reseal(b);
         },
         "row ranges disagree with the Parquet file",
@@ -666,7 +681,7 @@ fn corrupt_parts_are_rejected_at_open() {
     expect_corrupt(
         &|b| {
             // Two records swapped: ids out of order, checksum valid.
-            let (first, second) = (64, 64 + 44);
+            let (first, second) = (88, 88 + 44);
             let a: Vec<u8> = b[first..second].to_vec();
             let c: Vec<u8> = b[second..second + 44].to_vec();
             b[first..second].copy_from_slice(&c);
@@ -676,7 +691,15 @@ fn corrupt_parts_are_rejected_at_open() {
         "unsorted index",
     );
 
-    for file in [SPANS_FILE, INDEX_FILE, SUMMARY_FILE, PIECES_BLK, PIECES_IDX] {
+    for file in [
+        SPANS_FILE,
+        INDEX_FILE,
+        SUMMARY_FILE,
+        PIECES_BLK,
+        PIECES_IDX,
+        TEXT_INDEX_FILE,
+        TEXT_ROWS_FILE,
+    ] {
         let scratch = tempfile::tempdir().unwrap();
         let dir = copy_part(&good, scratch.path());
         std::fs::remove_file(dir.join(file)).unwrap();
@@ -998,9 +1021,17 @@ fn lifecycle_of_the_part_directory() {
     names.sort();
     assert_eq!(
         names,
-        [PIECES_BLK, PIECES_IDX, SPANS_FILE, SUMMARY_FILE, INDEX_FILE]
+        [
+            PIECES_BLK,
+            PIECES_IDX,
+            SPANS_FILE,
+            SUMMARY_FILE,
+            TEXT_INDEX_FILE,
+            TEXT_ROWS_FILE,
+            INDEX_FILE
+        ]
     );
-    assert_eq!(meta.files.len(), 5);
+    assert_eq!(meta.files.len(), 7);
     for (name, size) in &meta.files {
         assert_eq!(
             std::fs::metadata(final_dir.join(name)).unwrap().len(),
@@ -1102,7 +1133,7 @@ fn part_meta_describes_the_part() {
 
     assert_eq!(meta.part_id, 42);
     assert_eq!(meta.level, 0);
-    assert_eq!(meta.format_version, 5);
+    assert_eq!(meta.format_version, 6);
     assert_eq!(meta.window_start_ns, window_start);
     assert_eq!(meta.window_ns, WINDOW_NS);
     assert_eq!(meta.rows, spans.len() as u64);

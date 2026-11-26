@@ -60,6 +60,10 @@ fn writer_options() -> WriterOptions {
         splitter: Some(Arc::new(AttrsOnly)),
         dedup_window_bytes: WINDOW,
         row_group_bytes: 4 * MIB,
+        // The text index and the row lists have budgets of their own; they are
+        // kept small so that what these tests measure is not hidden by them.
+        text_index_budget_bytes: 1 << 20,
+        row_list_budget_bytes: 1 << 20,
         ..WriterOptions::default()
     }
 }

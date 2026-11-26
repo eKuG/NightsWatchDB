@@ -12,7 +12,7 @@ use axum::routing::get;
 use bytes::Bytes;
 use hyper::body::{Body as HttpBody, Frame};
 use nwdb_core::{Error, SpanColumns, SpanRecord, TraceId, TraceSummary};
-use nwdb_engine::{AggQuery, Engine, ListQuery};
+use nwdb_engine::{AggQuery, Engine, ListQuery, SearchQuery};
 use nwdb_otlp::{
     encode_spans, resource_dropped_attributes, scope_dropped_attributes, write_attrs, write_events,
     write_links, write_resource, write_scope_attrs,
@@ -182,6 +182,7 @@ pub(crate) fn router(engine: Engine, fatal: Arc<Notify>, hosts: HostCheck) -> Ro
         .route("/api/v1/traces", get(list_traces))
         .route("/api/v1/traces/{trace_id}", get(get_trace))
         .route("/api/v1/tokens", get(tokens))
+        .route("/api/v1/search", get(search))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "no such path") })
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "only GET is supported")
@@ -706,6 +707,64 @@ async fn list_traces(
     let traces = api.run(slot, move |e| e.list_traces(&query)).await?;
     let traces: Vec<Value> = traces.iter().map(summary_json).collect();
     Ok(json_response(StatusCode::OK, &json!({ "traces": traces })))
+}
+
+/// `GET /api/v1/search?q=...&from=&to=&limit=`: the newest spans whose text
+/// matches `q`. Only flushed parts are searched; the answer says through which
+/// log position.
+async fn search(
+    State(api): State<Api>,
+    Extension(slot): Extension<Slot>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
+    let mut p = Params::parse(raw)?;
+    let (from_ns, to_ns) = p.range()?;
+    let limit = match p.take("limit") {
+        None => DEFAULT_LIMIT,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=MAX_LIMIT).contains(n))
+            .ok_or_else(|| ApiError::bad(format!("`limit` must be 1 to {MAX_LIMIT}")))?,
+    };
+    let text = p
+        .take("q")
+        .ok_or_else(|| ApiError::bad("`q` is required"))?;
+    p.finish()?;
+    let query = nwdb_engine::textindex::parse(&text).map_err(|e| api.error(&e))?;
+    let query = SearchQuery {
+        query,
+        from_ns,
+        to_ns,
+        limit,
+    };
+    let found = api.run(slot, move |e| e.search(&query)).await?;
+    let spans: Vec<Value> = found
+        .hits
+        .iter()
+        .map(|h| {
+            let mut m = Map::new();
+            m.insert("trace_id".into(), h.trace_id.to_string().into());
+            m.insert("span_id".into(), h.span_id.to_string().into());
+            m.insert("start_ns".into(), (h.start_ns as u64).into());
+            m.insert("end_ns".into(), (h.end_ns as u64).into());
+            m.insert("name".into(), h.name.as_str().into());
+            for (k, v) in [
+                ("service_name", &h.service_name),
+                ("operation", &h.operation),
+                ("request_model", &h.request_model),
+            ] {
+                if let Some(v) = v {
+                    m.insert(k.into(), v.as_str().into());
+                }
+            }
+            Value::Object(m)
+        })
+        .collect();
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({ "spans": spans, "searched_through_lsn": found.searched_through_lsn }),
+    ))
 }
 
 fn summary_json(s: &TraceSummary) -> Value {

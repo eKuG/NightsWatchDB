@@ -51,6 +51,10 @@ fn write(dir: &std::path::Path, id: u64, unique_mib: usize) -> (usize, nwdb_core
     let options = WriterOptions {
         splitter: Some(Arc::new(Chunks(4096))),
         dedup_window_bytes: WINDOW,
+        // The text index and the row lists have budgets of their own; they are
+        // kept small so that what these tests measure is not hidden by them.
+        text_index_budget_bytes: 1 << 20,
+        row_list_budget_bytes: 1 << 20,
         ..WriterOptions::default()
     };
     let mut w = PartWriter::create(dir, id, 0, 900_000_000_000, options).unwrap();

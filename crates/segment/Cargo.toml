@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 nwdb-core = { path = "../core" }
 nwdb-payload = { path = "../payload" }
+nwdb-textindex = { path = "../textindex" }
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true

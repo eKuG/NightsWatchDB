@@ -24,6 +24,7 @@ use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
 use crate::compaction::CompactionOptions;
 use crate::lock;
 use crate::query::{AggQuery, ListQuery, Snapshot, TokenAgg};
+use crate::search::{SearchQuery, SearchResults};
 use crate::split::SplitMap;
 
 /// How long the background flusher waits after a failed flush before it tries
@@ -84,6 +85,15 @@ pub struct EngineOptions {
     /// How many bytes of recent piece blocks a flush keeps in memory to
     /// recognise repeated text, per part being written. Default 64 MiB.
     pub dedup_window_bytes: usize,
+    /// Memory the text index of a part being written may hold for its open
+    /// segment (see `nwdb_segment::WriterOptions::text_index_budget_bytes`),
+    /// per part. Default 32 MiB.
+    pub text_index_budget_bytes: usize,
+    /// Bytes of `(piece, row)` pairs a part being written holds before they
+    /// are sorted and spilled to disk (see
+    /// `nwdb_segment::WriterOptions::row_list_budget_bytes`), per part.
+    /// Default 32 MiB.
+    pub row_list_budget_bytes: usize,
     /// A test facility, in the manner of the log's `sync_hook`: called at each
     /// [`Stage`] of start-up and of a flush. An error it returns at a stage
     /// before the manifest commit is handled exactly as if that step had
@@ -185,6 +195,8 @@ impl std::fmt::Debug for EngineOptions {
             .field("accept_lost_log", &self.accept_lost_log)
             .field("splitter", &self.splitter.as_ref().map(|_| "<splitter>"))
             .field("dedup_window_bytes", &self.dedup_window_bytes)
+            .field("text_index_budget_bytes", &self.text_index_budget_bytes)
+            .field("row_list_budget_bytes", &self.row_list_budget_bytes)
             .field("stage_hook", &self.stage_hook.as_ref().map(|_| "<hook>"))
             .field("maintenance_interval", &self.maintenance_interval)
             .field("retention", &self.retention)
@@ -212,6 +224,8 @@ impl EngineOptions {
             accept_lost_log: false,
             splitter: None,
             dedup_window_bytes: nwdb_segment::DEFAULT_DEDUP_WINDOW_BYTES,
+            text_index_budget_bytes: nwdb_segment::DEFAULT_TEXT_INDEX_BUDGET_BYTES,
+            row_list_budget_bytes: nwdb_segment::DEFAULT_ROW_LIST_BUDGET_BYTES,
             stage_hook: None,
             maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
             retention: None,
@@ -902,6 +916,18 @@ impl Engine {
         self.snapshot().list_traces(query)
     }
 
+    /// [`Snapshot::search`] on a fresh snapshot, with the log position the
+    /// search covered. Spans still in the memory buffer are not searched; see
+    /// [`Snapshot::search`].
+    pub fn search(&self, query: &SearchQuery) -> Result<SearchResults> {
+        let snapshot = self.snapshot();
+        let hits = snapshot.search(query)?;
+        Ok(SearchResults {
+            hits,
+            searched_through_lsn: snapshot.searched_through_lsn(),
+        })
+    }
+
     /// [`Snapshot::aggregate_tokens`] on a fresh snapshot.
     pub fn aggregate_tokens(&self, query: &AggQuery) -> Result<Vec<TokenAgg>> {
         self.snapshot().aggregate_tokens(query)
@@ -1003,7 +1029,7 @@ impl Inner {
 
     pub(crate) fn snapshot(&self) -> Snapshot {
         let c = lock(&self.core);
-        Snapshot::new(c.vis.clone(), self.opts.batch_limits)
+        Snapshot::new(c.vis.clone(), self.opts.batch_limits, c.flushed_lsn)
     }
 
     pub(crate) fn set_fatal_locked(&self, c: &mut Core, msg: String) {

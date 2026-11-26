@@ -82,6 +82,10 @@ fn write(
         splitter: Some(Arc::new(OtlpSplitter::default())),
         dedup_window_bytes: MIB,
         row_group_rows: 2,
+        // The text index and the row lists have budgets of their own; they are
+        // kept small so that what this test measures is not hidden by them.
+        text_index_budget_bytes: 1 << 20,
+        row_list_budget_bytes: 1 << 20,
         max_pieces,
         ..WriterOptions::default()
     };

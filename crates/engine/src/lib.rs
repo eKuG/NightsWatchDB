@@ -23,16 +23,25 @@ mod flush;
 mod maintenance;
 mod query;
 mod rows;
+mod search;
 mod split;
 
 #[cfg(test)]
 extern crate self as nwdb_engine;
 #[cfg(test)]
 mod replace_tests;
+#[cfg(test)]
+mod search_tests;
 
 pub use compaction::{CompactionOptions, MergePlan, PartInfo, Rule, choose_merge};
 pub use engine::{Clock, Engine, EngineOptions, EngineStats, Stage, StageHook};
 pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
+pub use search::{SearchHit, SearchQuery, SearchResults, SearchStats};
+
+/// Limits of one search of one part.
+pub use nwdb_segment::SearchLimits;
+/// The full-text query model: [`textindex::Query`] and [`textindex::parse`].
+pub use nwdb_textindex as textindex;
 
 use std::sync::{Mutex, MutexGuard};
 

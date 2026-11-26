@@ -600,12 +600,74 @@ does not block, and is not blocked by, ingest or flush.
   routine `list_traces` uses, so a span id seen twice for one trace in the
   buffers is counted once and the three queries agree inside one snapshot.
 
+- `search` (see "Search" below): full-text search over the flushed parts.
+
 A trace's summary is a function of its set of spans only: merging partial
 summaries in any order gives the same result as summarising all the spans at
 once. `session_id` and `user_id` are the smallest non-null value among the
 spans, and the root fields come from the root with the smallest `(name,
 service)`. A malformed trace with several roots therefore shows the smallest
 root, not the earliest.
+
+## Search
+
+`Snapshot::search(&SearchQuery { query, from_ns, to_ns, limit })` returns the
+newest `limit` spans whose text matches the query, with `start_ns` in
+`[from_ns, to_ns)`, ordered by `(start_ns` descending, trace id, span id)`. A
+hit is the span's trace id, span id, start, end, name, service name, operation
+and request model. `Engine::search` takes a fresh snapshot and returns the hits
+with `searched_through_lsn`; a snapshot has `searched_through_lsn()` too.
+`query` is an `nwdb_textindex::Query`, built by `nwdb_engine::textindex::parse`
+from the grammar documented in that crate (words are ANDed, `OR`, a leading `-`,
+`"a phrase"`, `prefix*`, parentheses).
+
+**Freshness: search covers flushed parts only.** Spans that are still in the
+memory buffer (the active buffer, or the one being flushed) are not searched.
+They become searchable at the next flush, at most `flush_interval` (30 seconds by
+default) after they arrive, or sooner when the buffer reaches its size limit. The
+log position returned with the hits is the highest position whose data is in
+the parts that were searched: a caller that knows the position its own spans were
+acknowledged at can tell whether they could be found yet. A snapshot never
+changes: one taken before a flush does not see the part the flush writes.
+
+What is searched is what the parts index: the text held in pieces (see the
+segment README: text under 8 bytes, attribute values under 256 bytes that are
+not under a content key, and text past a part's piece ceiling stay inline in the
+span row and are not searched).
+
+How the walk goes, and why it may stop early. Every span of a part starts no
+later than the part's `U`, the largest maximum in the statistics of its
+`start_ns` column (`PartReader::max_start_ns`). The parts are searched in
+descending order of `U` (older part first among equal ones), the best `limit`
+hits are held, and the walk stops when `limit` hits are held and the next
+part's `U` is below the start of the worst held hit: a span enters the answer only
+if it sorts before the worst held hit, the order starts with the start descending,
+so no span of that part, nor of any later part (their `U` is no larger), can enter.
+The test is strict, since a span that starts exactly at the worst held start can
+win on trace id. The worst held hit only gets better as hits are added, so a part
+that was ruled out stays ruled out. Parts whose time bounds cannot reach the
+range (`min_start_ns >= to`, or `U < from`) are not looked at. `search_with_stats`
+returns `SearchStats` (parts searched, skipped early and out of range, rows
+matched and read) and tests pin them.
+
+Per part, `PartReader::search` gives the matching rows. They are read in ranges
+(rows less than 64 apart are read together, at most 16,384 rows a call) with a
+projection of eight columns that has none of the raw columns, so no piece is read
+and no rope rebuilt (a test checks that a search of words reads no piece block;
+only a phrase, which has to be confirmed against its text, reads pieces). Only the
+`limit` best hits are held, so memory is one range of rows, the matching row
+numbers of one part and the hits.
+
+The same span (trace id and span id) can be in two parts: a retry that crossed a
+flush, until a merge of the window. It is returned once, the copy of the older part
+(the one a merge would keep). The limit counts spans.
+
+Limits of one search of one part are those of `SearchLimits` (1,024 terms for a
+prefix, 256 MiB of piece text read to confirm, 10 million rows a leaf); a query
+over one is `Error::InvalidArgument` saying which. The text index and the row
+lists of the parts a flush writes have the budgets
+`EngineOptions::text_index_budget_bytes` and `EngineOptions::row_list_budget_bytes`
+(32 MiB each by default, per part being written).
 
 ## Known limits
 

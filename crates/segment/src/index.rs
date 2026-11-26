@@ -11,7 +11,7 @@ const MAGIC: &[u8; 4] = b"NWTI";
 /// file of a part that is read before any other, so it is where an older part
 /// is recognised.
 const VERSION: u32 = crate::FORMAT_VERSION;
-const HEADER_LEN: usize = 4 + 4 + 8 + 4 * (8 + 4);
+const HEADER_LEN: usize = 4 + 4 + 8 + 6 * (8 + 4);
 const RECORD_LEN: usize = 44;
 const CRC_LEN: usize = 4;
 
@@ -47,6 +47,8 @@ pub(crate) struct FileChecksums {
     pub summary: FileChecksum,
     pub pieces_blk: FileChecksum,
     pub pieces_idx: FileChecksum,
+    pub text_index: FileChecksum,
+    pub text_rows: FileChecksum,
 }
 
 /// What `traces.idx` holds.
@@ -67,6 +69,8 @@ pub(crate) fn encode(entries: &[TraceEntry], checksums: FileChecksums) -> Vec<u8
         checksums.summary,
         checksums.pieces_blk,
         checksums.pieces_idx,
+        checksums.text_index,
+        checksums.text_rows,
     ] {
         out.extend_from_slice(&c.len.to_le_bytes());
         out.extend_from_slice(&c.crc32c.to_le_bytes());
@@ -139,6 +143,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
         summary: sum_at(28),
         pieces_blk: sum_at(40),
         pieces_idx: sum_at(52),
+        text_index: sum_at(64),
+        text_rows: sum_at(76),
     };
     let mut entries: Vec<TraceEntry> = Vec::with_capacity(count as usize);
     for r in body[header_len..].as_chunks::<RECORD_LEN>().0 {
@@ -182,13 +188,21 @@ mod tests {
         },
         pieces_blk: FileChecksum { len: 5, crc32c: 6 },
         pieces_idx: FileChecksum { len: 8, crc32c: 9 },
+        text_index: FileChecksum {
+            len: 10,
+            crc32c: 11,
+        },
+        text_rows: FileChecksum {
+            len: 12,
+            crc32c: 13,
+        },
     };
 
     #[test]
     fn round_trip() {
         let all: Vec<_> = (1..50).map(entry).collect();
         let bytes = encode(&all, SUMS);
-        assert_eq!(bytes.len(), 64 + 49 * 44 + 4);
+        assert_eq!(bytes.len(), 88 + 49 * 44 + 4);
         let got = decode(&bytes).unwrap();
         assert_eq!(got.entries, all);
         assert_eq!(got.checksums, SUMS);

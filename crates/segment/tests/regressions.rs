@@ -142,6 +142,8 @@ fn damaged_parquet_bytes_never_panic() {
                     "traces.idx",
                     "pieces.blk",
                     "pieces.idx",
+                    "text.idx",
+                    "text.rows",
                 ] {
                     std::fs::copy(good.join(f), dir.join(f)).unwrap();
                 }
@@ -193,6 +195,8 @@ fn copy_dir(src: &Path, dst: &Path) {
         INDEX_FILE,
         "pieces.blk",
         "pieces.idx",
+        "text.idx",
+        "text.rows",
     ] {
         std::fs::copy(src.join(f), dst.join(f)).unwrap();
     }

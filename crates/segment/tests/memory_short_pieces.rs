@@ -68,6 +68,10 @@ fn write(
         // Small row groups, so that what Parquet buffers (the ropes of the
         // row group) does not grow with the part and hide what is measured.
         row_group_rows: 4,
+        // The text index and the row lists have budgets of their own; they are
+        // kept small so that what these tests measure is not hidden by them.
+        text_index_budget_bytes: 1 << 20,
+        row_list_budget_bytes: 1 << 20,
         max_pieces,
         ..WriterOptions::default()
     };

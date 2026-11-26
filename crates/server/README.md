@@ -393,6 +393,54 @@ curl 'http://127.0.0.1:4320/api/v1/tokens?operation=chat'
 # {"models":[{"model":"gpt-4o","count":42,"input_tokens":12000,"output_tokens":3400}]}
 ```
 
+**`GET /api/v1/search?q=&from=&to=&limit=`** returns the newest spans whose text
+matches `q`: `from`, `to` and `limit` are as for `/api/v1/traces` (`limit` is 1
+to 1000, default 20), and the spans are ordered by `start_ns` descending, then
+trace id, then span id. `q` is required and is written in this grammar: words
+are ANDed (`error timeout`), `OR` (upper case) binds tighter than the implicit
+AND (`error OR retry`), a leading `-` negates (`error -timeout`, `-"a phrase"`,
+`-(a OR b)`; a query that is only negations is refused), `"a phrase"` must
+occur in one message, `prefix*` (2 to 64 bytes before the `*`), and parentheses.
+Words are cut like the index cuts text: letters and digits (and all non-ASCII
+bytes) make a word, everything else separates them, and ASCII case does not
+matter, so `foo-bar` is the phrase `"foo bar"`. Percent-encode the query (`+` is a
+space).
+
+```sh
+curl 'http://127.0.0.1:4320/api/v1/search?q=%22rate+limit%22+-retry*&limit=3'
+# {"spans":[{"trace_id":"0af7...","span_id":"b7ad...","start_ns":1700000000000000000,
+#   "end_ns":1700000001000000000,"name":"chat gpt","service_name":"agent",
+#   "operation":"chat","request_model":"gpt-4o"}],"searched_through_lsn":4172}
+curl 'http://127.0.0.1:4320/api/v1/search?q=caf%C3%A9+(refund+OR+invoice)&from=1700000000000000000'
+```
+
+A span has `trace_id`, `span_id`, `start_ns`, `end_ns`, `name`, and, when not
+null, `service_name`, `operation` and `request_model`; open the trace for the
+rest.
+
+**What is searched and what is not.** Search covers **flushed parts only**. A
+span still in the memory buffer is not searched: it becomes searchable at the
+next flush, at most 30 seconds after it arrived (or sooner when the buffer
+reaches its size limit). `searched_through_lsn` is the log position up to which
+data was searched (compare it with `acked_lsn` in `/api/v1/stats`). Only text
+that the parts index is searched: the content of messages, prompts, completions,
+tool definitions and results, and other long values, in the span's attributes,
+events and links. Text that stays in the span row is not: values under 8 bytes,
+attribute values under 256 bytes that are not under a content key, and text past
+the part's piece ceiling; and the columns `name`, `service_name`, the models and
+the other promoted attributes are not text either (list traces by `service` and
+`model` instead). A span's text is all its messages together: a word matches if
+any message has it, a phrase must lie inside one message, and `AND`, `OR` and `-`
+combine spans. A span that was delivered twice into different parts is returned
+once. The search takes a concurrency slot like the other queries.
+
+A query that the parser refuses (nothing to search for, an unterminated quote or
+parenthesis, more than 64 operands, nesting deeper than 32, a query longer than
+16 KiB) or that is over a limit of one search of one part (a prefix that expands
+to more than 1,024 terms, more than 256 MiB of text to read to confirm phrases and
+words longer than 64 bytes, a word or phrase that matches more than 10 million
+rows of one part) is a 400 with the message.
+
 ## Shutdown
 
 On SIGTERM or SIGINT the server stops accepting connections and asks every

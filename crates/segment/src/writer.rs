@@ -1,7 +1,10 @@
 //! Writing one part.
 
 use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
-use crate::{PIECES_BLK, PIECES_IDX, SPANS_FILE, SUMMARY_FILE};
+use crate::text::{
+    DEFAULT_ROW_LIST_BUDGET_BYTES, DEFAULT_TEXT_INDEX_BUDGET_BYTES, TextFinished, TextWriter,
+};
+use crate::{PIECES_BLK, PIECES_IDX, SPANS_FILE, SUMMARY_FILE, TEXT_INDEX_FILE, TEXT_ROWS_FILE};
 use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
@@ -32,8 +35,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// columns; version 4 stores `attrs`, `events` and `links` as ropes and adds
 /// the piece store, `pieces.blk` and `pieces.idx`, whose length and CRC-32C
 /// are in `traces.idx` too; version 5 adds the CRC-32C of the rebuilt value to
-/// every rope that has a reference.
-pub const FORMAT_VERSION: u32 = 5;
+/// every rope that has a reference; version 6 adds the text index and the
+/// piece-to-rows lists, `text.idx` and `text.rows`, whose length and CRC-32C
+/// are in `traces.idx` too.
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The default for [`WriterOptions::dedup_window_bytes`]: 64 MiB.
 pub const DEFAULT_DEDUP_WINDOW_BYTES: usize = 64 << 20;
@@ -115,6 +120,15 @@ pub struct WriterOptions {
     /// Told about each piece the first time it is stored, before the batch
     /// that holds it is written. `None` by default.
     pub piece_observer: Option<Arc<dyn PieceObserver>>,
+    /// Memory the text index builder may hold for its open segment (see
+    /// `nwdb_textindex::IndexOptions::segment_budget_bytes`; values below
+    /// 1 MiB are raised to it). Default 32 MiB.
+    pub text_index_budget_bytes: usize,
+    /// Bytes of `(piece, row)` pairs held before they are sorted and written
+    /// to a run file in the part's temporary directory; the runs are merged
+    /// into `text.rows` when the part is finished. Eight bytes a pair. Default
+    /// 32 MiB. Must be greater than zero.
+    pub row_list_budget_bytes: usize,
 }
 
 impl std::fmt::Debug for WriterOptions {
@@ -132,6 +146,8 @@ impl std::fmt::Debug for WriterOptions {
                 "piece_observer",
                 &self.piece_observer.as_ref().map(|_| "<observer>"),
             )
+            .field("text_index_budget_bytes", &self.text_index_budget_bytes)
+            .field("row_list_budget_bytes", &self.row_list_budget_bytes)
             .finish()
     }
 }
@@ -148,6 +164,8 @@ impl Default for WriterOptions {
             min_piece_bytes: DEFAULT_MIN_PIECE_BYTES,
             max_pieces: DEFAULT_MAX_PIECES,
             piece_observer: None,
+            text_index_budget_bytes: DEFAULT_TEXT_INDEX_BUDGET_BYTES,
+            row_list_budget_bytes: DEFAULT_ROW_LIST_BUDGET_BYTES,
         }
     }
 }
@@ -158,6 +176,7 @@ impl WriterOptions {
             || self.row_group_bytes == 0
             || self.summary_row_group_rows == 0
             || self.piece_block_bytes == 0
+            || self.row_list_budget_bytes == 0
         {
             return Err(Error::invalid_argument(
                 "writer options must all be greater than zero",
@@ -205,7 +224,7 @@ fn parquet_props(row_group_rows: usize, spans: bool) -> WriterProperties {
 
 /// Length and CRC-32C of everything written to a file so far.
 #[derive(Default)]
-struct Digest {
+pub(crate) struct Digest {
     crc: AtomicU32,
     len: AtomicU64,
 }
@@ -219,7 +238,7 @@ impl Digest {
         self.len.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     }
 
-    fn get(&self) -> FileChecksum {
+    pub(crate) fn get(&self) -> FileChecksum {
         FileChecksum {
             len: self.len.load(Ordering::Relaxed),
             crc32c: self.crc.load(Ordering::Relaxed),
@@ -234,9 +253,15 @@ fn pq(e: parquet::errors::ParquetError) -> Error {
 /// A file shared between the Parquet writer, which owns it for writing, and
 /// the part writer, which syncs it after the Parquet writer has finished. It
 /// digests every byte that reaches the file.
-struct SharedFile {
+pub(crate) struct SharedFile {
     file: Arc<File>,
     digest: Arc<Digest>,
+}
+
+impl SharedFile {
+    pub(crate) fn new(file: Arc<File>, digest: Arc<Digest>) -> Self {
+        Self { file, digest }
+    }
 }
 
 impl Write for SharedFile {
@@ -284,7 +309,7 @@ struct Current {
 }
 
 /// Writes one immutable part: `spans.parquet`, `traces.idx`, `summary.parquet`,
-/// `pieces.blk` and `pieces.idx` in a directory that appears under its final
+/// `pieces.blk`, `pieces.idx`, `text.idx` and `text.rows` in a directory that appears under its final
 /// name only when [`finish`](Self::finish) has made all of them durable.
 ///
 /// Memory use while writing is the Parquet writer's row group (at most
@@ -293,7 +318,10 @@ struct Current {
 /// piece block and the hash map over its pieces, the length of every piece in
 /// its compact on-disk form (one to three bytes each, at most
 /// [`WriterOptions::max_pieces`] of them), and one [`TraceEntry`] and one
-/// [`TraceSummary`] per trace so far. It does not grow with the number of
+/// [`TraceSummary`] per trace so far, and the text index and the pairs of
+/// pieces and rows, each within its own budget
+/// ([`WriterOptions::text_index_budget_bytes`] and
+/// [`WriterOptions::row_list_budget_bytes`]). It does not grow with the number of
 /// spans or with the amount of unique text.
 ///
 /// Dropping a writer that was not finished removes the temporary directory.
@@ -533,6 +561,11 @@ impl PartWriter {
             batch.clone()
         };
         let batch = &stored;
+        let first_row = self.rows - batch.num_rows() as u64;
+        self.sink
+            .as_mut()
+            .expect("writer is open")
+            .note_rows(batch, first_row)?;
         let row_bytes = row_value_bytes(batch);
         let options = self.options.clone();
         let spans = self.spans.as_mut().expect("writer is open");
@@ -639,7 +672,12 @@ impl PartWriter {
         spans.close().map_err(pq)?;
         self.spans_file.sync_all()?;
 
-        let store = self.sink.take().expect("writer is open").pieces.finish()?;
+        let PayloadSink { pieces, text, .. } = self.sink.take().expect("writer is open");
+        let store = pieces.finish()?;
+        let TextFinished {
+            index: text_index_sum,
+            rows: text_rows_sum,
+        } = text.finish(store.totals.pieces)?;
         let spans_sum = self.spans_digest.get();
         let summary_sum = self.write_summary()?;
         let sum_of = |s: nwdb_payload::FileSum| FileChecksum {
@@ -652,6 +690,8 @@ impl PartWriter {
             (SUMMARY_FILE, summary_sum),
             (PIECES_BLK, blk_sum),
             (PIECES_IDX, idx_sum),
+            (TEXT_INDEX_FILE, text_index_sum),
+            (TEXT_ROWS_FILE, text_rows_sum),
         ] {
             let on_disk = fs::metadata(self.tmp_dir.join(name))?.len();
             if on_disk != sum.len {
@@ -668,6 +708,8 @@ impl PartWriter {
             summary: summary_sum,
             pieces_blk: blk_sum,
             pieces_idx: idx_sum,
+            text_index: text_index_sum,
+            text_rows: text_rows_sum,
         };
         write_synced(
             &self.tmp_dir.join(INDEX_FILE),
@@ -675,7 +717,15 @@ impl PartWriter {
         )?;
 
         let mut files = BTreeMap::new();
-        for name in [SPANS_FILE, INDEX_FILE, SUMMARY_FILE, PIECES_BLK, PIECES_IDX] {
+        for name in [
+            SPANS_FILE,
+            INDEX_FILE,
+            SUMMARY_FILE,
+            PIECES_BLK,
+            PIECES_IDX,
+            TEXT_INDEX_FILE,
+            TEXT_ROWS_FILE,
+        ] {
             files.insert(
                 name.to_string(),
                 fs::metadata(self.tmp_dir.join(name))?.len(),
@@ -771,9 +821,14 @@ struct PayloadSink {
     min_piece_bytes: usize,
     max_pieces: u64,
     pieces: PieceWriter,
+    /// The text index and the lists of rows of each piece. Every piece enters
+    /// the part through `intern` and every rope is written by `write_rows`, so
+    /// they are fed from there for flushes and merges alike.
+    text: TextWriter,
     cuts: Vec<Range<usize>>,
     ids: Vec<u32>,
     rope: Vec<u8>,
+    row_pieces: Vec<u32>,
 }
 
 impl PayloadSink {
@@ -790,10 +845,42 @@ impl PayloadSink {
                     dedup_window_bytes: options.dedup_window_bytes,
                 },
             )?,
+            text: TextWriter::create(
+                dir,
+                options.text_index_budget_bytes,
+                options.row_list_budget_bytes,
+            )?,
             cuts: Vec::new(),
             ids: Vec::new(),
             rope: Vec::new(),
+            row_pieces: Vec::new(),
         })
+    }
+
+    /// Notes the pieces every row of a batch of ropes refers to, `first_row`
+    /// being the part's row number of the batch's first row.
+    fn note_rows(&mut self, batch: &RecordBatch, first_row: u64) -> Result<()> {
+        let schema = batch.schema();
+        let mut columns = Vec::with_capacity(RAW_COLUMNS.len());
+        for (name, _) in RAW_COLUMNS {
+            let at = schema.index_of(name).map_err(Error::other)?;
+            columns.push(batch.column(at).as_binary::<i64>());
+        }
+        for row in 0..batch.num_rows() {
+            self.row_pieces.clear();
+            for column in &columns {
+                if column.is_null(row) {
+                    continue;
+                }
+                for id in rope::piece_ids(column.value(row)) {
+                    self.row_pieces
+                        .push(id.map_err(|e| Error::other(format!("a rope is malformed: {e:?}")))?);
+                }
+            }
+            self.text
+                .add_row(first_row + row as u64, &mut self.row_pieces)?;
+        }
+        Ok(())
     }
 
     /// The batch with `attrs`, `events` and `links` replaced by their ropes.
@@ -826,10 +913,11 @@ impl PayloadSink {
             return Ok(self.pieces.find_unreferenced(bytes));
         }
         let added = self.pieces.add_piece_unreferenced(bytes)?;
-        if added.new
-            && let Some(observer) = &self.observer
-        {
-            observer.piece_stored(added.id, bytes);
+        if added.new {
+            self.text.add_piece(added.id, bytes)?;
+            if let Some(observer) = &self.observer {
+                observer.piece_stored(added.id, bytes);
+            }
         }
         Ok(Some(added.id))
     }

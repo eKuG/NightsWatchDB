@@ -12,6 +12,7 @@ rust-version.workspace = true
 nwdb-core = { path = "../core" }
 nwdb-wal = { path = "../wal" }
 nwdb-segment = { path = "../segment" }
+nwdb-textindex = { path = "../textindex" }
 nwdb-manifest = { path = "../manifest" }
 arrow-array.workspace = true
 arrow-schema.workspace = true

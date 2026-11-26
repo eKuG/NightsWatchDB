@@ -17,10 +17,13 @@ contiguous read.
   exactly what was written.
 - `merge_parts` writes one part from several, without rebuilding their text
   (see [Merging](#merging)).
+- Every part carries a full-text index of its pieces and, for each piece, the
+  rows that refer to it; `PartReader::search` answers a text query with the
+  rows that match (see [Text search](#text-search)).
 
 ## Files of a part
 
-All integers are little-endian. A part directory holds exactly these five
+All integers are little-endian. A part directory holds exactly these seven
 files.
 
 ### `spans.parquet`
@@ -99,6 +102,51 @@ magic, version and checksum, and exact de-duplication within a window of recent
 blocks. Both files exist in every part; a part with no pieces has an empty
 `pieces.blk` and a header-only `pieces.idx`.
 
+### `text.idx` and `text.rows`
+
+The text of a part is searched through two files, both written by the part
+writer while it writes the part, so that a flush and a merge produce them in
+the same way (there is one implementation, in `src/text.rs`, fed from the one
+path every piece and every rope of a part passes).
+
+- `text.idx` is an `nwdb_textindex` index (format described in that crate's
+  README) with **one document per piece** of the part's piece store, the
+  document id being the piece id. A message that a thousand calls repeat is one
+  piece and is tokenised once. Each new piece is added to an `IndexBuilder`
+  when the piece is first stored (the same moment `WriterOptions::piece_observer`
+  hears of it, in the order of the ids). The builder closes a segment when its
+  open postings pass `WriterOptions::text_index_budget_bytes` (default 32 MiB,
+  at least 1 MiB), so its memory does not grow with the part.
+- `text.rows` is an `nwdb_textindex` id-list file with one key per piece id,
+  dense from 0 to the number of pieces minus one: the key's list is the
+  **ascending numbers of the rows** whose `attrs`, `events` or `links` refer to
+  the piece (a row that refers to a piece twice, or from two columns, lists it
+  once; a piece that no row refers to has an empty list). Row numbers are
+  `u32`: a part of more than 4,294,967,295 rows is refused by the writer.
+
+The `(piece, row)` pairs are collected from the ropes of every batch as it is
+written. They are kept in memory up to `WriterOptions::row_list_budget_bytes`
+(default 32 MiB, 8 bytes a pair), then sorted and written to a run file,
+`text.rows.runN`, in the part's temporary directory; when the part is finished
+the runs and the pairs still in memory are merged into `text.rows` and the run
+files are deleted before the directory is renamed. The result does not depend
+on the budget (a test builds a part with a 16 byte budget and a part with the
+default and compares the two files byte for byte). Memory while merging is one
+read buffer for each run (the budget divided between the runs, 4 to 64 KiB
+each) and the list of the piece being written, which is as long as the number of
+rows that refer to it (4 bytes a row: a system prompt shared by ten million
+rows is a 40 MB list).
+
+**What is not indexed, by design.** Only text that is in a piece is searchable.
+Text that stays inline in a row is not: a cut shorter than
+`WriterOptions::min_piece_bytes` (values under 8 bytes), a value the splitter
+does not cut (for the OTLP splitter: attribute values under 256 bytes that are
+not under a content key, and everything in a column the splitter does not
+read), and text stored after the part held `WriterOptions::max_pieces` pieces
+(the piece ceiling of a part; pieces that exist can still be referenced).
+Keys, names, ids and the promoted columns (`name`, `service_name`, models and
+the rest) are not text of pieces either; they are columns of the span row.
+
 ### Dictionary columns in Parquet
 
 What the Parquet library (60.2.0) does with them. `tests/dictionaries.rs`
@@ -142,7 +190,7 @@ them; a test pins this for 1 MiB values.
 ```
 offset  size   field
 0       4      magic "NWTI"
-4       4      version, u32 = 5, the part format version
+4       4      version, u32 = 6, the part format version
 8       8      trace count N, u64
 16      8      length of spans.parquet in bytes, u64
 24      4      CRC-32C of every byte of spans.parquet, u32
@@ -152,26 +200,31 @@ offset  size   field
 48      4      CRC-32C of every byte of pieces.blk, u32
 52      8      length of pieces.idx in bytes, u64
 60      4      CRC-32C of every byte of pieces.idx but its last four, u32
-64      44*N   records, sorted by trace_id (bytes compared in order)
-64+44N  4      CRC-32C (Castagnoli) of every byte before it
+64      8      length of text.idx in bytes, u64
+72      4      CRC-32C of every byte of text.idx, u32
+76      8      length of text.rows in bytes, u64
+84      4      CRC-32C of every byte of text.rows, u32
+88      44*N   records, sorted by trace_id (bytes compared in order)
+88+44N  4      CRC-32C (Castagnoli) of every byte before it
 ```
 
 The version is the first thing checked when a part is opened, before the
 lengths, the checksum or the Parquet schema. An index with any other version
 is refused with an error that gives the version the part has and the one this
 build reads, and says that parts from development versions cannot be read.
-Versions 2 and 3 had shorter headers, and version 4 ropes have no checksum;
-there is no migration, since the project has had no release.
+Versions 2 and 3 had shorter headers, version 4 ropes have no checksum, and
+version 5 has no text files; there is no migration, since the project has had no
+release.
 
 Parquet 60.2.0 writes no page checksums and zstd's frame checksum is off, so
 damage that leaves the file structure intact would otherwise be returned as
 data. The writer therefore keeps a running length and CRC-32C of everything
-it writes to each Parquet file and to the two piece files and records them
-here, once the files are complete (the piece store and the summary are written
-before the index). `PartReader::open` checks the lengths, and the CRC-32C of
-`pieces.idx`, which it reads in full anyway and which holds the checksum of every
-block; `PartReader::verify` checks the other CRCs, every block of the piece
-store and every rope.
+it writes to each Parquet file, to the two piece files and to the two text
+files and records them here, once the files are complete (the piece store, the
+text files and the summary are written before the index). `PartReader::open`
+checks the lengths, and the CRC-32C of `pieces.idx`, which it reads in full
+anyway and which holds the checksum of every block; `PartReader::verify` checks
+the other CRCs, every block of the piece store, both text files and every rope.
 
 The checksum recorded for `pieces.idx` leaves out the file's last four bytes.
 They are the file's own CRC-32C, and the CRC-32C of a message with its CRC-32C
@@ -205,8 +258,11 @@ listing reads only the groups that overlap the range.
 ## Reading
 
 `PartReader::open` fails with `Error::Corrupt`, naming the file, when a file is
-missing, `traces.idx` fails a check, the length of a file differs from the one
-recorded in the index, `pieces.idx` fails its own checks (magic, version,
+missing, `traces.idx` fails a check, the length of a file (any of the seven)
+differs from the one recorded in the index, `text.idx` or `text.rows` fails the
+open checks of its own format (footer, directory, group index) or does not
+cover exactly the part's pieces (a different number of documents or of lists
+than `pieces.idx` has pieces), `pieces.idx` fails its own checks (magic, version,
 checksum, tables that do not fill the blocks), a Parquet file does not have the
 expected columns, the index's ranges do not match the number of rows, or the
 summary's row count differs from the trace count. The two piece files are
@@ -217,9 +273,11 @@ block, so this binds the blocks to the part: the piece files of another part are
 refused at open, even with equal lengths, naming `pieces.idx`. Open does not
 read the data pages or the blocks of the piece store.
 
-- `PartReader::verify` re-reads all four data files and compares their length
+- `PartReader::verify` re-reads all six data files and compares their length
   and CRC-32C with the recorded values (`Corrupt` naming the file on a
-  mismatch), reads every block of the piece store, and then walks every rope of
+  mismatch), reads every block of the piece store, checks every segment of
+  `text.idx` (the CRC-32C of `text.rows` covers its lists), and
+  then walks every rope of
   every row against the store: each must be well formed, name pieces that exist,
   rebuild to the checksum it carries, and together the ropes must refer to
   exactly the bytes of pieces that `pieces.idx` records. It is the read path
@@ -306,6 +364,61 @@ read the data pages or the blocks of the piece store.
 - A projection returns the requested columns in the requested order; an
   unknown or repeated column is `Error::InvalidArgument`.
 
+## Text search
+
+```rust
+let rows = reader.search(&nwdb_textindex::parse("error \"rate limit\" -retry*")?,
+                         &SearchLimits::default())?;
+```
+
+`PartReader::search(&Query, &SearchLimits) -> Result<Vec<u32>>` returns the
+ascending rows whose text matches. A row's text is the union of the pieces its
+raw columns refer to:
+
+- A word (or a prefix) matches a row if **any** piece of the row has it.
+- A phrase must lie **inside one piece**.
+- `AND`, `OR` and `NOT` combine **sets of rows**, not of pieces: the two words
+  of an `AND` may be in different messages of one span, and `-x` is every row
+  of the part without a piece that has `x` (rows with no pieces included).
+
+For each leaf of the query the index gives candidate pieces. Where the library
+says the index alone cannot decide (a phrase; a word of more than 64 bytes),
+each candidate piece is read once, in the order of its blocks
+(`PieceReader::read_sorted`), and checked with `phrase_matches` /
+`contains_token`. The confirmed pieces become rows through `text.rows` and are
+united. Then `nwdb_textindex::evaluate` combines the leaves. The set of all
+rows is built only when the query contains a `NOT`.
+
+One query cannot hold a reader hostage. `SearchLimits` bounds, and a query over
+a bound is `Error::InvalidArgument` saying which (the reader is unharmed):
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `max_prefix_terms` | 1,024 | the terms a prefix may expand to |
+| `max_confirm_bytes` | 256 MiB | the bytes of piece text read to confirm phrases and long words, over the whole query (a piece counts once per leaf that reads it) |
+| `max_leaf_rows` | 10 million | the rows one leaf may produce; for a query with a `NOT`, also the rows the part may have, since the universe is built |
+
+The rows of a leaf are collected and sorted when they pass twice the limit, so
+memory is about twice the limit in row numbers (80 MB at the default) however
+many pieces match. A test pins the memory of a query over 300,000 matching
+pieces with a limit of 100,000 rows, in a child process (4 MiB of growth).
+
+A reader is shared by threads and holds no mutable state for a search. A damaged
+`text.idx` or `text.rows` is `Corrupt` naming the file: the segments of the index
+are checksummed the first time they are used, each group of `text.rows` every time
+it is read, and a row number outside the part is refused. A search never returns
+a wrong answer because of damage: a test damages every byte of the ends of both
+files and a sample of the rest (truncation, extension, flipped bits) and
+requires `Corrupt` from `open`, `verify` or the search, and the right rows
+from any search that succeeds. Text files of another part are caught by their
+recorded lengths and, at open, by their counts of documents and lists; with equal
+counts only `verify` catches them (its whole-file CRC-32C).
+
+`PartReader::text_stats()` reports the sizes of the two files and what they
+cover. `PartReader::max_start_ns()` is the largest maximum in the statistics of
+the `start_ns` column of the row groups, an upper bound for the walk of
+`nwdb-engine`'s search over parts.
+
 ## Writing
 
 Traces must arrive contiguously, though a trace may continue across batches,
@@ -321,7 +434,9 @@ for pieces under 16 KiB), plus 44 bytes of index entry, a trace summary, and a
 16-byte finished-id entry per trace. It does not grow with the amount of unique
 text: a test writes 120 MiB of text that never repeats through a 4 MiB window
 and shows the peak resident memory stays within a few MiB of what 24 MiB of such
-text took, and another that 3.5 million pieces of 12 bytes raise it by 6 MiB over
+text took (with the text index and the row lists at 1 MiB; at their defaults
+each adds up to its budget, 32 MiB, to the peak of a part being written), and
+another that 3.5 million pieces of 12 bytes raise it by 6 MiB over
 what 0.7 million took (27 and 33 MiB; before, with 16 bytes a piece for the life
 of the part, 37 and 101 MiB). A part with no rows is refused, `window_ns` must be positive
 (`InvalidArgument`), and dropping an unfinished writer removes its temporary
@@ -402,9 +517,13 @@ How it works:
   batches are merged by value), summary and index and file checksums. The
   writer takes batches whose raw columns already are ropes
   (`PartWriter::write_stored`, crate private); everything else is the code of a
-  flush, and a flush's output did not change. The format version stays 5: a
-  merged part is an ordinary part, and `PieceObserver` hears of the output's
-  pieces exactly as on a flush.
+  flush, and a flush's output did not change. The format version does not
+  depend on how a part was made: a merged part is an ordinary part, its text
+  index and row lists are built by the writer from the pieces and ropes it is
+  given exactly as on a flush (a test merges parts and requires every search to
+  give the rows, by trace id and span id, that the same search gives over the
+  inputs), and `PieceObserver` hears of the output's pieces exactly as on a
+  flush.
 - **Chunks.** The distinct traces of all inputs are ordered first (24 bytes
   each; the inputs' indexes are sorted by trace id, so this is a merge of
   sorted lists). Then traces are taken in output order into a chunk until the
@@ -472,17 +591,20 @@ prompt and tools in each part, conversations that grow across them) became
 
 ## Format version
 
-`FORMAT_VERSION` (5) is recorded in `PartMeta.format_version`, which the
+`FORMAT_VERSION` (6) is recorded in `PartMeta.format_version`, which the
 manifest stores for every part, and in the header of `traces.idx`. The engine
 checks the manifest's value and `PartReader::open` the index's, both before
 looking at any Parquet file. It covers the columns of `spans.parquet` and
 `summary.parquet`, their types and order, the meaning of the raw encodings
 inside them (`attrs`, `events`, `links`, `resource`, `scope`), and the layout of
-`traces.idx`. It must be raised on any change to those. A part with another
+`traces.idx`, and the formats of `text.idx` and `text.rows`. It must be raised
+on any change to those. A part with another
 version is refused; there is no migration. History: 2 added the file lengths
 and checksums to the index; 3 made the seven origin columns dictionary
 columns; 4 stores `attrs`, `events` and `links` as ropes, adds `pieces.blk` and
 `pieces.idx`, and records their lengths and checksums in the index header; 5
 adds the CRC-32C of the rebuilt value to every rope that has a reference (the
 rope tag `0x03` is followed by 4 bytes of checksum), and makes `open` compare the
-CRC-32C of `pieces.idx` with the one in the index.
+CRC-32C of `pieces.idx` with the one in the index; 6 adds the text index and the
+piece-to-rows lists, `text.idx` and `text.rows`, and records their lengths and
+checksums in the index header (the header grows from 64 to 88 bytes).

@@ -154,7 +154,16 @@ fn a_store_with_fewer_pieces_is_an_error_not_other_text() {
     drop(original);
     install(&part, scratch.path(), &sum);
 
-    let reader = PartReader::open(&part).unwrap();
+    // The text index was built for the part's own eight pieces, so open
+    // already notices that the store is not the one it was made for.
+    let reader = match PartReader::open(&part) {
+        Err(e) => {
+            let m = corrupt(e);
+            assert!(m.contains("pieces"), "{m}");
+            return;
+        }
+        Ok(r) => r,
+    };
     let m = corrupt(reader.read_trace(TraceId([1; 16]), None).unwrap_err());
     assert!(m.contains("piece"), "{m}");
     corrupt(reader.verify().unwrap_err());

@@ -82,11 +82,13 @@ pub struct ListStats {
 /// should not be held longer than needed.
 #[derive(Clone)]
 pub struct Snapshot {
-    vis: Visible,
+    pub(crate) vis: Visible,
     limits: BatchLimits,
+    /// The log position the parts of `vis` cover.
+    flushed_lsn: u64,
 }
 
-fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
+pub(crate) fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> Result<&'a T> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<T>())
@@ -217,8 +219,18 @@ impl Cursor {
 }
 
 impl Snapshot {
-    pub(crate) fn new(vis: Visible, limits: BatchLimits) -> Self {
-        Self { vis, limits }
+    pub(crate) fn new(vis: Visible, limits: BatchLimits, flushed_lsn: u64) -> Self {
+        Self {
+            vis,
+            limits,
+            flushed_lsn,
+        }
+    }
+
+    /// The highest log position whose data is in the parts of this snapshot:
+    /// what [`search`](Self::search) covers.
+    pub fn searched_through_lsn(&self) -> u64 {
+        self.flushed_lsn
     }
 
     fn buffer(&self) -> impl Iterator<Item = &Arc<RecordBatch>> {

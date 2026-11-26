@@ -366,7 +366,15 @@ fn agent_shaped_traces_shrink_and_read_back_identical() {
     let split = write_part(tmp.path(), 2, &rows, 16, with_splitter(Chunks(256)));
     assert_reads_back(&part_dir(tmp.path(), 2), &rows);
 
-    let total = |m: &nwdb_core::PartMeta| m.files.values().sum::<u64>();
+    // The text index and the row lists are not part of what sharing text
+    // saves; `search.rs` measures them.
+    let total = |m: &nwdb_core::PartMeta| {
+        m.files
+            .iter()
+            .filter(|(name, _)| !name.starts_with("text."))
+            .map(|(_, size)| size)
+            .sum::<u64>()
+    };
     let p = split.payload;
     eprintln!(
         "agent data: logical {} unique {} stored {} pieces {}; part {} bytes, without the store {}",
@@ -402,7 +410,15 @@ fn low_repetition_text_costs_only_a_few_percent() {
     let plain = write_part(tmp.path(), 1, &rows, 50, WriterOptions::default());
     let split = write_part(tmp.path(), 2, &rows, 50, with_splitter(Chunks(256)));
     assert_reads_back(&part_dir(tmp.path(), 2), &rows);
-    let total = |m: &nwdb_core::PartMeta| m.files.values().sum::<u64>();
+    // The text index and the row lists are not part of what sharing text
+    // saves; `search.rs` measures them.
+    let total = |m: &nwdb_core::PartMeta| {
+        m.files
+            .iter()
+            .filter(|(name, _)| !name.starts_with("text."))
+            .map(|(_, size)| size)
+            .sum::<u64>()
+    };
     eprintln!(
         "low repetition: logical {} unique {} stored {}; part {} bytes, without the store {} ({:.3})",
         split.payload.logical_bytes,

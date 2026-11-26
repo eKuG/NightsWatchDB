@@ -1,7 +1,9 @@
 #!/bin/sh
 # End-to-end check of the container image: load generated traces over OTLP
 # gRPC, then check the data through the HTTP API after a normal run, after
-# the server is killed with SIGKILL and after a clean stop with SIGTERM.
+# the server is killed with SIGKILL and after a clean stop with SIGTERM. A
+# word and a two-word phrase taken from the text of a stored trace must find
+# that trace in a search, in each of the three states.
 # Everything it creates (containers, network, volume) is removed on exit; the
 # two images stay. See scripts/README.md.
 set -eu
@@ -64,6 +66,53 @@ check() {
   echo "ok: $label: $got spans, $n traces opened"
 }
 
+# Takes a word and a two-word phrase from the text of a stored trace, read
+# through the API: the first run of base64 characters after a "content" key of
+# a message (the generator's text is base64, and the API returns a message as
+# an escaped JSON string). The first time it finds them it keeps them in
+# SEARCH_ID, SEARCH_WORD and SEARCH_PHRASE, and later calls reuse them.
+pick_search_text() {
+  [ -z "${SEARCH_ID:-}" ] || return 0
+  list=$(curl -fsS "http://$API/api/v1/traces?$RANGE&limit=50")
+  for id in $(printf '%s' "$list" | grep -o '"trace_id":"[0-9a-f]*"' | cut -d'"' -f4); do
+    run=$(curl -fsS "http://$API/api/v1/traces/$id" |
+      grep -o 'content\\":\\"[A-Za-z0-9+/]\{40,\}' | head -n 1 | sed 's/.*\\"//')
+    [ -n "$run" ] || continue
+    tokens=$(printf '%s' "$run" | tr '+/' '\n\n')
+    word=$(printf '%s\n' "$tokens" | awk 'length($0) >= 6 {print; exit}')
+    phrase=$(printf '%s\n' "$tokens" |
+      awk 'NF {n++; t[n] = $0; if (n == 2) {print t[1] "%20" t[2]; exit}} !NF {n = 0}')
+    if [ -n "$word" ] && [ -n "$phrase" ]; then
+      SEARCH_ID=$id SEARCH_WORD=$word SEARCH_PHRASE=$phrase
+      echo "searching trace $id for the word $word and the phrase $phrase"
+      return 0
+    fi
+  done
+  fail "no listed trace has message text to search for"
+}
+
+# Waits until a search for $2 returns trace $SEARCH_ID. Search covers only
+# flushed parts, so after a load or a kill the data becomes searchable at the
+# next flush, within 30 seconds.
+wait_for_hit() {
+  label=$1
+  i=0
+  until curl -fsS "http://$API/api/v1/search?$RANGE&limit=1000&q=$2" |
+    grep -q "\"trace_id\":\"$SEARCH_ID\""; do
+    i=$((i + 1))
+    [ "$i" -le 150 ] || fail "$label: a search for $3 did not return trace $SEARCH_ID"
+    sleep 1
+  done
+}
+
+check_search() {
+  label=$1
+  pick_search_text
+  wait_for_hit "$label" "$SEARCH_WORD" "the word $SEARCH_WORD"
+  wait_for_hit "$label" "%22$SEARCH_PHRASE%22" "the phrase $SEARCH_PHRASE"
+  echo "ok: $label: a word and a phrase of trace $SEARCH_ID are found by search"
+}
+
 echo "== building images"
 docker build -q -t "$SERVER_IMAGE" "$ROOT" >/dev/null
 docker build -q -t "$GEN_IMAGE" "$ROOT/bench/tracegen" >/dev/null
@@ -88,12 +137,14 @@ SPANS=$(grep '^  "spans":' "$OUT/gen.json" | tr -dc '0-9\n' | awk '{s += $1} END
 [ "$(grep -c '^  "spans":' "$OUT/gen.json")" = 2 ] || fail "expected two generator summaries"
 echo "generator sent $SPANS spans"
 check "after load"
+check_search "after load"
 
 echo "== kill -9 and restart"
 docker kill -s KILL "$SERVER" >/dev/null
 docker rm "$SERVER" >/dev/null
 start_server
 check "after SIGKILL"
+check_search "after SIGKILL"
 
 echo "== SIGTERM and restart"
 docker stop "$SERVER" >/dev/null
@@ -102,6 +153,7 @@ code=$(docker inspect -f '{{.State.ExitCode}}' "$SERVER")
 docker rm "$SERVER" >/dev/null
 start_server
 check "after SIGTERM"
+check_search "after SIGTERM"
 parts=$(curl -fsS "http://$API/api/v1/stats" | grep -o '"parts":[0-9]*' | cut -d: -f2)
 [ "${parts:-0}" -gt 0 ] || fail "no parts after a clean shutdown"
 echo "ok: $parts parts after the clean shutdown"

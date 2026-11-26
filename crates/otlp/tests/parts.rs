@@ -205,7 +205,15 @@ fn agent_traces_read_back_identical_and_shrink() {
     assert_identical(&tmp.path().join(part_dir_name(1)), &batches);
     assert_identical(&tmp.path().join(part_dir_name(2)), &batches);
 
-    let total = |m: &PartMeta| m.files.values().sum::<u64>();
+    // Without the text index and the row lists, which are not what sharing
+    // text saves.
+    let total = |m: &PartMeta| {
+        m.files
+            .iter()
+            .filter(|(name, _)| !name.starts_with("text."))
+            .map(|(_, size)| size)
+            .sum::<u64>()
+    };
     let p = split.payload;
     eprintln!(
         "OTLP agent data: logical {} unique {} stored {} pieces {} => unique/logical {:.4}, \

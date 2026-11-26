@@ -227,6 +227,8 @@ impl Inner {
                     WriterOptions {
                         splitter: self.opts.splitter.clone(),
                         dedup_window_bytes: self.opts.dedup_window_bytes,
+                        text_index_budget_bytes: self.opts.text_index_budget_bytes,
+                        row_list_budget_bytes: self.opts.row_list_budget_bytes,
                         ..WriterOptions::default()
                     },
                 )?;

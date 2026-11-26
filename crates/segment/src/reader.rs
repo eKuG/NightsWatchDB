@@ -30,6 +30,7 @@
 //! error.
 
 use crate::index::{self, FileChecksum, FileChecksums, INDEX_FILE, TraceEntry};
+use crate::search::TextFiles;
 use crate::writer::row_value_bytes;
 use crate::{PIECES_BLK, PIECES_IDX, SPANS_FILE, SUMMARY_FILE};
 use arrow_array::cast::AsArray;
@@ -1052,6 +1053,7 @@ pub struct PartReader {
     spans: Arc<Table>,
     summary: Arc<Table>,
     store: Arc<PieceReader>,
+    pub(crate) text: TextFiles,
 }
 
 impl PartReader {
@@ -1092,6 +1094,7 @@ impl PartReader {
             sum(checksums.pieces_idx),
         )?);
         spans.store = Some(store.clone());
+        let text = TextFiles::open(dir, &checksums, store.totals().pieces)?;
 
         check_ranges(&entries, spans.rows())?;
         if summary.rows() != entries.len() as u64 {
@@ -1111,6 +1114,7 @@ impl PartReader {
             spans: Arc::new(spans),
             summary: Arc::new(summary),
             store,
+            text,
         })
     }
 
@@ -1151,6 +1155,7 @@ impl PartReader {
     /// should.
     pub fn verify(&self) -> Result<()> {
         self.verify_files()?;
+        self.verify_text()?;
         self.spans.verify_ropes()
     }
 
@@ -1212,6 +1217,15 @@ impl PartReader {
     /// Number of row groups in `spans.parquet`.
     pub fn row_group_count(&self) -> usize {
         self.spans.row_group_count()
+    }
+
+    /// An upper bound on the `start_ns` of every span of the part: the largest
+    /// maximum in the statistics of the row groups of `spans.parquet`
+    /// (`i64::MAX` if a group records none). It reads no data page.
+    pub fn max_start_ns(&self) -> Result<i64> {
+        (0..self.spans.row_group_count()).try_fold(i64::MIN, |most, group| {
+            Ok(most.max(self.spans.max_of(col::START_NS, group)?))
+        })
     }
 
     /// Number of row groups in `summary.parquet`.
