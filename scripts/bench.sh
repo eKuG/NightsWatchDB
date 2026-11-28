@@ -16,6 +16,12 @@
 # running and no time window has more than one part, and records how long that
 # took and the CPU the server used meanwhile. BENCH_NO_COMPACTION=1 runs the
 # server without compaction (and skips the wait) to measure what it saves.
+# After the queries, querybench writes annotations (10% of the traces get a
+# score) and times the queries that use them. The script then waits for
+# compaction once more, and records the annotation counts, the time until they
+# were in parts, the time until compaction settled, the annotation parts and
+# bytes and the size of the volume. BENCH_NO_ANNOTATIONS=1 skips all of that,
+# for a server that has no annotations.
 # BENCH_CORPUS_DIR is the host directory the corpus volume is filled from
 # (default .data/corpus).
 set -eu
@@ -69,6 +75,7 @@ QB_WARMUP=${BENCH_WARMUP:-20}
 QB_CONC=${BENCH_CONCURRENCY:-1}
 QUIET=${BENCH_COMPACTION_QUIET:-5s}
 NO_COMPACTION=${BENCH_NO_COMPACTION:-0}
+NO_ANNOTATIONS=${BENCH_NO_ANNOTATIONS:-0}
 COMPACT_TIMEOUT=${BENCH_COMPACTION_TIMEOUT:-3600}
 CORPUS_DIR=${BENCH_CORPUS_DIR:-$ROOT/.data/corpus}
 
@@ -203,6 +210,22 @@ server_spans() {
     grep -o '"count":[0-9]*' | cut -d: -f2 | awk '{s += $1} END {print s + 0}'
 }
 stat_field() { curl -fsS "http://$API/api/v1/stats" | grep -o "\"$1\":[0-9]*" | cut -d: -f2; }
+# A stats number that must be there (the annotation fields are not, on an old server).
+need_stat() {
+  v=$(stat_field "$1")
+  [ -n "$v" ] || fail "/api/v1/stats has no number $1: $(curl -fsS "http://$API/api/v1/stats")"
+  echo "$v"
+}
+# Sizes of the data directories of the volume, one "name bytes" line each, to $1.
+# The helper only reads, so it also works while the server runs.
+du_volume() {
+  docker run --rm -v "$NAME":/data:ro "$TOOLS" sh -c '
+    cd /data
+    for d in parts wal manifest; do echo "$d $(du -sb "$d" | cut -f1)"; done
+    echo "total $(du -sb . | cut -f1)"
+    echo "files $(find parts -type f | wc -l)"
+  ' > "$1"
+}
 
 # Waits until the buffer is flushed, no merge is running and no window has more
 # than one part (two polls in a row), then sets SETTLE_S to how long that took
@@ -277,13 +300,8 @@ CODE=$(docker inspect -f '{{.State.ExitCode}}' "$SERVER")
 [ "$CODE" = 0 ] || fail "the server exited with code $CODE after SIGTERM, expected 0"
 # Measured with the server stopped: the stop has flushed the log into parts, so
 # the split shows the finished layout and not a write in progress.
-docker run --rm -v "$NAME":/data:ro "$TOOLS" sh -c '
-  cd /data
-  for d in parts wal manifest; do echo "$d $(du -sb "$d" | cut -f1)"; done
-  echo "total $(du -sb . | cut -f1)"
-  echo "files $(find parts -type f | wc -l)"
-' > "$TMP/du.txt"
-du_of() { awk -v k="$1" '$1 == k {print $2}' "$TMP/du.txt"; }
+du_volume "$TMP/du.txt"
+du_of() { awk -v k="$1" '$1 == k {print $2}' "${2:-$TMP/du.txt}"; }
 PARTS_B=$(du_of parts); WAL_B=$(du_of wal); MANIFEST_B=$(du_of manifest); TOTAL_B=$(du_of total)
 restart_timed
 CLEAN_MS=$RESTART_MS
@@ -304,10 +322,54 @@ PEAK_START=$(mem_peak)
 
 echo "== queries ($QB_N per kind, $QB_WARMUP warm-up, concurrency $QB_CONC)" >&2
 docker run --rm --network "$NAME" "$QB_IMG" -addr "$SERVER:4320" -n "$QB_N" -warmup "$QB_WARMUP" \
-  -concurrency "$QB_CONC" > "$OUT/querybench.json" || fail "querybench failed"
+  -concurrency "$QB_CONC" -annotate="$([ "$NO_ANNOTATIONS" = 1 ] && echo false || echo true)" > "$OUT/querybench.json" || fail "querybench failed"
 PEAK_QUERY=$(mem_peak)
 QB_SPANS=$(grep -o '"server_span_count":[0-9]*' "$OUT/querybench.json" | cut -d: -f2)
 [ "$QB_SPANS" = "$TOTAL_SPANS" ] || fail "querybench saw $QB_SPANS spans, expected $TOTAL_SPANS"
+
+# querybench printed its annotation step on one line starting with "annotation":
+# (null when it was skipped).
+ANN_ENABLED=false
+if grep -q '^"annotation":{' "$OUT/querybench.json"; then ANN_ENABLED=true; fi
+ann_num() { grep '^"annotation":' "$OUT/querybench.json" | grep -o "\"$1\":[0-9.]*" | head -n 1 | cut -d: -f2; }
+if [ "$ANN_ENABLED" = true ]; then
+  ANN_SENT=$(ann_num sent); ANN_ACCEPTED=$(ann_num accepted); ANN_REJECTED=$(ann_num rejected)
+  ANN_POST_S=$(ann_num seconds); ANN_PER_S=$(ann_num per_s); ANN_FLUSH_S=$(ann_num flush_wait_s)
+  ANN_PARTS_FLUSH=$(ann_num annotation_parts); ANN_BYTES_FLUSH=$(ann_num annotation_bytes)
+  [ -n "$ANN_SENT" ] && [ -n "$ANN_PER_S" ] && [ -n "$ANN_FLUSH_S" ] && [ -n "$ANN_BYTES_FLUSH" ] ||
+    fail "could not read the annotation step of querybench.json"
+  [ "$ANN_REJECTED" = 0 ] && [ "$ANN_ACCEPTED" = "$ANN_SENT" ] ||
+    fail "querybench sent $ANN_SENT annotations, the server accepted $ANN_ACCEPTED and rejected $ANN_REJECTED"
+  if [ "$NO_COMPACTION" = 1 ]; then
+    echo "== compaction is off, not waiting after the annotations" >&2
+    ANN_SETTLE_S=0
+  else
+    echo "== waiting for compaction to settle after the annotations" >&2
+    LOAD_SETTLE_S=$SETTLE_S
+    wait_compaction
+    ANN_SETTLE_S=$SETTLE_S; SETTLE_S=$LOAD_SETTLE_S
+  fi
+  ANN_PARTS_SETTLED=$(need_stat annotation_parts); ANN_BYTES_SETTLED=$(need_stat annotation_bytes)
+  ANN_BUFFERED=$(need_stat annotations_buffered)
+  [ "$ANN_BUFFERED" = 0 ] || fail "$ANN_BUFFERED annotations are buffered after the wait"
+  ANN_BYTES_PER=$(awk -v b="$ANN_BYTES_SETTLED" -v n="$ANN_ACCEPTED" 'BEGIN {printf "%.1f", b / n}')
+  # The volume again, with the server running. Unlike the first measurement it
+  # also holds the crash batch and whatever the log has not yet been folded
+  # into parts.
+  du_volume "$TMP/du2.txt"
+  TOTAL_B2=$(du_of total "$TMP/du2.txt"); PARTS_B2=$(du_of parts "$TMP/du2.txt"); WAL_B2=$(du_of wal "$TMP/du2.txt")
+  ANN_JSON=$(cat <<ANN
+{"sent": $ANN_SENT, "accepted": $ANN_ACCEPTED, "rejected": $ANN_REJECTED, "post_s": $ANN_POST_S, "per_s": $ANN_PER_S,
+    "in_parts_after_s": $ANN_FLUSH_S, "settle_after_s": $ANN_SETTLE_S,
+    "annotation_parts_after_flush": $ANN_PARTS_FLUSH, "annotation_bytes_after_flush": $ANN_BYTES_FLUSH,
+    "annotation_parts_settled": $ANN_PARTS_SETTLED, "annotation_bytes_settled": $ANN_BYTES_SETTLED,
+    "bytes_per_annotation": $ANN_BYTES_PER,
+    "volume_after": {"total_bytes": $TOTAL_B2, "parts_bytes": $PARTS_B2, "wal_bytes": $WAL_B2, "measured_with_server_running": true}}
+ANN
+)
+else
+  ANN_JSON=null
+fi
 
 # --- results -----------------------------------------------------------------
 
@@ -361,6 +423,7 @@ cat > "$OUT/result.json" <<EOF
     "parts": $PARTS, "bytes_per_span": $BYTES_PER_SPAN, "parts_bytes_per_span": $PARTS_PER_SPAN
   },
   "restart": {"clean_ms": $CLEAN_MS, "crash_ms": $CRASH_MS, "crash_batch_spans": $EXTRA_SPANS, "server_peak_memory_after_restarts_bytes": $(nn "$PEAK_START")},
+  "annotations": $ANN_JSON,
   "queries": $(cat "$OUT/querybench.json"),
   "server_peak_memory_after_queries_bytes": $(nn "$PEAK_QUERY")
 }
@@ -403,6 +466,20 @@ mb() { awk -v b="$1" 'BEGIN {if (b == "null" || b == "") print "n/a"; else print
   echo "| Clean restart to /healthz (ms) | $CLEAN_MS |"
   echo "| Crash restart to /healthz (ms), after $EXTRA_SPANS more spans | $CRASH_MS |"
   echo "| Server peak memory since the last start, after queries (MiB) | $(mb "$(nn "$PEAK_QUERY")") |"
+  if [ "$ANN_ENABLED" = true ]; then
+    echo
+    echo "| Annotations (written by querybench after the queries) | |"
+    echo "|---|---|"
+    echo "| Sent / accepted / rejected | $ANN_SENT / $ANN_ACCEPTED / $ANN_REJECTED |"
+    echo "| Annotations per second (requests of 500, one at a time) / seconds | $ANN_PER_S / $ANN_POST_S |"
+    echo "| Seconds until they were in parts / until compaction settled | $ANN_FLUSH_S / $ANN_SETTLE_S |"
+    echo "| Annotation parts after the flush / settled | $ANN_PARTS_FLUSH / $ANN_PARTS_SETTLED |"
+    echo "| Annotation bytes after the flush / settled | $ANN_BYTES_FLUSH / $ANN_BYTES_SETTLED |"
+    echo "| Bytes per annotation (settled) | $ANN_BYTES_PER |"
+    echo "| Volume with the server running, after the annotations: total / parts/ / wal/ (bytes) | $TOTAL_B2 / $PARTS_B2 / $WAL_B2 |"
+    echo
+    echo "The rows annotate_post_500, open_trace_annotated, list_annotated_50, list_annotation_label_50 and list_annotation_value_50 below are measured after the annotations were written; open_trace_after and list_newest_50_after repeat open_trace and list_newest_50 to show what annotations cost the queries that do not ask for them."
+  fi
   echo
   echo "Queries: $QB_N per kind after $QB_WARMUP warm-up, concurrency $QB_CONC, against the restarted server."
   echo
