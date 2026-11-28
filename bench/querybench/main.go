@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -113,6 +114,24 @@ func (c *client) get(path string, q url.Values) ([]byte, error) {
 	}
 	if resp.StatusCode != 200 {
 		return b, fmt.Errorf("%s: status %d", path, resp.StatusCode)
+	}
+	return b, nil
+}
+
+// post sends a JSON body and returns the answer; a status other than 200 is
+// an error, as for get.
+func (c *client) post(path string, body []byte) ([]byte, error) {
+	resp, err := c.http.Post(c.base+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return b, err
+	}
+	if resp.StatusCode != 200 {
+		return b, fmt.Errorf("%s: status %d: %s", path, resp.StatusCode, b)
 	}
 	return b, nil
 }
@@ -387,6 +406,190 @@ func elapsedMs(started, readyNs string) error {
 	return nil
 }
 
+// annotation is one item of the annotations request.
+type annotation struct {
+	TraceID string   `json:"trace_id"`
+	Name    string   `json:"name"`
+	Source  string   `json:"source,omitempty"`
+	Value   *float64 `json:"value,omitempty"`
+	Label   string   `json:"label,omitempty"`
+}
+
+// annotationBody is the request body for a batch of items.
+func annotationBody(items []annotation) ([]byte, error) {
+	return json.Marshal(struct {
+		Annotations []annotation `json:"annotations"`
+	}{items})
+}
+
+// parseAnnotateReply reads the answer to an annotations request.
+func parseAnnotateReply(b []byte) (accepted, rejected int, err error) {
+	var r struct {
+		Accepted *int              `json:"accepted"`
+		Rejected []json.RawMessage `json:"rejected"`
+	}
+	if err = json.Unmarshal(b, &r); err != nil {
+		return
+	}
+	if r.Accepted == nil {
+		return 0, 0, fmt.Errorf("the answer has no accepted count: %s", b)
+	}
+	return *r.Accepted, len(r.Rejected), nil
+}
+
+// frac is the share of n that is selected, at least one item when n > 0.
+func frac(n, den int) int {
+	if n > 0 && n/den == 0 {
+		return 1
+	}
+	return n / den
+}
+
+// buildAnnotations picks, with the seed, 10% of the ids for a quality
+// annotation (value uniform in [0,1), label good from 0.5, else bad) and 1%
+// for a human annotation (label down). The same ids and seed always give the
+// same items. It also returns the ids that got a quality annotation.
+func buildAnnotations(ids []string, seed int64) (items []annotation, annotated []string) {
+	rng := rand.New(rand.NewSource(seed))
+	perm := rng.Perm(len(ids))
+	for _, i := range perm[:frac(len(ids), 10)] {
+		v := rng.Float64()
+		label := "bad"
+		if v >= 0.5 {
+			label = "good"
+		}
+		items = append(items, annotation{TraceID: ids[i], Name: "quality", Source: "bench", Value: &v, Label: label})
+		annotated = append(annotated, ids[i])
+	}
+	for _, i := range perm[:frac(len(ids), 100)] {
+		items = append(items, annotation{TraceID: ids[i], Name: "human", Source: "bench", Label: "down"})
+	}
+	return items, annotated
+}
+
+// annStats are the annotation fields of /api/v1/stats.
+type annStats struct {
+	Buffered, Parts, Bytes, Written, Dropped uint64
+}
+
+// parseAnnStats reads them and fails by name if the server does not report one.
+func parseAnnStats(b []byte) (annStats, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return annStats{}, err
+	}
+	m := map[string]*uint64{}
+	for k, v := range raw { // the other fields are not all numbers
+		var x uint64
+		if json.Unmarshal(v, &x) == nil {
+			m[k] = &x
+		}
+	}
+	var s annStats
+	for _, f := range []struct {
+		name string
+		to   *uint64
+	}{{"annotations_buffered", &s.Buffered}, {"annotation_parts", &s.Parts}, {"annotation_bytes", &s.Bytes}, {"annotations_written", &s.Written}, {"annotations_dropped", &s.Dropped}} {
+		v, ok := m[f.name]
+		if !ok || v == nil {
+			return annStats{}, fmt.Errorf("/api/v1/stats has no field %q: the server is too old for the annotation phase (run with -annotate=false)", f.name)
+		}
+		*f.to = *v
+	}
+	return s, nil
+}
+
+func (c *client) annStats() (annStats, error) {
+	b, err := c.get("/api/v1/stats", nil)
+	if err != nil {
+		return annStats{}, err
+	}
+	return parseAnnStats(b)
+}
+
+// annReport is the annotate step in the output.
+type annReport struct {
+	Sent          int     `json:"sent"`
+	Accepted      int     `json:"accepted"`
+	Rejected      int     `json:"rejected"`
+	Seconds       float64 `json:"seconds"`
+	PerSecond     float64 `json:"per_s"`
+	FlushWaitS    float64 `json:"flush_wait_s"`
+	QualityTraces int     `json:"quality_traces"`
+	Parts         uint64  `json:"annotation_parts"`
+	Bytes         uint64  `json:"annotation_bytes"`
+	Written       uint64  `json:"annotations_written"`
+	Dropped       uint64  `json:"annotations_dropped"`
+	kind          kindResult
+}
+
+// annotate sends the items in requests of `batch`, one at a time, and times
+// each request. Any error or rejected item fails the phase.
+func (c *client) annotate(items []annotation, batch int) (annReport, error) {
+	r := annReport{Sent: len(items), kind: kindResult{Kind: "annotate_post_" + strconv.Itoa(batch)}}
+	var lat []float64
+	t0 := time.Now()
+	for i := 0; i < len(items); i += batch {
+		end := i + batch
+		if end > len(items) {
+			end = len(items)
+		}
+		body, err := annotationBody(items[i:end])
+		if err != nil {
+			return r, err
+		}
+		t := time.Now()
+		b, err := c.post("/api/v1/annotations", body)
+		ms := float64(time.Since(t)) / 1e6
+		r.kind.Bytes += int64(len(b))
+		r.kind.Count++
+		if err != nil {
+			r.kind.Errors++
+			return r, fmt.Errorf("annotate request %d: %w", r.kind.Count, err)
+		}
+		lat = append(lat, ms)
+		acc, rej, err := parseAnnotateReply(b)
+		if err != nil {
+			return r, err
+		}
+		r.Accepted += acc
+		r.Rejected += rej
+		if rej > 0 {
+			return r, fmt.Errorf("annotate request %d: %d items rejected: %s", r.kind.Count, rej, b)
+		}
+	}
+	d := time.Since(t0).Seconds()
+	r.Seconds = math.Round(d*1000) / 1000
+	if d > 0 {
+		r.PerSecond = math.Round(float64(r.Accepted)/d*10) / 10
+	}
+	sort.Float64s(lat)
+	r.kind.P50, r.kind.P95, r.kind.P99 = ms3(percentile(lat, 50)), ms3(percentile(lat, 95)), ms3(percentile(lat, 99))
+	if len(lat) > 0 {
+		r.kind.Max = ms3(lat[len(lat)-1])
+	}
+	return r, nil
+}
+
+// waitFlushed polls the stats until no annotation is left in the memory
+// buffers, and returns how long that took and the stats then.
+func (c *client) waitFlushed(limit time.Duration) (time.Duration, annStats, error) {
+	t0 := time.Now()
+	for {
+		s, err := c.annStats()
+		if err != nil {
+			return 0, s, err
+		}
+		if s.Buffered == 0 {
+			return time.Since(t0), s, nil
+		}
+		if time.Since(t0) > limit {
+			return 0, s, fmt.Errorf("%d annotations still buffered after %s", s.Buffered, limit)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func main() {
 	if err := realMain(); err != nil {
 		fmt.Fprintln(os.Stderr, "querybench:", err)
@@ -406,6 +609,7 @@ func realMain() error {
 	warm := flag.Int("warmup", 20, "unmeasured requests per kind")
 	seed := flag.Int64("seed", 1, "seed for choosing trace ids")
 	conc := flag.Int("concurrency", 1, "requests in flight")
+	annotate := flag.Bool("annotate", true, "after the other kinds, write annotations and time the queries that use them (false for a server without annotations)")
 	wait := flag.String("wait", "", "URL: poll until it answers 200, print the Unix ns of the answer, and exit")
 	elapsed := flag.Bool("elapsed", false, "with two arguments STARTED READY_NS: print the milliseconds between them")
 	flag.Parse()
@@ -502,6 +706,36 @@ func realMain() error {
 	add("search_prefix", search("config*"))
 	add("search_no_hit", search("zqxjkvw"))
 
+	var ann *annReport
+	if *annotate {
+		items, annotated := buildAnnotations(ids, *seed)
+		fmt.Fprintf(os.Stderr, "annotating: %d items on %d traces\n", len(items), len(annotated))
+		r, err := c.annotate(items, 500)
+		if err != nil {
+			return err
+		}
+		r.QualityTraces = len(annotated)
+		kinds = append(kinds, r.kind)
+		wait, st, err := c.waitFlushed(120 * time.Second)
+		if err != nil {
+			return err
+		}
+		r.FlushWaitS = math.Round(wait.Seconds()*10) / 10
+		r.Parts, r.Bytes, r.Written, r.Dropped = st.Parts, st.Bytes, st.Written, st.Dropped
+		ann = &r
+		arng := rand.New(rand.NewSource(*seed + 2))
+		apick := make([]string, *warm+*n)
+		for i := range apick {
+			apick[i] = annotated[arng.Intn(len(annotated))]
+		}
+		add("open_trace_annotated", func(i int) (string, url.Values) { return "/api/v1/traces/" + apick[i], nil })
+		add("list_annotated_50", list(url.Values{"annotation": {"quality"}}))
+		add("list_annotation_label_50", list(url.Values{"annotation": {"human"}, "annotation_label": {"down"}}))
+		add("list_annotation_value_50", list(url.Values{"annotation": {"quality"}, "annotation_min": {"0.999"}}))
+		add("open_trace_after", func(i int) (string, url.Values) { return "/api/v1/traces/" + pick[i], nil })
+		add("list_newest_50_after", list(nil))
+	}
+
 	// One more token query, not timed, gives the number of spans the server
 	// holds in the range, for the caller to compare with what it sent.
 	b, err := c.get(tokens(*from, *to)(0))
@@ -516,6 +750,8 @@ func realMain() error {
 	// One line per kind, so a shell script can read the numbers with awk.
 	fmt.Printf("{\"config\":{\"addr\":%q,\"from_ns\":%d,\"to_ns\":%d,\"hour_start_ns\":%d,\"n\":%d,\"warmup\":%d,\"seed\":%d,\"concurrency\":%d,\"service\":%q,\"model\":%q},\n",
 		*addr, *from, *to, *hourFrom, *n, *warm, *seed, *conc, service, model)
+	aj, _ := json.Marshal(ann) // null when skipped
+	fmt.Printf("\"annotation\":%s,\n", aj)
 	pj, _ := json.Marshal(exp)
 	fmt.Printf("\"exp_params\":%s,\n", pj)
 	fmt.Printf("\"discovered_traces\":%d,\"discovery_ms\":%.1f,\"server_span_count\":%d,\"token_rows_truncated\":%v,\n\"kinds\":[\n", len(ids), discoverMs, spans, truncated)

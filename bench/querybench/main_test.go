@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -176,5 +177,127 @@ func TestElapsed(t *testing.T) {
 	}
 	if err := elapsedMs("not a time", "1"); err == nil {
 		t.Error("bad time must fail")
+	}
+}
+
+func testIDs(n int) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = "t" + strconv.Itoa(i)
+	}
+	return ids
+}
+
+func TestBuildAnnotations(t *testing.T) {
+	ids := testIDs(1000)
+	a, annotated := buildAnnotations(ids, 1)
+	b, _ := buildAnnotations(ids, 1)
+	if len(a) != 100+10 || len(annotated) != 100 {
+		t.Fatalf("%d items, %d annotated", len(a), len(annotated))
+	}
+	ab, _ := json.Marshal(a)
+	bb, _ := json.Marshal(b)
+	if string(ab) != string(bb) {
+		t.Error("the same seed must give the same items")
+	}
+	c, _ := buildAnnotations(ids, 2)
+	cb, _ := json.Marshal(c)
+	if string(ab) == string(cb) {
+		t.Error("another seed must give other items")
+	}
+	humans := 0
+	for _, x := range a {
+		switch x.Name {
+		case "quality":
+			if x.Value == nil || *x.Value < 0 || *x.Value >= 1 || x.Source != "bench" {
+				t.Fatalf("%+v", x)
+			}
+			if (*x.Value >= 0.5) != (x.Label == "good") || (x.Label != "good" && x.Label != "bad") {
+				t.Errorf("label %q for %v", x.Label, *x.Value)
+			}
+		case "human":
+			humans++
+			if x.Value != nil || x.Label != "down" {
+				t.Errorf("%+v", x)
+			}
+		default:
+			t.Errorf("%+v", x)
+		}
+	}
+	if humans != 10 {
+		t.Errorf("%d human items", humans)
+	}
+	if items, _ := buildAnnotations(testIDs(3), 1); len(items) != 2 {
+		t.Errorf("a small set gets one item of each kind, got %d", len(items))
+	}
+}
+
+func TestAnnotationBody(t *testing.T) {
+	v := 0.25
+	b, err := annotationBody([]annotation{{TraceID: "aa", Name: "quality", Source: "bench", Value: &v, Label: "bad"}, {TraceID: "bb", Name: "human", Label: "down"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"annotations":[{"trace_id":"aa","name":"quality","source":"bench","value":0.25,"label":"bad"},{"trace_id":"bb","name":"human","label":"down"}]}`
+	if string(b) != want {
+		t.Errorf("%s", b)
+	}
+}
+
+func TestParseAnnotateReply(t *testing.T) {
+	a, r, err := parseAnnotateReply([]byte(`{"accepted":3,"rejected":[{"index":1,"error":"unknown trace"}]}`))
+	if err != nil || a != 3 || r != 1 {
+		t.Fatal(a, r, err)
+	}
+	if _, _, err := parseAnnotateReply([]byte(`{"rejected":[]}`)); err == nil {
+		t.Error("a missing accepted count must fail")
+	}
+}
+
+func TestParseAnnStats(t *testing.T) {
+	s, err := parseAnnStats([]byte(`{"parts":4,"merging":false,"last_compaction_error":null,"annotations_buffered":0,"annotation_parts":2,"annotation_bytes":900,"annotations_written":110,"annotations_dropped":1}`))
+	if err != nil || s != (annStats{0, 2, 900, 110, 1}) {
+		t.Fatal(s, err)
+	}
+	_, err = parseAnnStats([]byte(`{"annotations_buffered":0}`))
+	if err == nil || !strings.Contains(err.Error(), "annotation_parts") {
+		t.Errorf("a missing field must be named: %v", err)
+	}
+}
+
+// The annotate step sends requests of 500, one at a time, with the JSON
+// content type, and fails on a rejected item.
+func TestAnnotate(t *testing.T) {
+	var sizes []int
+	reject := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.Header.Get("Content-Type") != "application/json" {
+			w.WriteHeader(415)
+			return
+		}
+		var req struct {
+			Annotations []annotation `json:"annotations"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		sizes = append(sizes, len(req.Annotations))
+		if reject {
+			w.Write([]byte(`{"accepted":0,"rejected":[{"index":0,"error":"unknown trace"}]}`))
+			return
+		}
+		w.Write([]byte(`{"accepted":` + strconv.Itoa(len(req.Annotations)) + `,"rejected":[]}`))
+	}))
+	defer srv.Close()
+	c := &client{base: srv.URL, http: srv.Client()}
+	items, _ := buildAnnotations(testIDs(6000), 1) // 600 + 60
+	r, err := c.annotate(append(items, items...)[:1100], 500)
+	if err != nil || r.Accepted != 1100 || r.Rejected != 0 || r.kind.Count != 3 {
+		t.Fatal(r, err)
+	}
+	if len(sizes) != 3 || sizes[0] != 500 || sizes[2] != 100 {
+		t.Errorf("%v", sizes)
+	}
+	reject = true
+	if _, err := c.annotate(items, 500); err == nil {
+		t.Error("a rejected item must fail the phase")
 	}
 }
