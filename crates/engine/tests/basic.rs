@@ -30,7 +30,7 @@ fn manifest_state(dir: &std::path::Path) -> Arc<nwdb_manifest::ManifestState> {
 }
 
 fn wait_until(what: &str, cond: impl FnMut() -> bool) {
-    wait_with_timeout(what, Duration::from_secs(30), cond);
+    nwdb_testkit::wait_for(what, Duration::from_secs(30), cond);
 }
 
 fn sample(trace: u128, base: i64) -> Vec<TSpan> {

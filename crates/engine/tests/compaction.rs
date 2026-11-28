@@ -25,7 +25,7 @@ use support::disk_state;
 const W: i64 = 1_000;
 
 fn wait_for(what: &str, cond: impl FnMut() -> bool) {
-    wait_with_timeout(what, Duration::from_secs(60), cond);
+    nwdb_testkit::wait_for(what, Duration::from_secs(60), cond);
 }
 
 /// Feeds an engine and a model: one part per window per flush.

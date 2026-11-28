@@ -81,7 +81,7 @@ fn expired(window_start: i64, retention: i64, now: i64) -> bool {
 }
 
 fn wait_for(what: &str, cond: impl FnMut() -> bool) {
-    wait_with_timeout(what, Duration::from_secs(30), cond);
+    nwdb_testkit::wait_for(what, Duration::from_secs(30), cond);
 }
 
 #[test]

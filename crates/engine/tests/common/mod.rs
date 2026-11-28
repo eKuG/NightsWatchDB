@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use nwdb_core::{
@@ -37,15 +37,6 @@ pub fn wal_no_sync() -> WalOptions {
     WalOptions {
         sync: SyncMode::None,
         ..WalOptions::default()
-    }
-}
-
-/// Polls `cond` every 5 ms until it holds; panics naming `what` after `timeout`.
-pub fn wait_with_timeout(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
-    let end = Instant::now() + timeout;
-    while !cond() {
-        assert!(Instant::now() < end, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

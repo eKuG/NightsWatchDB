@@ -808,6 +808,7 @@ dependencies = [
  "nwdb-core",
  "nwdb-manifest",
  "nwdb-segment",
+ "nwdb-testkit",
  "nwdb-textindex",
  "nwdb-wal",
  "rand",

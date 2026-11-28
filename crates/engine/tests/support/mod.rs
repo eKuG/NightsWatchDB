@@ -2,6 +2,7 @@
 //! comparing data directories, and checking what a recovered engine holds.
 #![allow(dead_code)]
 
+pub use nwdb_testkit::fs::copy_dir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
 use std::io::{BufRead, BufReader};
@@ -122,19 +123,6 @@ pub fn run_child(
         success: status.success(),
         aborted_at,
         signal: std::os::unix::process::ExitStatusExt::signal(&status),
-    }
-}
-
-pub fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        let target = to.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &target);
-        } else {
-            std::fs::copy(e.path(), &target).unwrap();
-        }
     }
 }
 
