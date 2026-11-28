@@ -19,7 +19,7 @@ use rand::Rng;
 use support::*;
 
 #[global_allocator]
-static ALLOC: alloc::Counting = alloc::Counting;
+static ALLOC: alloc::Counting = alloc::Counter;
 
 /// The allocator counts the whole process, so the tests take turns: the
 /// total heap held during a call is only meaningful when nothing else runs.

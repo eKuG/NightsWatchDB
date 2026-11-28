@@ -11,7 +11,7 @@ use nwdb_core::{Error, put_varint};
 use nwdb_textindex::{IndexBuilder, IndexOptions, IndexReader, MIN_SEGMENT_BUDGET};
 
 #[global_allocator]
-static ALLOC: alloc::Counting = alloc::Counting;
+static ALLOC: alloc::Counting = alloc::Counter;
 
 /// The allocator counts the whole process, so the tests take turns.
 static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());

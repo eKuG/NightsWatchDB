@@ -11,7 +11,7 @@ use std::io::Write;
 use nwdb_textindex::{IndexBuilder, IndexOptions, IndexReader};
 
 #[global_allocator]
-static ALLOC: alloc::Counting = alloc::Counting;
+static ALLOC: alloc::Counting = alloc::Counter;
 
 static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

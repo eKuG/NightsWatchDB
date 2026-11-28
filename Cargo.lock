@@ -884,6 +884,7 @@ version = "0.0.1"
 dependencies = [
  "crc32c",
  "nwdb-core",
+ "nwdb-testkit",
  "rand",
 ]
 

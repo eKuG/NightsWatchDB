@@ -18,7 +18,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 #[global_allocator]
-static ALLOC: alloc::Counting = alloc::Counting;
+static ALLOC: alloc::Counting = alloc::Counter;
 
 /// The allocator counts the whole process, so the two tests take turns.
 static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
