@@ -996,7 +996,11 @@ fn a_rotation_whose_directory_sync_fails_poisons_the_log_and_leaves_the_new_file
         .unwrap()
         .push((dir.path().to_path_buf(), None));
     let err = wal.rotate().unwrap_err();
-    writer::DIR_SYNC_FAULTS.lock().unwrap().clear();
+    // Only this test's entry: the list is shared by tests that run at once.
+    writer::DIR_SYNC_FAULTS
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| d != dir.path());
     assert!(matches!(err, Error::Fatal(_)), "{err}");
     assert!(matches!(
         wal.append_blocking(b"three"),
@@ -1027,7 +1031,11 @@ fn a_rotation_that_leaves_its_new_file_behind_poisons_the_log() {
         .unwrap()
         .push((dir.path().to_path_buf(), Some(3)));
     let err = wal.rotate().unwrap_err();
-    writer::DIR_SYNC_FAULTS.lock().unwrap().clear();
+    // Only this test's entry: the list is shared by tests that run at once.
+    writer::DIR_SYNC_FAULTS
+        .lock()
+        .unwrap()
+        .retain(|(d, _)| d != dir.path());
     assert!(matches!(err, Error::Fatal(_)), "{err}");
     assert!(matches!(
         wal.append_blocking(b"three"),
