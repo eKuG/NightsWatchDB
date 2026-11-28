@@ -19,6 +19,7 @@ arrow-select.workspace = true
 parquet = { workspace = true, features = ["arrow", "zstd"] }
 crc32c.workspace = true
 bytes.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

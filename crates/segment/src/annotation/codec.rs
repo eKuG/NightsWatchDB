@@ -60,7 +60,7 @@ pub(crate) fn encode_record(a: &Annotation, with_arrival: bool, out: &mut Vec<u8
 }
 
 /// Every read checks the length first.
-struct Cursor<'a>(&'a [u8]);
+pub(crate) struct Cursor<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -88,7 +88,7 @@ impl<'a> Cursor<'a> {
 
 /// Reads one record from the front of `cur`, checking everything `validate`
 /// checks. `arrival` is 0 unless `with_arrival`.
-fn decode_record(cur: &mut Cursor<'_>, with_arrival: bool) -> Result<Annotation> {
+pub(crate) fn decode_record(cur: &mut Cursor<'_>, with_arrival: bool) -> Result<Annotation> {
     let trace_id = TraceId(cur.array()?);
     let flags = cur.array::<1>()?[0];
     if flags & RESERVED != 0 {

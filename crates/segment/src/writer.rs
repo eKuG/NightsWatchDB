@@ -1008,7 +1008,7 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -1016,10 +1016,10 @@ fn sync_dir(dir: &Path) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     /// Makes the next [`sync_after_rename`] on this thread fail.
-    static FAIL_SYNC_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static FAIL_SYNC_AFTER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn sync_after_rename(dir: &Path) -> Result<()> {
+pub(crate) fn sync_after_rename(dir: &Path) -> Result<()> {
     #[cfg(test)]
     if FAIL_SYNC_AFTER_RENAME.with(|f| f.replace(false)) {
         return Err(std::io::Error::other("injected failure").into());
@@ -1028,7 +1028,7 @@ fn sync_after_rename(dir: &Path) -> Result<()> {
 }
 
 /// The directory that holds `path`; `.` for a bare relative name.
-fn parent_of(path: &Path) -> &Path {
+pub(crate) fn parent_of(path: &Path) -> &Path {
     path.parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
@@ -1037,7 +1037,7 @@ fn parent_of(path: &Path) -> &Path {
 /// Creates `dir` and any missing parents, and syncs the parent of every
 /// directory it created: a new directory is not durable until its parent has
 /// been synced.
-fn create_dir_all_synced(dir: &Path) -> Result<()> {
+pub(crate) fn create_dir_all_synced(dir: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut p = dir;
     while !p.as_os_str().is_empty() && !p.exists() {

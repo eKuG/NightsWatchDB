@@ -868,6 +868,7 @@ dependencies = [
  "parquet",
  "rand",
  "tempfile",
+ "zstd",
 ]
 
 [[package]]

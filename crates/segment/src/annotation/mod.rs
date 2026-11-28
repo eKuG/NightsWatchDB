@@ -6,11 +6,15 @@
 //! described in the crate's `README.md`.
 
 mod codec;
+mod latest;
+mod part;
 
 use nwdb_core::{Error, Result, SpanId, TraceId};
 use std::cmp::Ordering;
 
 pub use codec::{decode_batch, encode_batch};
+pub use latest::Latest;
+pub use part::{AnnotationCursor, AnnotationReader, AnnotationWriter};
 
 /// Version of the annotation part format (the file `annotations.nwa`).
 /// Recorded in `PartMeta::format_version` of an annotation part.

@@ -30,9 +30,9 @@ mod text;
 mod writer;
 
 pub use annotation::{
-    ANNOTATION_FILE, ANNOTATION_FORMAT_VERSION, Annotation, MAX_BATCH_ITEMS, MAX_COMMENT_BYTES,
-    MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_SOURCE_BYTES, check_annotation_format_version,
-    decode_batch, encode_batch,
+    ANNOTATION_FILE, ANNOTATION_FORMAT_VERSION, Annotation, AnnotationCursor, AnnotationReader,
+    AnnotationWriter, Latest, MAX_BATCH_ITEMS, MAX_COMMENT_BYTES, MAX_LABEL_BYTES, MAX_NAME_BYTES,
+    MAX_SOURCE_BYTES, check_annotation_format_version, decode_batch, encode_batch,
 };
 pub use index::{FileChecksum, INDEX_FILE, TraceEntry};
 pub use merge::{DEFAULT_MERGE_CHUNK_BYTES, MergeOptions, MergeStats, merge_parts};
