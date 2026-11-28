@@ -1,4 +1,4 @@
-//! Review: queries whose words are longer than the index can hold. A token
+//! Queries whose words are longer than the index can hold. A token
 //! over 64 bytes is not indexed (README, "Tokeniser"), but the parser turns
 //! such a word into a plain `Term` (or keeps a prefix that only matches
 //! indexed terms), and the documented leaf mapping then answers it from the

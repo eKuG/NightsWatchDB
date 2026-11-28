@@ -21,13 +21,16 @@ pub const BLOCK: usize = 128;
 /// relative to the end of the skip table, both `u32`.
 pub const SKIP_ENTRY: usize = 8;
 
-/// Appends `v` as a little-endian base-128 varint.
-pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push(v as u8 | 0x80);
-        v >>= 7;
+pub use nwdb_core::put_varint;
+
+/// Appends the ids of an inline list, strictly ascending, as varint gaps:
+/// each id minus one past the one before it.
+pub fn put_inline(out: &mut Vec<u8>, ids: &[u32]) {
+    let mut next_min = 0u64;
+    for &id in ids {
+        put_varint(out, u64::from(id) - next_min);
+        next_min = u64::from(id) + 1;
     }
-    out.push(v as u8);
 }
 
 /// Reads a varint at `*pos`, advancing it. A varint longer than 10 bytes, one

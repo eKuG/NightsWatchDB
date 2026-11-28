@@ -12,7 +12,7 @@ use std::io::Write;
 
 use nwdb_core::{Error, Result};
 
-use crate::codec::{encode_list, put_varint};
+use crate::codec::{encode_list, put_inline, put_varint};
 use crate::format::{
     DIR_ENTRY, DirEntry, FOOTER, FooterFields, INLINE_MAX, TERMS_PER_BLOCK, encode_footer,
 };
@@ -301,11 +301,7 @@ impl<W: Write> IndexBuilder<W> {
             prev = term;
             put_varint(&mut dict, ids.len() as u64);
             if ids.len() <= INLINE_MAX {
-                let mut next_min = 0u64;
-                for &id in ids {
-                    put_varint(&mut dict, u64::from(id) - next_min);
-                    next_min = u64::from(id) + 1;
-                }
+                put_inline(&mut dict, ids);
             } else {
                 put_varint(&mut dict, postings_len);
                 tmp.clear();

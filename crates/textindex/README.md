@@ -104,7 +104,7 @@ Measured with a counting allocator (`tests/build_memory.rs`), building about
 The peak is about 1.3 times the budget plus a fixed 250 KiB or so (the output
 buffer and the table's growth step). The test asserts `peak <= 1.5 x budget +
 256 KiB + 144 bytes x segments`, and that a larger budget gives a larger peak.
-`tests/regressions_review_memory.rs` builds 60,000 small documents with a
+`tests/regressions_memory.rs` builds 60,000 small documents with a
 requested budget of 1 KiB (raised to 1 MiB): the number of segments follows
 the minimum budget, and growing the input twelvefold adds only the documented
 144 bytes per extra segment to the peak. The memory the builder holds does not
@@ -294,7 +294,7 @@ a prefix with one matching term in a segment, an `intersect` of one token)
 also reads ahead: an 8 KiB buffer, once. With several lists open (a prefix
 with many matches, an `intersect` of several tokens) nothing reads ahead, so
 the total is the number of open lists times 2 KiB and does not depend on the
-length of any list. `tests/regressions_review_memory.rs` and
+length of any list. `tests/regressions_memory.rs` and
 `tests/bounded_memory.rs` measure it (about 1.6 KB per list in a
 prefix search over 1,000 terms; 2.7 KB in all for an intersection of two long
 lists, over 48,000 or 1,200,000 documents alike).
@@ -482,9 +482,8 @@ reader holds 16 bytes per group (at most 16 bytes per 128 keys).
 - `tests/hostile.rs`: hand-built files with valid checksums.
 - `tests/long_tokens.rs`: words longer than 64 bytes, byte-level terms that are
   not UTF-8, document ids near `u32::MAX`, a writer that fails midway.
-- `tests/regressions_review_*.rs`: the failing tests of an independent review
-  of this crate (long words, memory of a search and of the builder, bytes
-  read).
+- `tests/regressions_*.rs`: regression tests for fixed defects (long words,
+  memory of a search and of the builder, bytes read).
 - `tests/size.rs`: the index over a few megabytes of English-like text.
 - `tests/idlist.rs`: round trips and group boundaries of the id-list store; a
   flipped byte in one group, or a group of another file, is `Corrupt` when that

@@ -18,7 +18,10 @@ use std::io::Write;
 
 use nwdb_core::{Error, Result};
 
-use crate::codec::{BLOCK, decode_block, encode_blocks, get_varint, get_varint_u32, put_varint};
+use crate::codec::{
+    BLOCK, decode_block, encode_blocks, get_varint, get_varint_u32, put_inline, put_varint,
+};
+use crate::format::{corrupt, le32, le64};
 use crate::ids::is_ascending;
 use crate::source::{ReadAt, Sink, read_checked};
 
@@ -91,11 +94,7 @@ impl<W: Write> IdListWriter<W> {
         let before = self.lists.len();
         put_varint(&mut self.lists, ids.len() as u64);
         if ids.len() <= INLINE_MAX {
-            let mut next_min = 0u64;
-            for &id in ids {
-                put_varint(&mut self.lists, u64::from(id) - next_min);
-                next_min = u64::from(id) + 1;
-            }
+            put_inline(&mut self.lists, ids);
         } else {
             encode_blocks(ids, &mut self.lists, |_, _| {});
         }
@@ -200,10 +199,6 @@ pub struct IdList<'a> {
     max_ids: u64,
 }
 
-fn corrupt<T>(what: &str) -> Result<T> {
-    Err(Error::corrupt(what))
-}
-
 impl<S: ReadAt> IdListReader<S> {
     /// Opens the file, checking the footer and the group index.
     pub fn open(src: S) -> Result<Self> {
@@ -216,12 +211,8 @@ impl<S: ReadAt> IdListReader<S> {
         if &f[36..40] != MAGIC {
             return corrupt("not an id-list file: bad magic");
         }
-        let u32_at = |i: usize| u32::from_le_bytes([f[i], f[i + 1], f[i + 2], f[i + 3]]);
-        let u64_at = |i: usize| {
-            let mut x = [0u8; 8];
-            x.copy_from_slice(&f[i..i + 8]);
-            u64::from_le_bytes(x)
-        };
+        let u32_at = |i: usize| le32(&f, i);
+        let u64_at = |i: usize| le64(&f, i);
         if u32_at(0) != VERSION {
             return corrupt("unknown id-list format version");
         }
@@ -245,11 +236,7 @@ impl<S: ReadAt> IdListReader<S> {
         let mut offsets: Vec<u64> = Vec::with_capacity(groups as usize);
         let mut crcs: Vec<u32> = Vec::with_capacity(groups as usize);
         for (i, e) in index.as_chunks::<INDEX_ENTRY>().0.iter().enumerate() {
-            let key = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
-            let mut o = [0u8; 8];
-            o.copy_from_slice(&e[4..12]);
-            let off = u64::from_le_bytes(o);
-            let crc = u32::from_le_bytes([e[12], e[13], e[14], e[15]]);
+            let (key, off, crc) = (le32(e, 0), le64(e, 4), le32(e, 12));
             let ok = if i == 0 {
                 key == 0 && off == 0
             } else {

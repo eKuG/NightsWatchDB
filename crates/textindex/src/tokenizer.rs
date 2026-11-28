@@ -50,17 +50,6 @@ impl<'a> Token<'a> {
         self.raw
     }
 
-    /// Length in bytes. A token is never empty.
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.raw.len()
-    }
-
-    /// True if the token is short enough to be indexed.
-    pub fn is_indexable(&self) -> bool {
-        self.raw.len() <= MAX_TOKEN_LEN
-    }
-
     /// The lowercased token, written into `buf`, or `None` if the token is
     /// too long to index.
     pub fn lowercase<'b>(&self, buf: &'b mut [u8; MAX_TOKEN_LEN]) -> Option<&'b [u8]> {

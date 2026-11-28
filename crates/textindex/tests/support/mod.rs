@@ -259,13 +259,7 @@ impl ReadAt for CountingSource {
 
 // ------------------------------------------------- hand-written files
 
-pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push(v as u8 | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
+pub use nwdb_core::put_varint;
 
 /// What a hand-written dictionary entry points at.
 pub enum Hand {

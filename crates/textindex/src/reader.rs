@@ -21,8 +21,8 @@ use nwdb_core::{Error, Result};
 
 use crate::codec::{BLOCK, SKIP_ENTRY, block_max, decode_block, get_varint, get_varint_u32};
 use crate::format::{
-    DIR_ENTRY, DirEntry, FOOTER, INLINE_MAX, MAX_DICT_BLOCK, TERMS_PER_BLOCK, decode_footer,
-    footer_crc,
+    DIR_ENTRY, DirEntry, FOOTER, INLINE_MAX, MAX_DICT_BLOCK, TERMS_PER_BLOCK, corrupt,
+    decode_footer, footer_crc,
 };
 use crate::ids::DocIds;
 use crate::meta::IndexMeta;
@@ -128,10 +128,6 @@ enum Outcome {
     Damaged(String),
 }
 
-fn corrupt<T>(what: &str) -> Result<T> {
-    Err(Error::corrupt(what))
-}
-
 impl Segment {
     fn postings_end(&self) -> u64 {
         self.postings_at + self.e.postings_len
@@ -154,7 +150,7 @@ impl Segment {
         if self.verified.load(Ordering::Acquire) {
             return Ok(());
         }
-        let mut outcome = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        let mut outcome = nwdb_core::lock(&self.outcome);
         match &*outcome {
             Outcome::Good => return Ok(()),
             Outcome::Damaged(m) => return Err(Error::corrupt(m)),

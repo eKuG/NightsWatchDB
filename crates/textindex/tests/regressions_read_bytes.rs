@@ -1,4 +1,4 @@
-//! Review: bytes read per call, counted through a `ReadAt` wrapper.
+//! Bytes read per call, counted through a `ReadAt` wrapper.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};

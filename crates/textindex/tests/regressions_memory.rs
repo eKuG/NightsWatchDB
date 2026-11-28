@@ -1,4 +1,4 @@
-//! Review: memory claims of the builder and of a search, measured with the
+//! Memory claims of the builder and of a search, measured with the
 //! counting allocator.
 
 #[path = "support/alloc.rs"]
@@ -7,7 +7,7 @@ mod support;
 
 use std::io::Write;
 
-use nwdb_core::Error;
+use nwdb_core::{Error, put_varint};
 use nwdb_textindex::{IndexBuilder, IndexOptions, IndexReader, MIN_SEGMENT_BUDGET};
 
 #[global_allocator]
@@ -83,14 +83,6 @@ fn builder_memory_is_bounded_by_the_minimum_budget_and_the_documented_cost_per_s
         large <= small + 144 * more + 32 * 1024,
         "peak grew from {small} to {large} bytes with {more} more segments"
     );
-}
-
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push(v as u8 | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
 }
 
 /// An index of one segment, written by hand from the documented layout, whose

@@ -61,13 +61,14 @@ fn tokeniser_length_limit() {
     let text = format!("{t64} {t65} {t64}");
     let all: Vec<Token<'_>> = tokens(text.as_bytes()).collect();
     assert_eq!(all.len(), 3);
-    assert!(all[0].is_indexable() && !all[1].is_indexable() && all[2].is_indexable());
+    let mut buf = [0u8; MAX_TOKEN_LEN];
+    assert!(all[0].lowercase(&mut buf).is_some());
+    assert!(all[1].lowercase(&mut buf).is_none());
+    assert!(all[2].lowercase(&mut buf).is_some());
     // The long token is not indexed but is still a token for adjacency.
     assert_eq!(toks(text.as_bytes()), [t64.as_bytes(), t64.as_bytes()]);
     assert!(phrase_matches(text.as_bytes(), &[&t64, &t65]));
     assert!(!phrase_matches(text.as_bytes(), &[&t64, &t64]));
-    let mut buf = [0u8; MAX_TOKEN_LEN];
-    assert!(all[1].lowercase(&mut buf).is_none());
     // 64 bytes of multi-byte text, and one more byte, on the same limit.
     assert_eq!(toks("\u{e9}".repeat(32).as_bytes()).len(), 1);
     assert!(toks("\u{e9}".repeat(33).as_bytes()).is_empty());

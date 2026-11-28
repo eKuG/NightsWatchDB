@@ -166,6 +166,11 @@ pub fn footer_crc(directory: &[u8], footer: &[u8; FOOTER]) -> u32 {
     crc32c::crc32c_append(crc32c::crc32c(directory), &footer[..56])
 }
 
+/// `Err(Error::corrupt(what))`.
+pub fn corrupt<T>(what: &str) -> Result<T> {
+    Err(Error::corrupt(what))
+}
+
 pub fn le32<const N: usize>(b: &[u8; N], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
 }
