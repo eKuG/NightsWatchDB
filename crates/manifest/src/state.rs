@@ -3,8 +3,14 @@ use std::collections::BTreeSet;
 use nwdb_core::{Error, PartMeta, Result};
 use serde::{Deserialize, Serialize};
 
-/// The only on-disk format version this crate reads and writes.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// The on-disk format version this crate writes. Version 1 files, which can
+/// only list span parts, are still read; see [`READABLE_VERSIONS`].
+///
+/// Version 2 adds `kind` to the parts, so a manifest can list annotation parts.
+pub(crate) const FORMAT_VERSION: u32 = 2;
+
+/// Format versions this crate reads.
+pub(crate) const READABLE_VERSIONS: [u32; 2] = [1, FORMAT_VERSION];
 
 /// Largest `next_part_id` accepted on load or in an edit. A real database
 /// never gets near 2^62 parts; a larger value is a damaged or hostile file,
@@ -25,7 +31,8 @@ pub const PART_ID_LEFTOVER_WINDOW: u64 = 1 << 32;
 /// file written by a newer writer that only added fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestState {
-    /// Version of the file format, currently 1.
+    /// Version of the file format. A state loaded from a version 1 file keeps 1
+    /// until the next commit, which writes the current version.
     pub format_version: u32,
     /// Manifest version. 0 is the empty state that exists before the first
     /// commit and is never written to disk.
@@ -183,7 +190,7 @@ impl ManifestState {
             )));
         }
         Ok(Self {
-            format_version: self.format_version,
+            format_version: FORMAT_VERSION,
             version,
             next_part_id,
             wal_flushed_lsn,

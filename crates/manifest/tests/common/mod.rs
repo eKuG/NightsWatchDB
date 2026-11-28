@@ -21,6 +21,7 @@ pub fn base_part(id: u64) -> PartMeta {
         created_unix_ms: 0,
         format_version: 1,
         payload: Default::default(),
+        kind: Default::default(),
     }
 }
 

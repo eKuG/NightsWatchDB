@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use nwdb_core::{Error, PartMeta, part_dir_name};
+use nwdb_core::{Error, PartKind, PartMeta, part_dir_name};
 use nwdb_manifest::{
     Edit, Manifest, ManifestOptions, ManifestState, OpenMode, unreferenced_part_dirs,
 };
@@ -69,7 +69,7 @@ fn empty_commit_reopen() {
     let m = open(&dir);
     let s0 = m.current();
     assert_eq!(*s0, ManifestState::empty());
-    assert_eq!((s0.version, s0.next_part_id, s0.format_version), (0, 1, 1));
+    assert_eq!((s0.version, s0.next_part_id, s0.format_version), (0, 1, 2));
     assert!(file_names(&dir).is_empty());
 
     let s1 = m.commit(add(&[1, 2])).unwrap();
@@ -84,20 +84,29 @@ fn empty_commit_reopen() {
 
 #[test]
 fn known_answer_file_content_and_unknown_fields() {
+    let mut annotations = part(6);
+    annotations.kind = PartKind::Annotations;
+    annotations.files = BTreeMap::from([("annotations.nwa".to_string(), 60)]);
     let state = ManifestState {
-        format_version: 1,
+        format_version: 2,
         version: 3,
         next_part_id: 8,
         wal_flushed_lsn: 77,
-        parts: vec![part(7)],
+        parts: vec![annotations, part(7)],
         created_unix_ms: 1_700_000_000_123,
     };
     let json = concat!(
-        r#"{"format_version":1,"version":3,"next_part_id":8,"wal_flushed_lsn":77,"#,
-        r#""parts":[{"part_id":7,"level":0,"window_start_ns":0,"window_ns":900000000000,"#,
+        r#"{"format_version":2,"version":3,"next_part_id":8,"wal_flushed_lsn":77,"#,
+        r#""parts":[{"part_id":6,"level":0,"window_start_ns":0,"window_ns":900000000000,"#,
+        r#""rows":6,"traces":1,"min_start_ns":1,"max_end_ns":2,"files":{"annotations.nwa":60},"#,
+        r#""created_unix_ms":1700000000000,"format_version":1,"#,
+        r#""payload":{"pieces":0,"logical_bytes":0,"unique_bytes":0,"stored_bytes":0},"#,
+        r#""kind":"annotations"},"#,
+        r#"{"part_id":7,"level":0,"window_start_ns":0,"window_ns":900000000000,"#,
         r#""rows":7,"traces":1,"min_start_ns":1,"max_end_ns":2,"files":{"spans.parquet":70},"#,
         r#""created_unix_ms":1700000000000,"format_version":1,"#,
-        r#""payload":{"pieces":0,"logical_bytes":0,"unique_bytes":0,"stored_bytes":0}}],"#,
+        r#""payload":{"pieces":0,"logical_bytes":0,"unique_bytes":0,"stored_bytes":0},"#,
+        r#""kind":"spans"}],"#,
         r#""created_unix_ms":1700000000123}"#,
     );
     let bytes = state.encode().unwrap();
@@ -108,7 +117,7 @@ fn known_answer_file_content_and_unknown_fields() {
         rest,
         format!("crc32c:{:08x}\n", crc32c_reference(json.as_bytes()))
     );
-    assert_eq!(rest, "crc32c:4ecb416e\n");
+    assert_eq!(rest, "crc32c:fff6868f\n");
     assert_eq!(ManifestState::decode("x", &bytes).unwrap(), state);
 
     // A newer writer's extra field is ignored, as long as the checksum
@@ -463,4 +472,98 @@ fn reserved_ids_and_unreferenced_dirs() {
     .map(|n| parts.join(n))
     .collect();
     assert_eq!(got, want);
+}
+
+/// Writes a manifest file as an older or other writer would: the given JSON
+/// line and its checksum.
+fn write_file(dir: &Path, version: u64, json: &str) {
+    let file = format!("{json}\ncrc32c:{:08x}\n", crc32c_reference(json.as_bytes()));
+    fs::write(dir.join(vname(version)), file).unwrap();
+}
+
+fn json_with_format(format_version: u32) -> String {
+    format!(
+        concat!(
+            r#"{{"format_version":{},"version":1,"next_part_id":3,"wal_flushed_lsn":5,"#,
+            r#""parts":[{{"part_id":2,"level":0,"window_start_ns":0,"window_ns":900000000000,"#,
+            r#""rows":2,"traces":1,"min_start_ns":1,"max_end_ns":2,"files":{{"spans.parquet":20}},"#,
+            r#""created_unix_ms":1700000000000,"format_version":1,"#,
+            r#""payload":{{"pieces":0,"logical_bytes":0,"unique_bytes":0,"stored_bytes":0}}}}],"#,
+            r#""created_unix_ms":1700000000123}}"#,
+        ),
+        format_version
+    )
+}
+
+#[test]
+fn a_version_1_file_loads_and_the_next_commit_writes_version_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_file(tmp.path(), 1, &json_with_format(1));
+    let m = open(tmp.path());
+    let loaded = m.current();
+    assert_eq!(loaded.format_version, 1);
+    assert_eq!(ids(&loaded), [2]);
+    assert_eq!(loaded.parts[0].kind, PartKind::Spans);
+
+    let next = m.commit(add(&[5])).unwrap();
+    assert_eq!(next.format_version, 2);
+    let text = fs::read_to_string(tmp.path().join(vname(2))).unwrap();
+    assert!(
+        text.starts_with(r#"{"format_version":2,"version":2,"#),
+        "{text}"
+    );
+
+    let reloaded = m.reload().unwrap();
+    assert_eq!(*reloaded, *next);
+    assert_eq!(ids(&reloaded), [2, 5]);
+    assert_eq!(*open(tmp.path()).current(), *next);
+}
+
+#[test]
+fn format_versions_other_than_1_and_2_are_refused_and_nothing_changes() {
+    for found in [0u32, 3] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_file(tmp.path(), 1, &json_with_format(found));
+        let before = fs::read(tmp.path().join(vname(1))).unwrap();
+        let err = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default())
+            .err()
+            .expect("refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("format_version {found}")) && msg.contains("versions 1 and 2"),
+            "{msg}"
+        );
+        assert_eq!(file_names(tmp.path()), [vname(1)]);
+        assert_eq!(fs::read(tmp.path().join(vname(1))).unwrap(), before);
+    }
+}
+
+#[test]
+fn an_annotation_part_survives_commit_reload_and_remove() {
+    let tmp = tempfile::tempdir().unwrap();
+    let m = open(tmp.path());
+    let mut a = part(3);
+    a.kind = PartKind::Annotations;
+    a.format_version = 1;
+    a.files = BTreeMap::from([("annotations.nwa".to_string(), 33)]);
+    let s = m
+        .commit(Edit {
+            add: vec![part(1), a.clone()],
+            ..Edit::default()
+        })
+        .unwrap();
+    assert_eq!(s.part(3), Some(&a));
+    let reloaded = m.reload().unwrap();
+    assert_eq!(reloaded.part(3).unwrap().kind, PartKind::Annotations);
+    assert_eq!(reloaded.part(1).unwrap().kind, PartKind::Spans);
+    assert_eq!(open(tmp.path()).current().part(3), Some(&a));
+
+    let s = m
+        .commit(Edit {
+            remove: vec![3],
+            ..Edit::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&s), [1]);
+    assert_eq!(ids(&m.reload().unwrap()), [1]);
 }

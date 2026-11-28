@@ -39,8 +39,12 @@ crc32c:<8 lowercase hex digits>\n
 
 The checksum is CRC-32C over the bytes of the JSON line, without its newline.
 Unknown JSON fields are ignored on read, so a newer writer that only adds
-fields does not break an older reader. A `format_version` other than 1 is
-refused, because an older reader cannot know what a changed layout means.
+fields does not break an older reader. The format version is 2. Version 2 added
+`kind` to every part (`spans` or `annotations`; absent means `spans`), so a
+manifest can list annotation parts; version 1 files, which can only list span
+parts, are still read, and the next commit writes version 2. A `format_version`
+other than 1 or 2 is refused, with a message naming the version found and the
+versions understood, because a reader cannot know what a changed layout means.
 
 Anything else in the directory is ignored, apart from temporary files (names
 starting `.tmp-`), which `open` removes. With one writer these are always

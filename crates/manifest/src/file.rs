@@ -2,7 +2,7 @@
 
 use nwdb_core::{Error, Result};
 
-use crate::state::{FORMAT_VERSION, ManifestState};
+use crate::state::{FORMAT_VERSION, ManifestState, READABLE_VERSIONS};
 
 const CRC_PREFIX: &str = "crc32c:";
 const SUFFIX: &str = ".json";
@@ -55,10 +55,10 @@ impl ManifestState {
         }
         let state: Self =
             serde_json::from_str(json).map_err(|e| bad(&format!("invalid JSON: {e}")))?;
-        if state.format_version != FORMAT_VERSION {
+        if !READABLE_VERSIONS.contains(&state.format_version) {
             // Guessing at a newer layout could resurrect deleted parts.
             return Err(bad(&format!(
-                "unsupported format_version {}",
+                "unsupported format_version {}; this build reads versions 1 and {FORMAT_VERSION}",
                 state.format_version
             )));
         }
