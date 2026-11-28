@@ -479,6 +479,14 @@ async fn the_reply_comes_only_after_the_log_sync() {
     let server = server_with_options(o, 1).await;
     let api = server.api_addr();
 
+    // A failed assertion must not leave the log blocked for the teardown.
+    struct OpenOnDrop(Arc<Gate>);
+    impl Drop for OpenOnDrop {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+    let _open = OpenOnDrop(gate.clone());
     gate.set(false);
     let (tx, rx) = mpsc::channel();
     let body = json!({"annotations": [score(1, "q", 1.0)]})
