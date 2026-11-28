@@ -61,8 +61,8 @@ impl<'a> Latest<'a> {
             }
             self.primed = true;
         }
-        // ponytail: linear scan over the inputs, a heap if merges ever take
-        // dozens of inputs.
+        // A linear scan over the inputs; a heap would pay only for dozens of
+        // inputs.
         let mut min: Option<usize> = None;
         for (i, h) in self.heads.iter().enumerate() {
             let Some(h) = h else { continue };

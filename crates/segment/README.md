@@ -729,8 +729,8 @@ from 88 to 96 bytes).
 An annotation is a score, a label or a comment attached to a trace, or to one
 span of it, after the spans were written. This crate defines the record and its
 encoding (`Annotation`, `encode_batch`, `decode_batch`); the annotation part
-file (`annotations.nwa`, format version `ANNOTATION_FORMAT_VERSION` = 1) arrives
-with the next package.
+file (`annotations.nwa`, format version `ANNOTATION_FORMAT_VERSION` = 1) is
+described in the next section.
 
 **Identity.** `(trace_id, span_id, name, source)`. `Annotation::identity_cmp`
 orders by trace id, then span id (no span id first), then the bytes of the name,
@@ -778,3 +778,121 @@ bit that is reserved, text that is not UTF-8, a record `validate` refuses, or an
 identity that occurs twice in one body. It reserves memory only for as many
 records as the body's bytes can hold. `encode_batch` returns `InvalidArgument`,
 and writes nothing, for the same faults.
+
+## Annotations: the part
+
+An annotation part holds annotation records (see above) of one time window, one
+record per identity, in one file. It is the form annotations take once they have
+left the log. A part directory is `parts/<20-digit id>/` and holds one file,
+`annotations.nwa`; `PartMeta.kind` is `Annotations`.
+
+**Layout.** All integers little-endian.
+
+```
+blocks, back to back from offset 0: each a zstd level-3 frame of whole records
+        (the record encoding with arrival)
+block table, B entries of 36 bytes:
+        first_trace_id[16] | offset u64 | clen u32 | ulen u32 | crc32c(compressed bytes) u32
+footer, 80 bytes:
+  0 magic "NWAN" | 4 version u32 = 1 | 8 part_id u64 | 16 window_start_ns i64 | 24 window_ns i64
+ 32 records u64 | 40 traces u64 | 48 blocks B u64 | 56 min_time_ns i64 | 64 max_time_ns i64
+ 72 crc32c(block table) u32 | 76 crc32c(footer[0..76]) u32
+```
+
+Records are in strictly increasing identity order (`identity_cmp`) across the
+whole file, and there is at most one record per identity. A block is closed once
+it holds at least 16 KiB of uncompressed records; a record never crosses a
+block. A block's `ulen` is at most 32 KiB, a limit the reader enforces; the
+largest record is under 5 KiB, so a writer stays far below it. `first_trace_id`
+is the trace id of the block's first record. A trace can span several blocks, and
+then several consecutive blocks have it as first key.
+
+**`PartMeta` of an annotation part.** `rows` is the number of records, `traces`
+the number of distinct trace ids, `min_start_ns` and `max_end_ns` the smallest
+and largest `time_ns`, the window as given to the writer, `files` the one file
+and its length, `payload` zero, `format_version` 1.
+
+**The writer.** `AnnotationWriter::create` makes `<id>.tmp`; `append` refuses
+(`InvalidArgument`, writer still usable) a record `validate` refuses and one
+whose identity is not strictly greater than the previous one's; `finish` closes
+the last block, writes the table and the footer, syncs the file, syncs the
+directory, renames it into place and syncs the parts directory, as `PartWriter`
+does. A part without records is refused and nothing is left behind; a writer
+dropped without `finish` removes its temporary directory. A failure after the
+rename is `Fatal`: the part may or may not be durable, do not reuse its id.
+
+**Open checks**, in this order, each `Corrupt` (a missing file as well, through
+`Error::part_file_open`):
+
+1. the file has at least 80 bytes and the footer starts with the magic;
+2. the version, through `check_annotation_format_version`, before any checksum
+   is looked at: a file of another version is refused as such, whatever else is
+   wrong with it (there is no migration; a reader of version 1 refuses every
+   other version);
+3. the footer's checksum;
+4. `part_id`, `window_start_ns` and `window_ns` equal those of the `PartMeta`
+   given. This binds the file to its part: the file of another part, even one of
+   equal length and equal records, is refused;
+5. the table fits in the file; the file's length equals the sum of the `clen`
+   plus 36 x B plus 80, and equals `meta.files["annotations.nwa"]`;
+6. the table's checksum;
+7. blocks are contiguous from offset 0 (each `offset` is the end of the one
+   before);
+8. first keys do not decrease;
+9. every `ulen` is 1 to 32 KiB and every `clen` 1 to 64 KiB;
+10. B is at least 1;
+11. the footer's record count, trace count and time range equal the `PartMeta`'s.
+
+**Read checks**, for every block read, in this order: the CRC of the compressed
+bytes; decompression into exactly `ulen` bytes (the buffer is sized by the table,
+never by what the frame says, and a frame that holds more or fewer bytes is
+`Corrupt`); then strict decoding: every record decodes and passes `validate`,
+the block ends exactly after a record, identities increase strictly inside the
+block and from the last record of the block before, and the block's first trace
+id is the table's. A cursor that has failed returns the error once and then the
+end.
+
+**`verify`** reads every block with those checks and then compares the number of
+records, of distinct traces and the smallest and largest `time_ns` with the
+`PartMeta`; these are what open could not check.
+
+**Lookup.** `cursor(Some(trace))` binary-searches the first keys and reads the
+blocks that can hold the trace: block `i` can when `first_i <= trace <=
+first_(i+1)` (the last block when `first_i <= trace`). That is the blocks the
+trace spans, plus the one before the first of them when the trace is a block's
+first key; an id that is not stored reads at most one block.
+
+**Latest and merge.** Of all records with one identity the one with the largest
+`arrival` wins; on a tie the earlier input. `Latest` yields the winners of
+several cursors and of one more input held in memory (the last input), in
+identity order, deletes included. `merge_annotation_parts` merges parts of one
+window into one part with it. **A delete that wins is written to the output.**
+An older version of the same identity can be in a part of another time window,
+which this merge does not see; if the delete were dropped that version would
+become the winner again. `AnnotationMergeStats::superseded`
+counts the records of the inputs that are not in the output. Inputs of another
+window than the one given, or no input, are `InvalidArgument`. Every input is
+verified first. The stop flag is looked at before each input is verified and
+after every 64 output blocks; when it is set the temporary directory is removed
+and the result is `Unavailable("the merge was stopped")`.
+
+**Memory.** An open reader holds the file, the metadata and the table: 36 bytes
+per block, nothing per record or per trace. A cursor holds one compressed block
+(up to 64 KiB) and one decompressed block (up to 32 KiB), the last identity it
+returned, and one record. `Latest` and a merge hold that for each input, one
+record per input, and, for a merge, the writer's open block (under 21 KiB) and
+its table, 36 bytes per output block. Tests pin these: the table of two parts of
+equal block count and very different record sizes is the same size, and the peak
+resident memory of a merge of eight inputs does not grow when the inputs are four
+times larger.
+
+**Limits.** At most 32 KiB uncompressed per block; the most blocks are those
+that fit in a file (the table is read whole at open: 36 bytes per block, 36 MiB
+for a million blocks, about 16 GiB of records). A part has at most one record per
+identity, so a record is replaced by writing a later arrival into another part
+and merging, never in place.
+
+**Format version.** `ANNOTATION_FORMAT_VERSION` = 1, in the footer and in
+`PartMeta.format_version`. A reader that finds another version returns `Corrupt`
+naming the version found and the one understood, before it looks at anything else
+in the footer, and never guesses at the rest of the file.
