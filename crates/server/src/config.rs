@@ -96,18 +96,15 @@ pub fn parse(
             Some((n, v)) if n.starts_with("--") => (n.to_owned(), Some(v.to_owned())),
             _ => (arg, None),
         };
-        if name == "--accept-lost-log" {
+        if name == "--accept-lost-log" || name == "--no-compaction" {
             if inline.is_some() {
-                return Err("`--accept-lost-log` takes no value".into());
+                return Err(format!("`{name}` takes no value"));
             }
-            accept_lost_log = true;
-            continue;
-        }
-        if name == "--no-compaction" {
-            if inline.is_some() {
-                return Err("`--no-compaction` takes no value".into());
+            if name == "--accept-lost-log" {
+                accept_lost_log = true;
+            } else {
+                no_compaction = true;
             }
-            no_compaction = true;
             continue;
         }
         let slot = match name.as_str() {
