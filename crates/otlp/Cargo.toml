@@ -20,6 +20,7 @@ tempfile.workspace = true
 prost.workspace = true
 opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
 rand.workspace = true
+nwdb-testkit = { path = "../testkit" }
 
 [lints]
 workspace = true

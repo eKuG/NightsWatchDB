@@ -15,6 +15,7 @@
 use nwdb_core::{BatchLimits, PartMeta, SpanBatchBuilder, SpanId, SpanRecord, part_dir_name};
 use nwdb_otlp::OtlpSplitter;
 use nwdb_segment::{PartReader, PartWriter, WriterOptions};
+use nwdb_testkit::mem::memory;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
 use prost::Message;
 use std::path::Path;
@@ -25,17 +26,6 @@ const MIB: usize = 1 << 20;
 const PER_SPAN: u64 = 1 << 16;
 /// Attributes per span in the short-value phases.
 const ATTRS_PER_SPAN: u64 = 1 << 14;
-
-/// Peak and current resident memory of this process, in bytes.
-fn memory() -> (usize, usize) {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let kb = |key: &str| -> usize {
-        let line = status.lines().find(|l| l.starts_with(key)).unwrap();
-        let n: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-        n * 1024
-    };
-    (kb("VmHWM:"), kb("VmRSS:"))
-}
 
 fn string_kv(key: String, value: String) -> KeyValue {
     KeyValue {

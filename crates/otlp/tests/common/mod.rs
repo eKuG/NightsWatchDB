@@ -390,11 +390,7 @@ pub fn rand_request(rng: &mut StdRng, big: bool) -> ExportTraceServiceRequest {
 
 // ---- hand-built wire bytes ----
 
-pub fn varint(v: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    nwdb_core::put_varint(&mut out, v);
-    out
-}
+pub use nwdb_testkit::proto::{ld, varint};
 
 /// An `AnyValue` holding `levels` arrays inside each other, around an int.
 pub fn nested(levels: usize) -> Vec<u8> {
@@ -420,13 +416,6 @@ pub fn kv_bytes(key: &[u8], value: &[u8]) -> Vec<u8> {
 
 fn tag(field: u32, wire: u8) -> Vec<u8> {
     varint(u64::from(field) << 3 | u64::from(wire))
-}
-
-pub fn ld(field: u32, payload: &[u8]) -> Vec<u8> {
-    let mut out = tag(field, 2);
-    out.extend(varint(payload.len() as u64));
-    out.extend_from_slice(payload);
-    out
 }
 
 pub fn vf(field: u32, v: u64) -> Vec<u8> {

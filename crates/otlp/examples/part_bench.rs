@@ -42,14 +42,7 @@ use std::time::Instant;
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn status_kb(field: &str) -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with(field))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
-        })
-        .unwrap_or(0)
+    nwdb_testkit::mem::status_kb(field).unwrap_or(0) as u64
 }
 
 /// Restarts the peak resident size from the current one.

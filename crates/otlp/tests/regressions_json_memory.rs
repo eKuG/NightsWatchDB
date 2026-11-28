@@ -9,53 +9,8 @@ mod common;
 use common::{concat, kv_bytes, ld, nested, prefixed, vf};
 
 use nwdb_otlp::{write_attrs, write_events, write_links, write_resource};
+use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicIsize, Ordering};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static PEAK: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-fn grow(n: isize) {
-    let now = LIVE.fetch_add(n, Ordering::Relaxed) + n;
-    PEAK.fetch_max(now, Ordering::Relaxed);
-}
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE, grow};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                grow(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                grow(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                grow(n as isize - l.size() as isize);
-            }
-            q
-        }
-    }
-}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -75,11 +30,11 @@ impl Write for Count {
 
 /// Peak heap use above what was live before, and the bytes written.
 fn measure(f: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> (isize, usize) {
-    let base = LIVE.load(Ordering::SeqCst);
-    PEAK.store(base, Ordering::SeqCst);
+    let base = live();
+    reset_peak();
     let mut c = Count(0);
     f(&mut c).unwrap();
-    (PEAK.load(Ordering::SeqCst) - base, c.0)
+    (peak() - base, c.0)
 }
 
 fn repeat(item: &[u8], bytes: usize) -> Vec<u8> {

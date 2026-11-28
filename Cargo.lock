@@ -833,6 +833,7 @@ dependencies = [
  "nwdb-core",
  "nwdb-payload",
  "nwdb-segment",
+ "nwdb-testkit",
  "opentelemetry-proto",
  "prost",
  "rand",
