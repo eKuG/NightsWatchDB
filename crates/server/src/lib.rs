@@ -62,6 +62,11 @@ pub struct ServerOptions {
     /// How long an API response may make no progress on the socket (the
     /// client does not read) before the connection is closed. Default 30 s.
     pub api_write_timeout: Duration,
+    /// Largest request body the API accepts, in bytes. Default 1 MiB.
+    pub api_max_body_bytes: usize,
+    /// How long a sender has to deliver a whole request body to the API,
+    /// counted from the moment the request has its slot. Default 30 s.
+    pub api_body_timeout: Duration,
     /// Open connections the OTLP door serves at once. Default 1024.
     pub otlp_max_connections: usize,
     /// Open connections the API serves at once. Default 256.
@@ -86,6 +91,8 @@ impl ServerOptions {
             budget_wait: Duration::from_secs(5),
             max_calls: 256,
             api_write_timeout: Duration::from_secs(30),
+            api_max_body_bytes: 1024 * 1024,
+            api_body_timeout: Duration::from_secs(30),
             otlp_max_connections: 1024,
             api_max_connections: 256,
         }
@@ -167,7 +174,15 @@ impl Server {
         let listener = TcpListener::bind(options.api_addr).await?;
         let api_addr = listener.local_addr()?;
         let hosts = api::HostCheck::new(api_addr.ip(), &options.api_allowed_hosts);
-        let service = TowerToHyperService::new(api::router(engine.clone(), fatal.clone(), hosts));
+        let service = TowerToHyperService::new(api::router(
+            engine.clone(),
+            fatal.clone(),
+            hosts,
+            api::BodyLimits {
+                max: options.api_max_body_bytes,
+                timeout: options.api_body_timeout,
+            },
+        ));
         let h1 = serve::h1_builder();
         let write_timeout = options.api_write_timeout;
         let api = tokio::spawn(serve::run(

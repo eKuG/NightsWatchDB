@@ -40,10 +40,16 @@ const CHUNKS_IN_FLIGHT: usize = 4;
 const PROTOBUF: &str = "application/x-protobuf";
 const TRACE_PREFIX: &str = "/api/v1/traces/";
 
+mod body;
+pub(crate) use body::BodyLimits;
+#[allow(unused_imports)] // used by the first write endpoint
+pub(crate) use body::JsonBody;
+
 #[derive(Clone)]
 struct Api {
     engine: Engine,
     fatal: Arc<Notify>,
+    body: BodyLimits,
 }
 
 /// Which `Host` headers the API answers to. A web page can make a browser send
@@ -171,24 +177,54 @@ async fn guard(State(g): State<Arc<Guard>>, mut req: Request, next: Next) -> Res
 }
 
 /// The routes of the API.
-pub(crate) fn router(engine: Engine, fatal: Arc<Notify>, hosts: HostCheck) -> Router {
+pub(crate) fn router(
+    engine: Engine,
+    fatal: Arc<Notify>,
+    hosts: HostCheck,
+    body: BodyLimits,
+) -> Router {
     let guard_state = Arc::new(Guard {
         hosts,
         slots: Arc::new(Semaphore::new(MAX_CONCURRENT)),
     });
-    Router::new()
+    let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/traces", get(list_traces))
         .route("/api/v1/traces/{trace_id}", get(get_trace))
         .route("/api/v1/tokens", get(tokens))
-        .route("/api/v1/search", get(search))
+        .route("/api/v1/search", get(search));
+    write_routes(routes)
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "no such path") })
         .method_not_allowed_fallback(|| async {
-            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "only GET is supported")
+            ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the method is not supported on this path",
+            )
         })
-        .with_state(Api { engine, fatal })
+        .with_state(Api {
+            engine,
+            fatal,
+            body,
+        })
         .layer(from_fn_with_state(guard_state, guard))
+}
+
+/// The routes that take a POST. A handler of one takes [`JsonBody`] as its
+/// last argument, which applies every rule for write requests. A path listed
+/// here answers 405 to GET; every path not listed answers 405 to a POST.
+fn write_routes(routes: Router<Api>) -> Router<Api> {
+    #[cfg(test)]
+    let routes = routes.route(
+        "/api/v1/test/body",
+        axum::routing::post(|JsonBody(b): JsonBody| async move {
+            let sum = b
+                .iter()
+                .fold(0u64, |s, &x| s.wrapping_mul(31).wrapping_add(x.into()));
+            json_response(StatusCode::OK, &json!({ "len": b.len(), "sum": sum }))
+        }),
+    );
+    routes
 }
 
 // ---- errors ----
@@ -941,6 +977,10 @@ mod tests {
         let api = Api {
             engine: engine.clone(),
             fatal: Arc::new(Notify::new()),
+            body: BodyLimits {
+                max: 0,
+                timeout: Duration::ZERO,
+            },
         };
         let slots = Arc::new(Semaphore::new(1));
         let slot: Slot = Arc::new(slots.clone().acquire_owned().await.unwrap());

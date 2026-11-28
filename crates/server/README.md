@@ -24,6 +24,23 @@ model output. For that reason both listeners default to the loopback address
   configured, the check is **off**: whoever exposed it did so on purpose, and
   the server cannot know which names reach it. Set `--api-allowed-hosts`
   whenever the API is reachable by a name other than an IP address.
+- **Cross-site requests to write endpoints.** The API is read-only today; its
+  write endpoints (the first arrives with checkpoint 7) take a POST with a JSON
+  body. A web page can make a browser send a POST to `127.0.0.1` with the
+  right `Host`, so the host check does not stop it. The defence is to refuse
+  every request a page can send across sites without a CORS preflight, and to
+  never answer a preflight with permission: no response of the API carries an
+  `Access-Control-*` header, and an `OPTIONS` request is answered 405 (404 on
+  a path that does not exist). A write request is refused with 415 unless its
+  `Content-Type` is `application/json` (any case, optional parameters, and
+  `charset` only `utf-8`): `text/plain`, `application/x-www-form-urlencoded`
+  and `multipart/form-data` are the only types a page can send without a
+  preflight. It is refused with 403 if it has an `Origin` that is not
+  `http://` plus its own `Host` (so `Origin: null` is refused too), or a
+  `Sec-Fetch-Site` other than `same-origin` or `none`. A request with no
+  `Origin`, such as one from curl or an SDK, is accepted. Because there is no
+  authentication, anything on the machine that can reach the port can still
+  write.
 - **Docker.** The container image listens on `0.0.0.0` inside the container,
   so the published port is the access control. Publish the ports on the
   loopback address only: `-p 127.0.0.1:4317:4317 -p 127.0.0.1:4320:4320`.
@@ -293,12 +310,39 @@ default, a field of `ServerOptions`) is aborted. The connection is closed, the
 task that renders the response ends, and its rows and its slot are freed. A
 client that reads slowly but steadily is not cut off.
 
+**Write requests.** Every route is a GET today. A path that takes a POST (the
+first arrives with checkpoint 7) answers 405 to a GET, and every other path
+answers 405 to a POST. A handler of a write path receives the body through
+`JsonBody` (in `src/api/body.rs`), which applies these rules after the `Host`
+check and after the request has its concurrency slot, so the bodies held in
+memory at one time are at most the limit x 64 slots. The body is handed over as
+it was sent; the handler parses it, and decides what an empty body means.
+Requests that are refused: 403 for a cross-site `Origin` or `Sec-Fetch-Site`
+(see Security), 415 for a `Content-Type` that is not `application/json` in
+UTF-8 or for a `Content-Encoding` other than `identity` (the API does not
+decompress), 413 for a body over the limit, 408 for a body not received in
+time. A `Content-Length` over the limit is refused before any byte of the body
+is read; a body without one (chunked) is read up to the limit and refused once
+it passes it. A sender that has to be cut off for 408 or 413 has its
+connection closed after the response.
+
+| Limit | Default |
+|---|---|
+| Request body (`api_max_body_bytes`) | 1 MiB; worst-case memory for bodies is limit x 64 slots, 64 MiB by default |
+| Time to receive a whole request body (`api_body_timeout`) | 30 s from the moment the request has its slot, then 408 and the slot is freed |
+
+Neither has a command-line flag. The body timeout is a total, not a time
+without progress: a sender that trickles one byte at a time is cut off at the
+deadline like one that stops, so no sender holds a slot longer than the
+timeout.
+
 All responses are JSON, except `/healthz` and the protobuf form of a trace.
 Errors are always `{"error": "<message>"}`: 400 for bad input (including an
 unknown parameter name and percent-encoding that is wrong or not UTF-8), 404
-for a missing trace or path, 405 for a method other than GET, 421 for a `Host`
-that is not allowed (see Security), 503 for an engine that is unavailable or
-fatal, 500 otherwise. The one exception is a request that the HTTP library
+for a missing trace or path, 405 for a method the path does not take, 408, 413
+and 415 for write requests (above), 421 for a `Host`
+that is not allowed (see Security), 403 for a cross-site write request, 503 for an engine that is
+unavailable or fatal, 500 otherwise. The one exception is a request that the HTTP library
 cannot parse at all (for example a header line without a colon): the library
 answers it itself with status 400 and no body, before any of this code runs.
 Fields that are null are left out. In percent-encoding `%` must be followed by
