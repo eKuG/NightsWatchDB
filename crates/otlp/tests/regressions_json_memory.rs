@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{concat, kv_bytes, ld, nested, prefixed, varint, vf};
+use common::{concat, kv_bytes, ld, nested, prefixed, vf};
 
 use nwdb_otlp::{write_attrs, write_events, write_links, write_resource};
 use std::io::{self, Write};
