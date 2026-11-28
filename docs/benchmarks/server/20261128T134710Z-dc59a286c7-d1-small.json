@@ -1,0 +1,76 @@
+{
+  "commit": "dc59a286c7",
+  "dirty": true,
+  "date": "2026-11-28T13:50:57Z",
+  "dataset": {"name": "d1", "generator_flags": "--bytes 8GB --seed 1", "crash_batch_flags": "--traces 20 --seed 2", "compression": "gzip", "spans": 91419, "traces": 5014, "encoded_bytes": 8018129217},
+  "profile": {"name": "small", "cpus": 2, "memory": "4g"},
+  "environment": {
+    "host_cpu": "Apple M4 Pro", "host_cores": 14,
+    "docker_version": "29.9.3", "docker_platform": "linux/aarch64", "docker_kernel": "7.0.14-linuxkit",
+    "docker_vm_cpus": 14, "docker_vm_memory_bytes": 16787087360
+  },
+  "images": {"server": "sha256:1bc3c739a4b5a084689c66f489037bb65d29acf8bf489e4b271b852415cea9b3", "tracegen": "sha256:32dbf03f239fdb773d60818ab56ad309604803d42b381f994d4c95dfb5bb0e06", "querybench": "sha256:dda0ab33371edbb7f8894daa96205bb933fb98dee94787f83f375ddb9f52274b"},
+  "measured_with": "cgroup",
+  "ingest": {
+    "spans": 91419, "encoded_bytes": 8018129217, "wire_bytes": 1372039318, "wall_s": 95.276,
+    "spans_per_s": 960, "encoded_mb_per_s": 84.2, "wire_mb_per_s": 14.4,
+    "server_cpu_s": 25.04, "server_cpu_user_s": 22.74, "server_cpu_sys_s": 2.30,
+    "server_cpu_s_per_million_spans": 273.90, "server_peak_memory_bytes": 945553408
+  },
+  "compaction": {
+    "enabled": true, "quiet": "5s",
+    "settle_s": 39, "settle_cpu_s": 0.59,
+    "parts_at_end_of_load": 63, "parts_settled": 61,
+    "engine_stats_settled": {"acked_lsn":2684,"annotation_bytes":0,"annotation_parts":0,"annotations_buffered":0,"annotations_dropped":0,"annotations_superseded":0,"annotations_written":0,"buffered_bytes":0,"bytes_ingested":8018118481,"duplicate_spans_dropped":0,"fatal":false,"flushed_lsn":2684,"flushes":45,"flushing":false,"last_compaction_error":null,"last_error":null,"last_maintenance_error":null,"maintenance_passes":49,"merge_input_bytes":72969792,"merge_output_bytes":65569090,"merges_done":43,"merging":false,"parts":61,"parts_merged_away":87,"payload_logical_bytes":7963785886,"payload_stored_bytes":47471740,"payload_unique_bytes":305860403,"records_ingested":2684,"retention_parts_removed":0,"windows_with_many_parts":0}
+  },
+  "storage": {
+    "parts_bytes": 87757396, "wal_bytes": 4116, "manifest_bytes": 307676, "total_bytes": 88073284,
+    "parts": 61, "bytes_per_span": 963.4, "parts_bytes_per_span": 959.9
+  },
+  "restart": {"clean_ms": 77.4, "crash_ms": 163.6, "crash_batch_spans": 750, "server_peak_memory_after_restarts_bytes": 113463296},
+  "annotations": {"sent": 553, "accepted": 553, "rejected": 0, "post_s": 0.015, "per_s": 36414.5,
+    "in_parts_after_s": 24.9, "settle_after_s": 7,
+    "annotation_parts_after_flush": 63, "annotation_bytes_after_flush": 26115,
+    "annotation_parts_settled": 63, "annotation_bytes_settled": 26115,
+    "bytes_per_annotation": 47.2,
+    "volume_after": {"total_bytes": 89536364, "parts_bytes": 88943443, "wal_bytes": 4116, "measured_with_server_running": true}},
+  "queries": {"config":{"addr":"nwdb-bench-91824-server:4320","from_ns":1767225600000000000,"to_ns":1767315600000000000,"hour_start_ns":1767268800000000000,"n":200,"warmup":20,"seed":1,"concurrency":1,"service":"ops-agent","model":"gpt-4o"},
+"annotation":null,
+"exp_params":{"service":"ops-agent","model":"gpt-4o","from_ns":1767246923631512991,"to_ns":1767289560123850795,"min_span_start_ns":1767225605385344089,"max_span_start_ns":1767310878370019697},
+"discovered_traces":5034,"discovery_ms":30.6,"server_span_count":92169,"token_rows_truncated":false,
+"kinds":[
+{"kind":"open_trace","count":200,"errors":0,"p50_ms":1.723,"p95_ms":22.037,"p99_ms":59.928,"max_ms":78.116,"bytes":467045237},
+{"kind":"list_newest_50","count":200,"errors":0,"p50_ms":0.444,"p95_ms":0.501,"p99_ms":0.546,"max_ms":0.589,"bytes":3519000},
+{"kind":"list_service_50","count":200,"errors":0,"p50_ms":0.746,"p95_ms":0.799,"p99_ms":0.867,"max_ms":0.872,"bytes":3457400},
+{"kind":"list_model_50","count":200,"errors":0,"p50_ms":0.564,"p95_ms":0.63,"p99_ms":0.7,"max_ms":0.793,"bytes":3439400},
+{"kind":"list_error_50","count":200,"errors":0,"p50_ms":0.507,"p95_ms":0.601,"p99_ms":0.647,"max_ms":0.786,"bytes":3523400},
+{"kind":"tokens_range","count":200,"errors":0,"p50_ms":3.665,"p95_ms":3.764,"p99_ms":3.801,"max_ms":4.002,"bytes":155200},
+{"kind":"tokens_hour","count":200,"errors":0,"p50_ms":0.571,"p95_ms":0.599,"p99_ms":0.608,"max_ms":0.741,"bytes":149600},
+{"kind":"exp_list1","count":200,"errors":0,"p50_ms":0.75,"p95_ms":0.823,"p99_ms":0.846,"max_ms":0.873,"bytes":3457400},
+{"kind":"exp_list2","count":200,"errors":0,"p50_ms":0.923,"p95_ms":1.005,"p99_ms":1.073,"max_ms":1.369,"bytes":3456600},
+{"kind":"exp_agg","count":200,"errors":0,"p50_ms":2.308,"p95_ms":2.397,"p99_ms":2.422,"max_ms":2.462,"bytes":143600},
+{"kind":"search_word","count":200,"errors":0,"p50_ms":0.267,"p95_ms":0.31,"p99_ms":0.464,"max_ms":0.5,"bytes":1028200},
+{"kind":"search_common_word","count":200,"errors":0,"p50_ms":0.277,"p95_ms":0.314,"p99_ms":0.411,"max_ms":0.453,"bytes":1019000},
+{"kind":"search_and","count":200,"errors":0,"p50_ms":0.301,"p95_ms":0.342,"p99_ms":0.38,"max_ms":0.619,"bytes":1031400},
+{"kind":"search_or","count":200,"errors":0,"p50_ms":0.235,"p95_ms":0.264,"p99_ms":0.273,"max_ms":0.382,"bytes":1031400},
+{"kind":"search_not","count":200,"errors":0,"p50_ms":0.569,"p95_ms":0.62,"p99_ms":0.73,"max_ms":0.864,"bytes":926600},
+{"kind":"search_phrase","count":200,"errors":0,"p50_ms":1.726,"p95_ms":1.824,"p99_ms":1.972,"max_ms":1.978,"bytes":1031400},
+{"kind":"search_prefix","count":200,"errors":0,"p50_ms":0.274,"p95_ms":0.333,"p99_ms":0.518,"max_ms":0.567,"bytes":1028200},
+{"kind":"search_no_hit","count":200,"errors":0,"p50_ms":0.18,"p95_ms":0.202,"p99_ms":0.212,"max_ms":0.248,"bytes":8000}
+]},
+  "annotation_queries": {"config":{"addr":"nwdb-bench-91824-server:4320","from_ns":1767225600000000000,"to_ns":1767315600000000000,"hour_start_ns":1767268800000000000,"n":200,"warmup":20,"seed":1,"concurrency":1,"service":"ops-agent","model":"gpt-4o"},
+"annotation":{"sent":553,"accepted":553,"rejected":0,"seconds":0.015,"per_s":36414.5,"flush_wait_s":24.9,"quality_traces":503,"annotation_parts":63,"annotation_bytes":26115,"annotations_written":553,"annotations_dropped":0},
+"exp_params":{"service":"ops-agent","model":"gpt-4o","from_ns":1767246923631512991,"to_ns":1767289560123850795,"min_span_start_ns":1767225605385344089,"max_span_start_ns":1767310878370019697},
+"discovered_traces":5034,"discovery_ms":22.7,"server_span_count":92169,"token_rows_truncated":false,
+"kinds":[
+{"kind":"annotate_post_500","count":2,"errors":0,"p50_ms":2.002,"p95_ms":12.949,"p99_ms":12.949,"max_ms":12.949,"bytes":59},
+{"kind":"open_trace_annotated","count":200,"errors":0,"p50_ms":1.699,"p95_ms":9.413,"p99_ms":28.314,"max_ms":69.066,"bytes":257868163},
+{"kind":"list_annotated_50","count":200,"errors":0,"p50_ms":1.031,"p95_ms":1.115,"p99_ms":1.238,"max_ms":1.477,"bytes":4735200},
+{"kind":"list_annotation_label_50","count":200,"errors":0,"p50_ms":4.283,"p95_ms":4.48,"p99_ms":4.55,"max_ms":5.222,"bytes":4467400},
+{"kind":"list_annotation_value_50","count":200,"errors":0,"p50_ms":4.204,"p95_ms":4.332,"p99_ms":4.357,"max_ms":4.375,"bytes":2600},
+{"kind":"open_trace_after","count":200,"errors":0,"p50_ms":1.592,"p95_ms":23.197,"p99_ms":54.532,"max_ms":76.448,"bytes":467048150},
+{"kind":"list_newest_50_after","count":200,"errors":0,"p50_ms":0.569,"p95_ms":0.648,"p99_ms":0.719,"max_ms":0.82,"bytes":3680600}
+]},
+  "server_peak_memory_after_queries_bytes": 222519296,
+  "server_peak_memory_after_annotations_bytes": 281788416
+}

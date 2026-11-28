@@ -89,7 +89,9 @@ experiments. `standard` is 8 CPUs and 12 GB.
   50 traces, the same with a `service`, a `model` and an `error=true` filter,
   token totals over the whole range and over one hour, and eight searches of
   message text over the whole range, newest 20 spans each (a word, a common
-  word, AND, OR, NOT, a phrase, a prefix, a word that is nowhere). Count, errors, p50, p95,
+  word, AND, OR, NOT, a phrase, a prefix, a word that is nowhere), and, in a
+  second phase after annotations were written, opening annotated traces and
+  listing by annotation. Count, errors, p50, p95,
   p99 and max in milliseconds (nearest rank) and bytes received. One request at
   a time unless a concurrency is set. The peak memory of the query phase is the
   peak since the last start of the server, so it includes the log replay.
@@ -343,3 +345,102 @@ index: the queries are not the same ones.
 - Search was measured with eight fixed queries on one dataset. That shows the
   order of magnitude and nothing about rare words over many parts, large
   result sets or concurrent searches.
+
+### Results at checkpoint 7
+
+Run on 2026-11-28 with the `small` profile (2 CPUs, 4 GB) on the same machine,
+nothing else running, commit `dc59a28`. Checkpoint 7 adds scores and
+annotations. The harness now runs in two phases: first every query of the
+earlier checkpoints, unchanged, so the numbers compare; then it writes
+annotations through the HTTP API (a `quality` score on 10% of the traces and a
+`human` label on another 1%, 500 per request, one request at a time), waits
+until they are in parts, and times the queries that use them. The files are in
+[server/](server/).
+
+**Span-only data (`d2`): 10,000,039 spans, 545,163 traces; 59,967 annotations.**
+
+| Annotations | |
+|---|---|
+| Written | 59,967 in 1.5 s: 39,900 a second, each request answered after its log sync (12.5 ms at the median for 500) |
+| In parts after | 29 s (the flush interval is 30 s) |
+| On disk | 1.74 MB in 95 annotation parts, one per window: 29 bytes an annotation |
+| Span data | unchanged: 431 MB, 43 bytes per span |
+
+| Query | p50 ms | p99 ms |
+|---|---|---|
+| Open an annotated trace | 0.67 | 1.06 |
+| List the newest 50 traces with a `quality` score (one trace in ten has one) | 1.82 | 2.21 |
+| List 50 with the label `human` = `down` (one trace in a hundred) | 3.75 | 5.18 |
+| List 50 with `quality` at least 0.999 (one trace in ten thousand, whole range) | 236 | 246 |
+| List the newest 50 traces, no filter, annotations present | 1.21 | 1.36 |
+
+| The queries of earlier checkpoints | Checkpoint 6 | Now |
+|---|---|---|
+| Open a trace, p50 | 0.56 ms | 0.55 ms |
+| List the newest 50 traces, p50 | 0.71 ms | 0.70 ms |
+| List 50 for one service / one model / with an error, p50 | 0.90 / 0.78 / 0.74 ms | 0.89 / 0.76 / 0.72 ms |
+| Token totals, whole range / one hour, p50 | 296 / 16.1 ms | 295 / 16.3 ms |
+| Server CPU for the load | 47.7 s | 45.1 s |
+| Server peak memory during the load | 1,148 MiB | 1,158 MiB |
+| Restart after a clean stop / after `kill -9` | 135 / 140 ms | 142 / 135 ms |
+
+**Text-heavy data (`d1`): 8.0 GB of agent traces, 91,419 spans, 5,034 traces;
+553 annotations.** The dataset has few traces, so the annotation figures say
+little; the queries of earlier checkpoints are what matters here.
+
+| | Checkpoint 6 | Now |
+|---|---|---|
+| Stored, all part files | 87.8 MB | 87.8 MB |
+| Open a trace, p50 / p99 | 1.5 / 54 ms | 1.7 / 60 ms |
+| List the newest 50 traces, p50 | 0.45 ms | 0.44 ms |
+| Token totals, whole range, p50 | 3.4 ms | 3.7 ms |
+| Search: a word / AND / OR / NOT / prefix, p50 | 0.27 / 0.30 / 0.24 / 0.57 / 0.27 ms | 0.27 / 0.30 / 0.24 / 0.57 / 0.27 ms |
+| Search: a phrase, p50 | 1.50 ms | 1.73 ms |
+| Server CPU for the load | 25.0 s | 25.0 s |
+
+**What the numbers say.**
+
+- An annotation costs 29 bytes on disk when a window holds thousands of them.
+  A part with a handful (the text-heavy set has nine a window) is mostly its
+  footer: 47 bytes each there.
+- A filter that many traces match answers in about a millisecond: the listing
+  stops as soon as it has fifty. A filter that almost none match has to look
+  at every trace in the range: 236 ms over 545,163 traces. The annotations
+  themselves are scanned once per window; the time goes into reading every
+  trace summary. Driving such a query from the annotations instead is not
+  built.
+- Listing traces costs 0.5 ms more per 50 once annotations exist, because
+  each listed trace's annotations are looked up. On a database without
+  annotations nothing is looked up and the time is what it was. A first run
+  of this benchmark showed the listing a third slower even without
+  annotations; that is what led to the fix.
+- Annotations do not change what the span data takes, what a load costs, or
+  how long a restart takes.
+- **A phrase search is 15% slower than at checkpoint 6, and it is not fully
+  explained.** The first run of this checkpoint measured 2.44 ms against 1.50.
+  Running the checkpoint 6 code on the same day gave 1.54 ms, so the code was
+  slower, not the machine, and running the benchmark at five commits in
+  between placed the change at the engine's annotation commit, which does not
+  touch the search code. A profile put all of the extra time inside the
+  decompression of the text blocks a phrase is confirmed against: the same
+  blocks, the same calls and the same machine code, slower. Page faults,
+  allocator settings, thread wake-ups and code placement were each measured
+  and ruled out; the virtual machine offers no hardware counters to go
+  further. What the investigation did find is that the reader made a new
+  decompression context and megabyte buffers for every block. Reusing them
+  for a whole read brought the phrase search to 1.73 ms. The remaining 0.2 ms
+  is open.
+- **A second number moved without its code changing.** On the span-only data
+  the search `error -import` (which finds nothing there, but builds the list
+  of all rows of every part to subtract from) took 3.1 ms at checkpoint 6 and
+  before the reader change above, and 5.3 ms after it, in two runs, although
+  that dataset has no text and the changed code does not run. Like the phrase
+  search it is a loop that moves a lot of memory. Until the cause is found,
+  a difference of this size in such a query, between two builds, cannot be
+  told from an effect of how the build lays out memory, on this machine.
+
+**What this run does not show.** Annotating old traces across many windows
+writes one small part per window and flush before merging catches up; the run
+writes its annotations within two seconds, so they land in one flush. Many
+writers at once, annotations with comments, and traces with thousands of
+annotations were not measured.

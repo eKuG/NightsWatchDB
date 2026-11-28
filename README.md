@@ -8,10 +8,10 @@ store.
 > experiments and the engine is being built in checkpoints. Today it runs as a
 > single process that accepts traces over OTLP gRPC and answers over HTTP:
 > open a trace, list traces, token totals and full-text search of message
-> text. Repeated text is stored once, parts are merged in the background and
-> retention removes old data. It is not ready for production: there is no
-> authentication or TLS, logs and metrics are not accepted yet, and there is
-> no SQL. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md) for what works today.
+> text, and attach scores and annotations to traces afterwards. Repeated text
+> is stored once, parts are merged in the background and retention removes old
+> data. It is not ready for production: there is no authentication or TLS,
+> logs and metrics are not accepted yet, and there is no SQL. See [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md) for what works today.
 
 ## Why another database
 
@@ -78,29 +78,34 @@ caveats are in [docs/benchmarks](docs/benchmarks/README.md).
 
 ## What the server measures today
 
-At checkpoint 6, on a laptop in Docker with 2 CPUs and 4 GB. Method, caveats
+At checkpoint 7, on a laptop in Docker with 2 CPUs and 4 GB. Method, caveats
 and every number: [docs/benchmarks](docs/benchmarks/README.md).
 
 | | NightsWatchDB server | ClickHouse baseline (earlier run) |
 |---|---|---|
 | 8 GB of agent-trace text, stored with a text index | 88 MB | 496 MB + 119 MB index |
 | ... newest 50 traces with an error and one model, median | 0.9 ms | 586 ms |
-| ... token totals of chat spans by model, median | 2.2 ms | 420 ms |
+| ... token totals of chat spans by model, median | 2.3 ms | 420 ms |
 | ... search for a word, newest 20 spans, median | 0.3 ms | not measured on this run |
-| ... search for a phrase, median | 1.5 ms | not measured on this run |
+| ... search for a phrase, median | 1.7 ms | not measured on this run |
 | 10M spans without text, stored | 431 MB | 469 MB |
-| ... open a trace, median | 0.6 ms | 11.5 ms |
+| ... open a trace, median | 0.5 ms | 11.5 ms |
 | ... newest 50 traces of one service, median | 0.8 ms | 4.9 ms |
 | ... newest 50 traces with an error and one model, median | 0.8 ms | 773 ms |
-| ... token totals of chat spans by model, median | 154 ms | 272 ms |
+| ... token totals of chat spans by model, median | 153 ms | 272 ms |
+| ... write 60,000 scores over HTTP | 39,900 a second, 29 bytes each on disk | not measured |
+| ... newest 50 traces that have a score (one in ten does), median | 1.8 ms | not measured |
+| ... newest 50 traces with a rare score value (one in ten thousand), median | 236 ms | not measured |
 
 The list and token queries and their parameters are the same on both sides.
 The runs are not: the baseline used the Collector exporter's schema as shipped
 and was measured on another day, and the server is measured over HTTP. A
 schema tuned for these queries would do much better than the baseline here.
 
-Where it is behind: token totals over many spans run on one thread, opening a
-very large trace has a slow tail (54 ms at the 99th percentile), and a load
+Where it is behind: token totals over many spans run on one thread, a filter
+that almost no trace matches reads every trace in the range, opening a very
+large trace has a slow tail (60 ms at the 99th percentile), a phrase search is
+15% slower than a checkpoint ago for a reason only partly found, and a load
 peaks at about 1 GB of memory.
 
 ## Running it
@@ -120,10 +125,15 @@ curl 'http://127.0.0.1:4320/api/v1/traces?limit=10'
 curl  http://127.0.0.1:4320/api/v1/traces/<trace id>
 curl  http://127.0.0.1:4320/api/v1/tokens
 curl 'http://127.0.0.1:4320/api/v1/search?q=%22rate+limit%22+-retry*'
+curl -H 'Content-Type: application/json' http://127.0.0.1:4320/api/v1/annotations \
+  -d '{"annotations":[{"trace_id":"<trace id>","name":"quality","value":0.2,"label":"bad"}]}'
+curl 'http://127.0.0.1:4320/api/v1/traces?annotation=quality&annotation_max=0.5'
 ```
 
 The ports are published on the loopback address on purpose: there is no
-authentication yet. Configuration, the API and the limits are described in
+authentication yet. The API answers requests addressed to an IP address or to
+`localhost`; to reach it by another name, list the name in
+`--api-allowed-hosts`. Configuration, the API and the limits are described in
 the [server README](crates/server/README.md).
 
 ## Building and testing

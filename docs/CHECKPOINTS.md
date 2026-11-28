@@ -5,7 +5,7 @@ its tests pass in a Linux container, it has been through an independent
 review, and it is committed, tagged `checkpoint-NN` and pushed.
 
 ```
-Progress  [███████░░░░░░░░░]  7 of 16 checkpoints
+Progress  [████████░░░░░░░░]  8 of 16 checkpoints
 ```
 
 | # | Checkpoint | State |
@@ -17,7 +17,7 @@ Progress  [███████░░░░░░░░░]  7 of 16 checkpoint
 | 4 | Large text out of line, each distinct piece stored once | done |
 | 5 | Text index over distinct pieces; search | done |
 | 6 | Compaction, retention, late spans | done |
-| 7 | Scores and annotations | |
+| 7 | Scores and annotations | done |
 | 8 | Logs | |
 | 9 | Metrics | |
 | 10 | SQL and a Postgres-compatible endpoint | |
@@ -454,3 +454,132 @@ Known limits at this checkpoint:
   of the output, whichever is in progress.
 - The fixes of the last pass have had removal checks but no further
   independent examination.
+
+## Checkpoint 7: scores and annotations
+
+Evaluation scores, human labels and feedback arrive minutes or days after the
+spans they are about, and span files are immutable. An annotation is now a
+record of its own, attached to a trace or to one span of it.
+
+- **The record.** A name (`accuracy`, `thumbs`), a source (who or what made
+  it), a time, a number and/or a short label, an optional comment. Written
+  again for the same trace, span, name and source, the latest write wins; a
+  delete removes it.
+- **Writing.** `POST /api/v1/annotations` takes up to 1,000 at a time. The
+  answer comes after the write is in the log and synced, and from then on the
+  annotation shows. An annotation for a trace the database does not hold is
+  refused, by its position in the request; the others are written.
+- **Storage.** Annotations are flushed into immutable annotation parts beside
+  the span parts, in the same time windows, listed in the same manifest
+  (format version 2; version 1 is still read) and committed in the same step.
+  The file has its own small format: checksummed compressed blocks and a table
+  that finds one trace's annotations by reading one block. Which version wins
+  is decided by the number of the log record that carried it, so a crash, a
+  restart or a merge cannot change it.
+- **Reading.** A trace shows its annotations. The trace list filters on them
+  (has a score named so, a value range, a label) and shows up to eight per
+  trace. A filter scans a window's annotations once instead of looking up each
+  trace.
+- **Merging and expiry.** Annotation parts of a window are merged into one,
+  and removed with their window by retention, in the same step as its spans.
+  An annotation is stored in the window that ends last among those holding its
+  trace, so removing an older window can never bring an overwritten value
+  back. A delete is kept by merges for the same reason.
+- **The first write endpoint, and what it needed.** The API had only ever
+  answered reads. A write endpoint on an unauthenticated local port can be
+  reached by any web page in the user's browser, so a write must be JSON by
+  content type, must not come from another origin, is at most 1 MiB, and must
+  arrive within a deadline. No cross-origin permission is ever granted.
+
+Not built: deleting traces or spans, annotations arriving over OTLP, and a
+summary of scores over time. The last waits for SQL.
+
+How it was tested: the encodings and the part file against truncation at
+every length and every single flipped bit (no flipped bit yields a wrong
+record); random walks of annotate, overwrite, delete, flush, restart, merging
+and expiry against a model; the process aborted at every stage of a flush, of
+an annotation merge and of a retention step, with every acknowledged
+annotation required exactly once afterwards; hand-written HTTP for the write
+rules; and the end-to-end run, which now annotates, overwrites, deletes and
+tries three cross-site writes, and checks the result from memory, after
+`kill -9` and after a clean stop.
+
+Three independent examinations found fourteen defects, each proven with a
+failing test before it was fixed:
+
+- **A web page could read traces, and now write annotations, in the container
+  set-up.** The check of the `Host` header, the defence against DNS rebinding
+  since checkpoint 3, switched itself off when the server listened on all
+  interfaces, which the container image does. It is now always on: an address
+  or `localhost` is accepted, any other name only when it is listed.
+- An overwritten or deleted annotation could come back after retention when
+  the window width had been changed between runs, and, through a rare race
+  between a flush and retention, when the clock stepped back.
+- One request for a trace list could hold a gigabyte, and a list with a
+  filter took time that grew with the square of the annotations in memory.
+- A filter that matched more than a million traces of one window failed
+  instead of answering.
+- A request written as a JSON array instead of an object was accepted; the
+  reply to a malformed request repeated the request, three times larger.
+- A planted annotation file made the reader allocate as much as the file was
+  long before checking its length.
+- A merge whose result could not be opened marked its window as damaged until
+  the next restart.
+
+A second, independent pass over the fixes found four of the fourteen only
+partly closed, and new problems the fixes had brought. The check that was
+meant to keep an annotation out of an expired window compared windows where
+it should have compared traces, so it could still misplace an annotation and
+could drop one whose trace was live; a flush now starts over when retention
+removed parts while it was deciding. The trace list, made to stream so that it
+would not hold a gigabyte, held the whole database snapshot for as long as a
+slow client read it; it now reads its page, lets the snapshot go, and then
+replies. The always-on `Host` check had also closed the health endpoint to
+load balancers that address it by name; `/healthz`, which says only `ok`, is
+exempt again. These are fixed with tests; each fix that changes behaviour was
+then removed once more to see its test fail.
+
+The benchmark found one thing the tests had not: listing the newest fifty
+traces had become a third slower on a database with no annotations at all,
+because each listed trace was looked up in every part before finding there was
+nothing to read. Nothing is looked up now when there is nothing.
+
+A pass over the whole code base for duplicated and unused code ran beside the
+checkpoint: about a thousand lines went, among them nine copies of a counting
+allocator and ten of a varint encoder, with no change in behaviour.
+
+Measured with the benchmark harness (2 CPUs, 4 GB; full results in
+[benchmarks](benchmarks/README.md)): on ten million spans in 545,163 traces,
+60,000 annotations are written at 39,900 a second, each request answered
+after its log sync, and take 29 bytes each on disk. Opening an annotated trace
+takes 0.7 ms at the median. Listing the newest 50 traces with a score takes
+1.8 ms when one trace in ten has one, 3.8 ms for a label one in a hundred
+has, and 236 ms for a value one in ten thousand has, which has to look at
+every trace in the range. The queries of the earlier checkpoints take what
+they took. One did not: a phrase search on the
+text-heavy data went from 1.50 ms to 2.44 ms. Old code on the same machine
+and the benchmark at five commits in between showed that the engine's
+annotation commit had made it slower without touching the search code; a
+profile put the time in the decompression of the same text blocks. Reusing
+the decompression context and buffers across a read brought it to 1.73 ms.
+The last 0.2 ms is not explained, and the benchmark page says what was ruled
+out.
+
+Known limits at this checkpoint:
+
+- An annotation is removed with the time window it was stored in: the window
+  that ended last among those holding its trace when it was written to disk.
+- An annotation cannot be written before its trace has arrived.
+- Reading a trace's annotations costs time in proportion to the records stored
+  for that trace, deleted ones included. There is no limit on annotations per
+  trace.
+- A span id in an annotation is not checked against the trace's spans.
+- Every flush that carries annotations writes one small part per window it
+  touches; scoring old traces across many windows writes many parts before
+  merging catches up.
+- No authentication. The write endpoint lets a local client attach
+  annotations to existing traces; it cannot remove trace data.
+- A phrase search is 15% slower than at checkpoint 6 for a reason that is
+  only partly found (see the benchmark page).
+- The fixes of the second pass had removal checks but no further independent
+  examination.

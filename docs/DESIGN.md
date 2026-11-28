@@ -83,7 +83,7 @@ whole windows.
 | 3 | Large text stored out of line, split into pieces, each distinct piece stored once per time window | Smallest of four stores tested, least memory to build, fast single-span reads (experiment A). Sharing within a window captures nearly all the repetition, so no global index is needed. |
 | 4 | Our own inverted index, one document per distinct piece, no word positions | A fifth the size and a seventeenth of the build cost of indexing spans; phrase search stays fast because a piece is verified once (experiment B). |
 | 5 | Attribute names stored as sent; a few dozen important fields also copied into typed columns at ingest; older and newer names mapped from a table generated from the OpenTelemetry semantic conventions | Conventions change. Raw data is never lost, common queries stay fast. |
-| 6 | Scores, annotations and deletes as append-only overlay files merged at read time | Keeps files immutable; no transactions needed. |
+| 6 | Scores, annotations and deletes as append-only overlay files merged at read time | Keeps files immutable; no transactions needed. Built for scores and annotations as annotation parts beside the span parts of a time window; deleting trace data is not built yet. |
 | 7 | Atomic batch commit, snapshot reads, duplicate-safe ingest; no multi-statement transactions | Telemetry is append-only. |
 | 8 | Manifest as numbered files written with create-if-absent | The one primitive that behaves the same on a local disk and on every object store. |
 | 9 | Every buffer sized by bytes, never by rows | Rows range from 1 KB to megabytes. A row-based batch was killed for memory in testing. |

@@ -1,0 +1,76 @@
+{
+  "commit": "dc59a286c7",
+  "dirty": true,
+  "date": "2026-11-28T13:59:43Z",
+  "dataset": {"name": "d2", "generator_flags": "--no-content --spans 10000000 --seed 1", "crash_batch_flags": "--no-content --traces 100 --seed 2", "compression": "gzip", "spans": 10000039, "traces": 545063, "encoded_bytes": 3622025986},
+  "profile": {"name": "small", "cpus": 2, "memory": "4g"},
+  "environment": {
+    "host_cpu": "Apple M4 Pro", "host_cores": 14,
+    "docker_version": "29.9.3", "docker_platform": "linux/aarch64", "docker_kernel": "7.0.14-linuxkit",
+    "docker_vm_cpus": 14, "docker_vm_memory_bytes": 16787087360
+  },
+  "images": {"server": "sha256:44401671aad7b78885f840779599d413a19e90e17fb6ecb06b839cd1d851725b", "tracegen": "sha256:4436e16a02faeadad6dcedd1a5b022058327185dfe0e4a9ddc43e9a375a3aa7a", "querybench": "sha256:eb4851a5d1764e27d22932f4872e875702b4c6315b54d868154396e16356f271"},
+  "measured_with": "cgroup",
+  "ingest": {
+    "spans": 10000039, "encoded_bytes": 3622025986, "wire_bytes": 473689285, "wall_s": 256.477,
+    "spans_per_s": 38990, "encoded_mb_per_s": 14.1, "wire_mb_per_s": 1.8,
+    "server_cpu_s": 45.09, "server_cpu_user_s": 38.62, "server_cpu_sys_s": 6.47,
+    "server_cpu_s_per_million_spans": 4.51, "server_peak_memory_bytes": 1214656512
+  },
+  "compaction": {
+    "enabled": true, "quiet": "5s",
+    "settle_s": 38, "settle_cpu_s": 1.02,
+    "parts_at_end_of_load": 95, "parts_settled": 95,
+    "engine_stats_settled": {"acked_lsn":19532,"annotation_bytes":0,"annotation_parts":0,"annotations_buffered":0,"annotations_dropped":0,"annotations_superseded":0,"annotations_written":0,"buffered_bytes":0,"bytes_ingested":3621947858,"duplicate_spans_dropped":0,"fatal":false,"flushed_lsn":19532,"flushes":32,"flushing":false,"last_compaction_error":null,"last_error":null,"last_maintenance_error":null,"maintenance_passes":36,"merge_input_bytes":143207514,"merge_output_bytes":142767138,"merges_done":31,"merging":false,"parts":95,"parts_merged_away":62,"payload_logical_bytes":0,"payload_stored_bytes":0,"payload_unique_bytes":0,"records_ingested":19532,"retention_parts_removed":0,"windows_with_many_parts":0}
+  },
+  "storage": {
+    "parts_bytes": 431052391, "wal_bytes": 4116, "manifest_bytes": 435300, "total_bytes": 431495903,
+    "parts": 95, "bytes_per_span": 43.1, "parts_bytes_per_span": 43.1
+  },
+  "restart": {"clean_ms": 142.3, "crash_ms": 135.1, "crash_batch_spans": 2464, "server_peak_memory_after_restarts_bytes": 58949632},
+  "annotations": {"sent": 59967, "accepted": 59967, "rejected": 0, "post_s": 1.502, "per_s": 39931.7,
+    "in_parts_after_s": 28.8, "settle_after_s": 0,
+    "annotation_parts_after_flush": 95, "annotation_bytes_after_flush": 1742834,
+    "annotation_parts_settled": 95, "annotation_bytes_settled": 1742834,
+    "bytes_per_annotation": 29.1,
+    "volume_after": {"total_bytes": 433838634, "parts_bytes": 433328236, "wal_bytes": 4116, "measured_with_server_running": true}},
+  "queries": {"config":{"addr":"nwdb-bench-92988-server:4320","from_ns":1767225600000000000,"to_ns":1767315600000000000,"hour_start_ns":1767268800000000000,"n":200,"warmup":20,"seed":1,"concurrency":1,"service":"docs-qa","model":"gpt-4o"},
+"annotation":null,
+"exp_params":{"service":"docs-qa","model":"gpt-4o","from_ns":1767247299921061642,"to_ns":1767290699608087018,"min_span_start_ns":1767225600077548954,"max_span_start_ns":1767312399451599707},
+"discovered_traces":545163,"discovery_ms":2438.3,"server_span_count":10002503,"token_rows_truncated":false,
+"kinds":[
+{"kind":"open_trace","count":200,"errors":0,"p50_ms":0.546,"p95_ms":0.72,"p99_ms":0.868,"max_ms":1.209,"bytes":2649362},
+{"kind":"list_newest_50","count":200,"errors":0,"p50_ms":0.701,"p95_ms":0.741,"p99_ms":0.811,"max_ms":1.228,"bytes":3533800},
+{"kind":"list_service_50","count":200,"errors":0,"p50_ms":0.893,"p95_ms":0.922,"p99_ms":0.971,"max_ms":1.069,"bytes":3444600},
+{"kind":"list_model_50","count":200,"errors":0,"p50_ms":0.76,"p95_ms":0.804,"p99_ms":0.877,"max_ms":1.378,"bytes":3443200},
+{"kind":"list_error_50","count":200,"errors":0,"p50_ms":0.724,"p95_ms":0.76,"p99_ms":0.837,"max_ms":0.876,"bytes":3525800},
+{"kind":"tokens_range","count":200,"errors":0,"p50_ms":294.876,"p95_ms":307.1,"p99_ms":311.791,"max_ms":314.41,"bytes":165600},
+{"kind":"tokens_hour","count":200,"errors":0,"p50_ms":16.348,"p95_ms":16.516,"p99_ms":16.699,"max_ms":16.925,"bytes":158400},
+{"kind":"exp_list1","count":200,"errors":0,"p50_ms":0.788,"p95_ms":0.877,"p99_ms":1.107,"max_ms":1.182,"bytes":3462200},
+{"kind":"exp_list2","count":200,"errors":0,"p50_ms":0.843,"p95_ms":0.882,"p99_ms":0.981,"max_ms":1.017,"bytes":3455400},
+{"kind":"exp_agg","count":200,"errors":0,"p50_ms":153.263,"p95_ms":158.881,"p99_ms":165.576,"max_ms":168.105,"bytes":153200},
+{"kind":"search_word","count":200,"errors":0,"p50_ms":0.214,"p95_ms":0.24,"p99_ms":0.255,"max_ms":0.44,"bytes":8200},
+{"kind":"search_common_word","count":200,"errors":0,"p50_ms":0.212,"p95_ms":0.235,"p99_ms":0.25,"max_ms":0.256,"bytes":8200},
+{"kind":"search_and","count":200,"errors":0,"p50_ms":0.213,"p95_ms":0.238,"p99_ms":0.246,"max_ms":0.252,"bytes":8200},
+{"kind":"search_or","count":200,"errors":0,"p50_ms":0.213,"p95_ms":0.24,"p99_ms":0.246,"max_ms":0.593,"bytes":8200},
+{"kind":"search_not","count":200,"errors":0,"p50_ms":5.295,"p95_ms":5.393,"p99_ms":5.513,"max_ms":5.63,"bytes":8200},
+{"kind":"search_phrase","count":200,"errors":0,"p50_ms":0.221,"p95_ms":0.243,"p99_ms":0.257,"max_ms":0.413,"bytes":8200},
+{"kind":"search_prefix","count":200,"errors":0,"p50_ms":0.213,"p95_ms":0.243,"p99_ms":0.252,"max_ms":0.318,"bytes":8200},
+{"kind":"search_no_hit","count":200,"errors":0,"p50_ms":0.21,"p95_ms":0.24,"p99_ms":0.251,"max_ms":0.258,"bytes":8200}
+]},
+  "annotation_queries": {"config":{"addr":"nwdb-bench-92988-server:4320","from_ns":1767225600000000000,"to_ns":1767315600000000000,"hour_start_ns":1767268800000000000,"n":200,"warmup":20,"seed":1,"concurrency":1,"service":"docs-qa","model":"gpt-4o"},
+"annotation":{"sent":59967,"accepted":59967,"rejected":0,"seconds":1.502,"per_s":39931.7,"flush_wait_s":28.8,"quality_traces":54516,"annotation_parts":95,"annotation_bytes":1742834,"annotations_written":59967,"annotations_dropped":0},
+"exp_params":{"service":"docs-qa","model":"gpt-4o","from_ns":1767247299921061642,"to_ns":1767290699608087018,"min_span_start_ns":1767225600077548954,"max_span_start_ns":1767312399451599707},
+"discovered_traces":545163,"discovery_ms":2274.6,"server_span_count":10002503,"token_rows_truncated":false,
+"kinds":[
+{"kind":"annotate_post_500","count":120,"errors":0,"p50_ms":12.461,"p95_ms":12.684,"p99_ms":12.935,"max_ms":13.043,"bytes":3600},
+{"kind":"open_trace_annotated","count":200,"errors":0,"p50_ms":0.668,"p95_ms":0.948,"p99_ms":1.061,"max_ms":1.322,"bytes":3049878},
+{"kind":"list_annotated_50","count":200,"errors":0,"p50_ms":1.819,"p95_ms":1.964,"p99_ms":2.209,"max_ms":3.047,"bytes":4751600},
+{"kind":"list_annotation_label_50","count":200,"errors":0,"p50_ms":3.75,"p95_ms":3.949,"p99_ms":5.177,"max_ms":6.708,"bytes":4471400},
+{"kind":"list_annotation_value_50","count":200,"errors":0,"p50_ms":236.441,"p95_ms":240.718,"p99_ms":246.372,"max_ms":250.297,"bytes":4076800},
+{"kind":"open_trace_after","count":200,"errors":0,"p50_ms":0.579,"p95_ms":0.755,"p99_ms":0.96,"max_ms":1.243,"bytes":2651625},
+{"kind":"list_newest_50_after","count":200,"errors":0,"p50_ms":1.206,"p95_ms":1.278,"p99_ms":1.363,"max_ms":1.385,"bytes":3632600}
+]},
+  "server_peak_memory_after_queries_bytes": 613277696,
+  "server_peak_memory_after_annotations_bytes": 654487552
+}
