@@ -191,15 +191,17 @@ fn reading_a_trace_s_largest_annotations_holds_about_one_copy() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let e = engine_with_traces(dir.path());
+    let before = live();
     for k in (0..1_000).step_by(100) {
         annotate(&e, (k..k + 100).map(big_of_trace_1).collect());
     }
+    // The records returned are copies of the buffered ones: the same heap.
+    let returned = (live() - before) as usize;
     let snap = e.snapshot();
     let base = live();
     reset_peak();
     let (v, more) = snap.annotations(tid(1), 1_000).unwrap();
     let grown = (peak() - base) as usize;
-    let returned = (live() - base) as usize;
     eprintln!("returned {returned} bytes, peaked {grown} bytes above the start");
     assert_eq!(v.len(), 1_000);
     assert!(!more);
