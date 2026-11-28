@@ -458,12 +458,8 @@ impl Gate {
     }
 }
 
-fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !cond() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(2));
-    }
+fn wait_for(what: &str, cond: impl FnMut() -> bool) {
+    nwdb_testkit::wait_for(what, Duration::from_secs(10), cond);
 }
 
 type Results = Arc<Mutex<Vec<nwdb_core::Result<Lsn>>>>;
