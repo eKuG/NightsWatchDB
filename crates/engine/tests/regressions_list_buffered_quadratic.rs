@@ -64,6 +64,7 @@ fn list_time(n: u128) -> Duration {
 fn a_filtered_list_over_buffered_annotations_is_not_quadratic() {
     let small = list_time(1_000);
     let large = list_time(16_000);
+    eprintln!("{small:?} for 1,000, {large:?} for 16,000");
     assert!(
         large < small * 48,
         "one list took {small:?} over 1,000 traces with buffered annotations and {large:?} over \

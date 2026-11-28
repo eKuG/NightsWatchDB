@@ -153,6 +153,7 @@ fn a_flush_finds_the_windows_of_many_traces_over_many_parts_in_one_walk() {
     e.flush().unwrap();
     let probes = e.annotation_window_probes() - probes_before;
     let traces = (PARTS * PER) as u64;
+    eprintln!("{probes} index probes for {traces} traces over {PARTS} parts");
     assert!(
         probes <= traces,
         "{probes} index probes for {traces} traces over {PARTS} parts"
