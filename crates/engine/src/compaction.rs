@@ -13,7 +13,11 @@
 //!   never about the event time of the data, which may be loaded long after it
 //!   happened.
 //!
-//! A merge never crosses a window, never takes more than `max_parts` inputs
+//! Span parts and annotation parts are never merged together: the policy
+//! groups parts by kind and window, and what it says about a window it says
+//! about one kind of it.
+//!
+//! A merge never crosses a window or a kind, never takes more than `max_parts` inputs
 //! or a fixed number of input bytes, and never takes inputs whose pieces of
 //! text add up to more than a part can hold. At most one merge is chosen at a
 //! time.
@@ -21,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nwdb_core::{Error, Result};
+use nwdb_core::{Error, PartKind, Result};
 
 /// Settings of compaction, [`EngineOptions::compaction`](crate::EngineOptions).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,13 +110,16 @@ impl CompactionOptions {
 pub(crate) struct PartInfo {
     /// The part's id.
     pub id: u64,
+    /// What the part holds.
+    pub kind: PartKind,
     /// Start of the part's window, Unix nanoseconds.
     pub window_start_ns: i64,
     /// Width of the part's window, nanoseconds.
     pub window_ns: i64,
     /// Bytes on disk.
     pub size_bytes: u64,
-    /// Pieces of text the part holds (`meta.payload.pieces`).
+    /// Pieces of text the part holds (`meta.payload.pieces`); zero for an
+    /// annotation part, which has none.
     pub pieces: u64,
     /// Compaction level: 0 for a flush, one more than the highest input for
     /// a merge.
@@ -133,6 +140,8 @@ pub(crate) enum Rule {
 /// One merge to do: parts of one window, smallest first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MergePlan {
+    /// The kind of the parts.
+    pub kind: PartKind,
     /// Start of the window, Unix nanoseconds.
     pub window_start_ns: i64,
     /// Width of the window, nanoseconds.
@@ -143,12 +152,15 @@ pub(crate) struct MergePlan {
     pub parts: Vec<u64>,
 }
 
-/// The identity of a window.
-pub(crate) type WindowKey = (i64, i64);
+/// The identity of what a merge works on: a window (start, width) and the
+/// kind of part in it. The span parts and the annotation parts of one window
+/// are two of these.
+pub(crate) type MergeKey = (i64, i64, PartKind);
 
-/// Chooses the merge to do now, or none. `skip` names windows that must not
-/// be chosen (backing off or damaged). Among the windows that qualify the one
-/// with the most parts goes first, the oldest on a tie.
+/// Chooses the merge to do now, or none. `skip` names the (window, kind)
+/// pairs that must not be chosen (backing off or damaged). Among the ones that
+/// qualify the one with the most parts goes first, the oldest window on a tie
+/// (spans before annotations within one window).
 ///
 /// `max_pieces` is the most pieces of text one part is written with. A part
 /// holds no more; text past it is stored inline and cannot be searched, so a
@@ -169,22 +181,22 @@ pub(crate) fn choose_merge(
     opts: &CompactionOptions,
     parts: &[PartInfo],
     max_pieces: u64,
-    skip: &dyn Fn(i64, i64) -> bool,
+    skip: &dyn Fn(MergeKey) -> bool,
 ) -> Option<MergePlan> {
     if !opts.enabled {
         return None;
     }
-    let mut windows: BTreeMap<WindowKey, Vec<&PartInfo>> = BTreeMap::new();
+    let mut windows: BTreeMap<MergeKey, Vec<&PartInfo>> = BTreeMap::new();
     for p in parts {
         windows
-            .entry((p.window_start_ns, p.window_ns))
+            .entry((p.window_start_ns, p.window_ns, p.kind))
             .or_default()
             .push(p);
     }
     let mut best: Option<MergePlan> = None;
     let mut best_count = 0;
-    for ((start, width), mut ps) in windows {
-        if ps.len() < 2 || skip(start, width) {
+    for ((start, width, kind), mut ps) in windows {
+        if ps.len() < 2 || skip((start, width, kind)) {
             continue;
         }
         // Smallest first; the id makes the order total.
@@ -215,6 +227,7 @@ pub(crate) fn choose_merge(
         if best.is_none() || ps.len() > best_count {
             best_count = ps.len();
             best = Some(MergePlan {
+                kind,
                 window_start_ns: start,
                 window_ns: width,
                 rule,
@@ -252,6 +265,7 @@ mod tests {
     fn p(id: u64, window: i64, size: u64, live_secs: u64) -> PartInfo {
         PartInfo {
             id,
+            kind: PartKind::Spans,
             window_start_ns: window * W,
             window_ns: W,
             size_bytes: size,
@@ -264,7 +278,7 @@ mod tests {
     type Picked = Option<(Rule, i64, Vec<u64>)>;
 
     fn pick(opts: &CompactionOptions, parts: &[PartInfo]) -> Picked {
-        choose_merge(opts, parts, u64::MAX, &|_, _| false)
+        choose_merge(opts, parts, u64::MAX, &|_| false)
             .map(|m| (m.rule, m.window_start_ns / W, m.parts))
     }
 
@@ -381,7 +395,7 @@ mod tests {
             },
             &parts,
             u64::MAX,
-            &|_, _| false,
+            &|_| false,
         )
         .unwrap();
         assert_eq!((m.rule, m.parts), (Rule::Final, vec![1, 2, 3, 4, 5]));
@@ -396,10 +410,10 @@ mod tests {
         // 11 quiet parts; larger ids are larger parts. Every merge has at
         // most 4 inputs, the smallest first, and the window ends as one part.
         let mut parts: Vec<PartInfo> = (1..=11).map(|i| p(i, 0, 10 * i, 99)).collect();
-        let first = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
+        let first = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
         assert_eq!((first.rule, first.parts), (Rule::Final, vec![1, 2, 3, 4]));
         let mut merges = 0;
-        while let Some(m) = choose_merge(&o, &parts, u64::MAX, &|_, _| false) {
+        while let Some(m) = choose_merge(&o, &parts, u64::MAX, &|_| false) {
             assert!(m.parts.len() <= 4 && m.parts.len() >= 2, "{m:?}");
             let size = parts
                 .iter()
@@ -429,22 +443,22 @@ mod tests {
             with(2, 20, 40, 99),
             with(3, 30, 40, 99),
         ];
-        let m = choose_merge(&o, &parts, 100, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, 100, &|_| false).unwrap();
         assert_eq!(m.parts, vec![1, 2]);
         // Exactly at the ceiling fits.
-        let m = choose_merge(&o, &parts, 80, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, 80, &|_| false).unwrap();
         assert_eq!(m.parts, vec![1, 2]);
         // One piece less and no two parts fit: the window is left alone.
-        assert_eq!(choose_merge(&o, &parts, 79, &|_, _| false), None);
+        assert_eq!(choose_merge(&o, &parts, 79, &|_| false), None);
         // Tiered rule: the same.
         let parts: Vec<_> = (1..=4).map(|i| with(i, 10, 30, 1)).collect();
-        let m = choose_merge(&o, &parts, 100, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, 100, &|_| false).unwrap();
         assert_eq!((m.rule, m.parts), (Rule::Tiered, vec![1, 2, 3]));
-        assert_eq!(choose_merge(&o, &parts, 59, &|_, _| false), None);
+        assert_eq!(choose_merge(&o, &parts, 59, &|_| false), None);
         // A window that cannot merge does not hold back another one.
         let mut parts = vec![with(1, 10, 60, 99), with(2, 20, 60, 99)];
         parts.extend([p(3, 1, 5, 99), p(4, 1, 5, 99)]);
-        let m = choose_merge(&o, &parts, 100, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, 100, &|_| false).unwrap();
         assert_eq!((m.window_start_ns, m.parts), (W, vec![3, 4]));
     }
 
@@ -462,7 +476,7 @@ mod tests {
         assert_eq!(pick(&o, &parts), None);
         // Three parts: the largest is dropped and two remain.
         let parts = vec![p(1, 0, 30, 99), p(2, 0, 40, 99), p(3, 0, 70, 99)];
-        let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
         let bytes: u64 = parts
             .iter()
             .filter(|p| m.parts.contains(&p.id))
@@ -471,7 +485,7 @@ mod tests {
         assert_eq!((m.parts, bytes), (vec![1, 2], 70));
         // A tiered run over the cap is cut the same way.
         let parts: Vec<_> = (1..=4).map(|i| p(i, 0, 30, 1)).collect();
-        let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
         assert_eq!((m.rule, m.parts), (Rule::Tiered, vec![1, 2, 3]));
         // A window skipped for its cap does not hold back another window.
         let mut parts = vec![p(1, 0, 40, 99), p(2, 0, 61, 99)];
@@ -487,7 +501,7 @@ mod tests {
         parts.extend((3..=7).map(|i| p(i, 1, 10, 99)));
         parts.extend((8..=10).map(|i| p(i, 2, 10, 99)));
         assert_eq!(pick(&o, &parts).unwrap().1, 1);
-        let m = choose_merge(&o, &parts, u64::MAX, &|s, _| s == W).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|k| k.0 == W).unwrap();
         assert_eq!(m.window_start_ns, 2 * W);
         // A tie goes to the older window.
         let parts: Vec<_> = [(1, 5), (2, 5), (3, 2), (4, 2)]
@@ -507,7 +521,7 @@ mod tests {
                 },
                 &parts,
                 u64::MAX,
-                &|_, _| false
+                &|_| false
             )
             .is_none()
         );
@@ -583,7 +597,7 @@ mod tests {
         /// the output id of each merge.
         fn settle(&mut self, o: &CompactionOptions) -> Vec<(Vec<u64>, u64)> {
             let mut done = Vec::new();
-            while let Some(m) = choose_merge(o, &self.parts, u64::MAX, &|_, _| false) {
+            while let Some(m) = choose_merge(o, &self.parts, u64::MAX, &|_| false) {
                 let level = self
                     .parts
                     .iter()
@@ -688,7 +702,7 @@ mod tests {
         for x in &mut parts {
             x.live_for = Duration::from_secs(61);
         }
-        let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
         assert_eq!((m.rule, m.parts.len()), (Rule::Final, 4));
         // After the merge the window is one part and nothing is chosen again.
         let one = [p(5, 0, 1_003_000, 0)];

@@ -13,12 +13,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use nwdb_core::{Error, Result, part_dir_name};
+use nwdb_core::{Error, PartKind, Result, part_dir_name};
 use nwdb_manifest::Edit;
-use nwdb_segment::{MergeOptions, PartReader, merge_parts};
+use nwdb_segment::{
+    AnnotationReader, MergeOptions, PartReader, merge_annotation_parts, merge_parts,
+};
 
-use crate::compaction::{MergePlan, PartInfo, Rule, WindowKey, choose_merge};
-use crate::engine::{Inner, LivePart, Stage, run_hook, sync_dir};
+use crate::compaction::{MergeKey, MergePlan, PartInfo, Rule, choose_merge};
+use crate::engine::{
+    Inner, LiveAnnotationPart, LivePart, Stage, annotation_windows, run_hook, sync_dir,
+};
 use crate::flush::panic_message;
 use crate::lock;
 use crate::split::change_parts;
@@ -29,16 +33,18 @@ pub(crate) struct CompactionState {
     pub merges_done: u64,
     pub parts_merged_away: u64,
     pub duplicates_dropped: u64,
+    pub annotations_superseded: u64,
     pub input_bytes: u64,
     pub output_bytes: u64,
     pub merging: bool,
     pub last_error: Option<String>,
-    /// Windows whose merge failed: how many times in a row, and when to try
-    /// again (`None`: a time that cannot be represented, so not by the
-    /// clock). Other windows are not held back by them.
-    failing: HashMap<WindowKey, (u32, Option<Instant>)>,
-    /// Windows with a damaged input: left alone until a restart.
-    damaged: HashSet<WindowKey>,
+    /// Windows whose merge failed, per kind of part: how many times in a row,
+    /// and when to try again (`None`: a time that cannot be represented, so
+    /// not by the clock). Other windows, and the other kind of the same
+    /// window, are not held back by them.
+    failing: HashMap<MergeKey, (u32, Option<Instant>)>,
+    /// Windows with a damaged input, per kind: left alone until a restart.
+    damaged: HashSet<MergeKey>,
 }
 
 /// Sets the "a merge is running" flag for as long as it lives, also when the
@@ -111,11 +117,26 @@ impl Inner {
     /// Queries on snapshots taken before the replacement keep reading the
     /// removed parts from their open files.
     pub(crate) fn replace_parts(&self, remove: &[u64], add: Vec<LivePart>) -> Result<Replaced> {
+        self.replace_any(remove, add, Vec::new())
+    }
+
+    /// [`replace_parts`](Self::replace_parts) for both kinds of part: `remove`
+    /// names live parts of either kind (each in exactly one of the two
+    /// lists), `add` span parts and `add_ann` annotation parts. One manifest
+    /// edit, one commit, and one publish in which the span list, the split
+    /// map, the annotation list and its window index change together.
+    pub(crate) fn replace_any(
+        &self,
+        remove: &[u64],
+        add: Vec<LivePart>,
+        add_ann: Vec<LiveAnnotationPart>,
+    ) -> Result<Replaced> {
         let dirs: Vec<PathBuf> = remove
             .iter()
             .map(|&id| self.parts_dir.join(part_dir_name(id)))
             .collect();
         let add: Vec<Arc<LivePart>> = add.into_iter().map(Arc::new).collect();
+        let add_ann: Vec<Arc<LiveAnnotationPart>> = add_ann.into_iter().map(Arc::new).collect();
 
         // The long work, before the gate: the list and the split map that the
         // list seen now will have after the replacement. Costs what
@@ -131,14 +152,18 @@ impl Inner {
 
         {
             let gate = lock(&self.publish_gate);
-            let old_parts = {
+            let (old_parts, old_ann) = {
                 let c = lock(&self.core);
                 if let Some(f) = &c.fatal {
                     return Err(Error::fatal(f.clone()));
                 }
-                c.vis.parts.clone()
+                (c.vis.parts.clone(), c.vis.ann_parts.clone())
             };
-            let live: HashSet<u64> = old_parts.iter().map(|p| p.meta.part_id).collect();
+            let live: HashSet<u64> = old_parts
+                .iter()
+                .map(|p| p.meta.part_id)
+                .chain(old_ann.iter().map(|p| p.meta.part_id))
+                .collect();
             let mut seen_twice = HashSet::new();
             for id in remove {
                 if !live.contains(id) || !seen_twice.insert(*id) {
@@ -147,7 +172,7 @@ impl Inner {
                     )));
                 }
             }
-            if remove.is_empty() && add.is_empty() {
+            if remove.is_empty() && add.is_empty() && add_ann.is_empty() {
                 return Ok(Replaced::default());
             }
             // The parts published since the list was seen. Everything that
@@ -171,7 +196,11 @@ impl Inner {
 
             // 1. The commit.
             let edit = Edit {
-                add: add.iter().map(|p| p.meta.clone()).collect(),
+                add: add
+                    .iter()
+                    .map(|p| p.meta.clone())
+                    .chain(add_ann.iter().map(|p| p.meta.clone()))
+                    .collect(),
                 remove: remove.to_vec(),
                 ..Edit::default()
             };
@@ -191,10 +220,22 @@ impl Inner {
             } else {
                 change_parts(&built, &built_split, &[], later)
             };
+            // The annotation list is small: rebuilt from the list as it is
+            // now, so parts a flush added meanwhile stay.
+            let mut ann: Vec<Arc<LiveAnnotationPart>> = old_ann
+                .iter()
+                .filter(|p| !remove.contains(&p.meta.part_id))
+                .cloned()
+                .chain(add_ann)
+                .collect();
+            ann.sort_by_key(|p| p.meta.part_id);
+            let ann_windows = Arc::new(annotation_windows(&ann));
             {
                 let mut c = lock(&self.core);
                 c.vis.parts = Arc::new(parts);
                 c.vis.split = Arc::new(split);
+                c.vis.ann_parts = Arc::new(ann);
+                c.vis.ann_windows = ann_windows;
             }
             drop(gate);
         }
@@ -365,8 +406,8 @@ impl Inner {
         self.delete_dirs(dirs).into_result()
     }
 
-    /// Removes every part whose whole window is older than the retention, in
-    /// one replacement.
+    /// Removes every part, of either kind, whose whole window is older than
+    /// the retention, in one replacement.
     fn apply_retention(&self) -> Result<()> {
         let Some(retention) = self.opts.retention else {
             return Ok(());
@@ -375,16 +416,24 @@ impl Inner {
         // retention or an odd clock must not overflow.
         let keep = i128::try_from(retention.as_nanos()).unwrap_or(i128::MAX);
         let cutoff = i128::from(self.now_ns()).saturating_sub(keep);
-        let parts = lock(&self.core).vis.parts.clone();
+        let (parts, ann) = {
+            let c = lock(&self.core);
+            (c.vis.parts.clone(), c.vis.ann_parts.clone())
+        };
+        let expired = |m: &nwdb_core::PartMeta| {
+            i128::from(m.window_start_ns) + i128::from(m.window_ns) <= cutoff
+        };
         let expired: Vec<u64> = parts
             .iter()
-            .filter(|p| i128::from(p.meta.window_start_ns) + i128::from(p.meta.window_ns) <= cutoff)
-            .map(|p| p.meta.part_id)
+            .map(|p| &p.meta)
+            .chain(ann.iter().map(|p| &p.meta))
+            .filter(|m| expired(m))
+            .map(|m| m.part_id)
             .collect();
         if expired.is_empty() {
             return Ok(());
         }
-        let replaced = self.replace_parts(&expired, Vec::new())?;
+        let replaced = self.replace_any(&expired, Vec::new(), Vec::new())?;
         lock(&self.core).retention_removed += expired.len() as u64;
         replaced.into_result()
     }
@@ -411,7 +460,7 @@ impl Inner {
         // A window that failed is left alone for the rest of the pass, so a
         // failure that persists ends the pass instead of repeating in it,
         // whatever the backoff.
-        let mut failed_now = HashSet::new();
+        let mut failed_now: HashSet<MergeKey> = HashSet::new();
         while !self.merge_stop.load(Ordering::SeqCst) && !self.maintenance_stopping() {
             if last_retention.elapsed() >= self.opts.maintenance_interval {
                 *last_retention = Instant::now();
@@ -422,11 +471,14 @@ impl Inner {
                     break;
                 }
             }
-            let parts = lock(&self.core).vis.parts.clone();
-            let Some(plan) = self.next_merge(&parts, &failed_now) else {
+            let (parts, ann) = {
+                let c = lock(&self.core);
+                (c.vis.parts.clone(), c.vis.ann_parts.clone())
+            };
+            let Some(plan) = self.next_merge(&parts, &ann, &failed_now) else {
                 break;
             };
-            match self.merge_one(&parts, &plan) {
+            match self.merge_one(&parts, &ann, &plan) {
                 Ok(replaced) => {
                     if let Err(e) = replaced.into_result() {
                         first_error.get_or_insert(e);
@@ -440,7 +492,7 @@ impl Inner {
                     break;
                 }
                 Err(e) => {
-                    failed_now.insert((plan.window_start_ns, plan.window_ns));
+                    failed_now.insert((plan.window_start_ns, plan.window_ns, plan.kind));
                     self.note_merge_failure(&plan, &e);
                     if matches!(e, Error::Fatal(_)) {
                         return Err(e);
@@ -452,17 +504,19 @@ impl Inner {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// The policy's choice for the parts that are live now, leaving out the
-    /// windows that are backing off or damaged.
+    /// The policy's choice for the parts of both kinds that are live now,
+    /// leaving out the (window, kind) pairs that are backing off or damaged.
     fn next_merge(
         &self,
         parts: &[Arc<LivePart>],
-        failed_now: &HashSet<WindowKey>,
+        ann: &[Arc<LiveAnnotationPart>],
+        failed_now: &HashSet<MergeKey>,
     ) -> Option<MergePlan> {
         let infos: Vec<PartInfo> = parts
             .iter()
             .map(|p| PartInfo {
                 id: p.meta.part_id,
+                kind: PartKind::Spans,
                 window_start_ns: p.meta.window_start_ns,
                 window_ns: p.meta.window_ns,
                 size_bytes: p.meta.size_bytes(),
@@ -470,17 +524,27 @@ impl Inner {
                 level: p.meta.level,
                 live_for: p.live_since.elapsed(),
             })
+            .chain(ann.iter().map(|p| PartInfo {
+                id: p.meta.part_id,
+                kind: PartKind::Annotations,
+                window_start_ns: p.meta.window_start_ns,
+                window_ns: p.meta.window_ns,
+                size_bytes: p.meta.size_bytes(),
+                pieces: 0,
+                level: p.meta.level,
+                live_for: p.live_since.elapsed(),
+            }))
             .collect();
         let now = Instant::now();
         let (damaged, waiting) = {
             let mut c = lock(&self.core);
-            let live: HashSet<WindowKey> = infos
+            let live: HashSet<MergeKey> = infos
                 .iter()
-                .map(|p| (p.window_start_ns, p.window_ns))
+                .map(|p| (p.window_start_ns, p.window_ns, p.kind))
                 .collect();
             // A window that is gone (expired) has nothing to remember.
             c.compaction.failing.retain(|k, _| live.contains(k));
-            let waiting: HashSet<WindowKey> = c
+            let waiting: HashSet<MergeKey> = c
                 .compaction
                 .failing
                 .iter()
@@ -490,60 +554,98 @@ impl Inner {
             (c.compaction.damaged.clone(), waiting)
         };
         let max_pieces = self.writer_options().max_pieces as u64;
-        choose_merge(
-            &self.opts.compaction,
-            &infos,
-            max_pieces,
-            &|start, width| {
-                let key = (start, width);
-                damaged.contains(&key) || waiting.contains(&key) || failed_now.contains(&key)
-            },
-        )
+        choose_merge(&self.opts.compaction, &infos, max_pieces, &|key| {
+            damaged.contains(&key) || waiting.contains(&key) || failed_now.contains(&key)
+        })
     }
 
-    /// Merges the parts of `plan` into one and replaces them by it. On any
-    /// error before the commit the database is as it was and the new
+    /// Merges the parts of `plan` into one and replaces them by it. The kind
+    /// of the plan decides which list the inputs are in and which merge writes
+    /// the output; everything around it (the id, the level, the stages, the
+    /// abandoning of the output, the replacement, the statistics) is the same.
+    /// On any error before the commit the database is as it was and the new
     /// directory is gone (except after `Fatal`, where whether the commit
     /// happened is not known and a restart decides).
-    fn merge_one(&self, live: &[Arc<LivePart>], plan: &MergePlan) -> Result<Replaced> {
+    fn merge_one(
+        &self,
+        live: &[Arc<LivePart>],
+        live_ann: &[Arc<LiveAnnotationPart>],
+        plan: &MergePlan,
+    ) -> Result<Replaced> {
         // Oldest first: ids grow with time. Which copy of a span a merge keeps
         // does not depend on this order; it matters only for equal arrivals.
-        let mut inputs: Vec<&Arc<LivePart>> = live
-            .iter()
-            .filter(|p| plan.parts.contains(&p.meta.part_id))
-            .collect();
+        let mut inputs: Vec<&Arc<LivePart>> = Vec::new();
+        let mut ann_inputs: Vec<&Arc<LiveAnnotationPart>> = Vec::new();
+        match plan.kind {
+            PartKind::Spans => {
+                inputs.extend(live.iter().filter(|p| plan.parts.contains(&p.meta.part_id)))
+            }
+            PartKind::Annotations => {
+                ann_inputs.extend(
+                    live_ann
+                        .iter()
+                        .filter(|p| plan.parts.contains(&p.meta.part_id)),
+                );
+            }
+        }
         inputs.sort_by_key(|p| p.meta.part_id);
-        if inputs.len() != plan.parts.len() {
+        ann_inputs.sort_by_key(|p| p.meta.part_id);
+        // What the steps below need of an input, whatever its kind.
+        let metas: Vec<&nwdb_core::PartMeta> = inputs
+            .iter()
+            .map(|p| &p.meta)
+            .chain(ann_inputs.iter().map(|p| &p.meta))
+            .collect();
+        if metas.len() != plan.parts.len() {
             return Err(Error::other("a part chosen for a merge is not live"));
         }
         let _busy = Merging::new(self);
         let id = self.manifest.reserve_part_ids(1)?.start;
         let dir = self.parts_dir.join(part_dir_name(id));
-        let level = inputs
+        let level = metas
             .iter()
-            .map(|p| p.meta.level)
+            .map(|m| m.level)
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let readers: Vec<&PartReader> = inputs.iter().map(|p| &p.reader).collect();
-        // The same writer settings a flush uses.
-        let options = MergeOptions {
-            writer: self.writer_options(),
-            level,
-            // Set at shutdown: the merge then ends at its next chunk, and
-            // the pass treats the error that arrives as no failure.
-            stop: Some(self.merge_stop.clone()),
-            ..MergeOptions::default()
-        };
+        // The same writer settings a flush uses. `stop` is set at shutdown:
+        // the merge then ends at its next chunk, and the pass treats the
+        // error that arrives as no failure.
         run_hook(&self.opts.stage_hook, Stage::MergeStarting)?;
-        let (meta, stats) = merge_parts(
-            &readers,
-            &self.parts_dir,
-            id,
-            plan.window_start_ns,
-            plan.window_ns,
-            options,
-        )?;
+        let (meta, duplicates, superseded) = match plan.kind {
+            PartKind::Spans => {
+                let readers: Vec<&PartReader> = inputs.iter().map(|p| &p.reader).collect();
+                let options = MergeOptions {
+                    writer: self.writer_options(),
+                    level,
+                    stop: Some(self.merge_stop.clone()),
+                    ..MergeOptions::default()
+                };
+                let (meta, stats) = merge_parts(
+                    &readers,
+                    &self.parts_dir,
+                    id,
+                    plan.window_start_ns,
+                    plan.window_ns,
+                    options,
+                )?;
+                (meta, stats.duplicates_dropped, 0)
+            }
+            PartKind::Annotations => {
+                let readers: Vec<&AnnotationReader> =
+                    ann_inputs.iter().map(|p| &p.reader).collect();
+                let (meta, stats) = merge_annotation_parts(
+                    &readers,
+                    &self.parts_dir,
+                    id,
+                    plan.window_start_ns,
+                    plan.window_ns,
+                    level,
+                    Some(&self.merge_stop),
+                )?;
+                (meta, 0, stats.superseded)
+            }
+        };
 
         // From here the output exists on disk. Until the commit an error
         // removes it.
@@ -553,31 +655,53 @@ impl Inner {
             }
             e
         };
-        let reader = PartReader::open(&dir).map_err(abandon)?;
         let output_bytes = meta.size_bytes();
-        let mut part = LivePart::new(meta, reader);
-        if plan.rule == Rule::Final {
-            // The inputs were all quiet and nothing new is in the output, so
-            // it is as quiet as they were: the window can go on to its next
-            // merge at once, not after another quiet period.
-            if let Some(since) = inputs.iter().map(|p| p.live_since).max() {
-                part.live_since = since;
+        // The inputs were all quiet when the final rule chose them and
+        // nothing new is in the output, so it is as quiet as they were: the
+        // window can go on to its next merge at once, not after another quiet
+        // period.
+        let quiet_since = if plan.rule == Rule::Final {
+            inputs
+                .iter()
+                .map(|p| p.live_since)
+                .chain(ann_inputs.iter().map(|p| p.live_since))
+                .max()
+        } else {
+            None
+        };
+        let (add, add_ann) = match plan.kind {
+            PartKind::Spans => {
+                let reader = PartReader::open(&dir).map_err(abandon)?;
+                let mut part = LivePart::new(meta, reader);
+                if let Some(since) = quiet_since {
+                    part.live_since = since;
+                }
+                (vec![part], Vec::new())
             }
-        }
+            PartKind::Annotations => {
+                let reader = AnnotationReader::open(&dir, &meta).map_err(abandon)?;
+                let mut part = LiveAnnotationPart::new(meta, reader);
+                if let Some(since) = quiet_since {
+                    part.live_since = since;
+                }
+                (Vec::new(), vec![part])
+            }
+        };
         run_hook(&self.opts.stage_hook, Stage::MergeWritten).map_err(abandon)?;
-        let remove: Vec<u64> = inputs.iter().map(|p| p.meta.part_id).collect();
-        let replaced = self.replace_parts(&remove, vec![part]).map_err(abandon)?;
+        let remove: Vec<u64> = metas.iter().map(|m| m.part_id).collect();
+        let replaced = self.replace_any(&remove, add, add_ann).map_err(abandon)?;
 
-        let input_bytes: u64 = inputs.iter().map(|p| p.meta.size_bytes()).sum();
+        let input_bytes: u64 = metas.iter().map(|m| m.size_bytes()).sum();
         let mut c = lock(&self.core);
         c.compaction.merges_done += 1;
         c.compaction.parts_merged_away += remove.len() as u64;
-        c.compaction.duplicates_dropped += stats.duplicates_dropped;
+        c.compaction.duplicates_dropped += duplicates;
+        c.compaction.annotations_superseded += superseded;
         c.compaction.input_bytes += input_bytes;
         c.compaction.output_bytes += output_bytes;
         c.compaction
             .failing
-            .remove(&(plan.window_start_ns, plan.window_ns));
+            .remove(&(plan.window_start_ns, plan.window_ns, plan.kind));
         Ok(replaced)
     }
 
@@ -586,7 +710,7 @@ impl Inner {
     /// backoff that doubles with every failure in a row. A `Fatal` error also
     /// puts the engine in the fatal state.
     fn note_merge_failure(&self, plan: &MergePlan, e: &Error) {
-        let key = (plan.window_start_ns, plan.window_ns);
+        let key = (plan.window_start_ns, plan.window_ns, plan.kind);
         let mut c = lock(&self.core);
         let damaged = matches!(e, Error::Corrupt(_));
         c.compaction.last_error = Some(format!(

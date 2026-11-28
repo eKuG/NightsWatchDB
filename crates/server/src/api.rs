@@ -480,6 +480,7 @@ async fn stats(State(api): State<Api>) -> Response {
             "duplicate_spans_dropped": s.duplicate_spans_dropped,
             "merge_input_bytes": s.merge_input_bytes,
             "merge_output_bytes": s.merge_output_bytes,
+            "annotations_superseded": s.annotations_superseded,
             "windows_with_many_parts": s.windows_with_many_parts,
             "merging": s.merging,
             "last_compaction_error": s.last_compaction_error,

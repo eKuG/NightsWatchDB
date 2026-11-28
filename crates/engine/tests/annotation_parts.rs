@@ -807,8 +807,13 @@ fn maintenance_with_annotation_parts_live_keeps_them_listed_and_published() {
     let s = e.stats();
     assert!(s.retention_parts_removed >= 2, "{s:?}");
     assert!(s.merges_done >= 1, "{s:?}");
-    assert_eq!(s.annotation_parts, 4, "annotation parts are not touched");
-    assert_eq!(e.snapshot().annotation_part_info(), ann_before);
+    // The annotation part of window 0 expired with it; the others are
+    // untouched.
+    assert_eq!(s.annotation_parts, 3, "{s:?}");
+    assert_eq!(
+        e.snapshot().annotation_part_info(),
+        ann_before[1..].to_vec()
+    );
     // Window 0's traces are gone; the rest keep their annotations.
     for t in traces.iter().filter(|t| **t >= 10) {
         assert_eq!(shown(&e, *t).len(), 1, "trace {t}");
@@ -829,10 +834,10 @@ fn maintenance_with_annotation_parts_live_keeps_them_listed_and_published() {
         .filter(|p| p.kind == PartKind::Annotations)
         .map(|p| p.part_id)
         .collect();
-    let ids: Vec<u64> = ann_before.iter().map(|x| x.0).collect();
+    let ids: Vec<u64> = ann_before[1..].iter().map(|x| x.0).collect();
     assert_eq!(listed, ids);
     let e = open(opts(dir.path()));
-    assert_eq!(e.stats().annotation_parts, 4);
+    assert_eq!(e.stats().annotation_parts, 3);
     assert_eq!(shown(&e, 31).len(), 1);
     e.shutdown().unwrap();
 }

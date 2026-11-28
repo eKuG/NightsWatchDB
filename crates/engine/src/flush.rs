@@ -154,7 +154,7 @@ impl Inner {
                     ann_metas
                         .into_iter()
                         .zip(ann_readers)
-                        .map(|(meta, reader)| Arc::new(LiveAnnotationPart { meta, reader })),
+                        .map(|(meta, reader)| Arc::new(LiveAnnotationPart::new(meta, reader))),
                 );
                 ann_parts.sort_by_key(|p| p.meta.part_id);
                 let ann_windows = Arc::new(annotation_windows(&ann_parts));

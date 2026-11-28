@@ -353,7 +353,11 @@ pub struct EngineStats {
     pub merge_input_bytes: u64,
     /// Bytes on disk of their outputs.
     pub merge_output_bytes: u64,
-    /// Windows that now have more than one live part.
+    /// Annotation records dropped by merges because a newer record of the
+    /// same identity (trace, span, name, source) was in the same window.
+    pub annotations_superseded: u64,
+    /// Pairs of a window and a kind of part (spans, annotations) that now
+    /// have more than one live part: 0 means both kinds are settled.
     pub windows_with_many_parts: usize,
     /// True while a merge is being written or replaced.
     pub merging: bool,
@@ -375,6 +379,18 @@ pub(crate) struct LivePart {
 pub(crate) struct LiveAnnotationPart {
     pub meta: nwdb_core::PartMeta,
     pub reader: AnnotationReader,
+    /// When the part became live in this process, as for [`LivePart`].
+    pub live_since: Instant,
+}
+
+impl LiveAnnotationPart {
+    pub(crate) fn new(meta: nwdb_core::PartMeta, reader: AnnotationReader) -> Self {
+        Self {
+            meta,
+            reader,
+            live_since: Instant::now(),
+        }
+    }
 }
 
 /// The window an annotation part belongs to: `(window_start_ns, window_ns)`.
@@ -757,10 +773,10 @@ impl Engine {
                 }
                 PartKind::Annotations => {
                     check_annotation_format_version(meta.format_version)?;
-                    ann_parts.push(Arc::new(LiveAnnotationPart {
-                        meta: meta.clone(),
-                        reader: AnnotationReader::open(dir, meta)?,
-                    }));
+                    ann_parts.push(Arc::new(LiveAnnotationPart::new(
+                        meta.clone(),
+                        AnnotationReader::open(dir, meta)?,
+                    )));
                 }
             }
         }
@@ -1179,14 +1195,23 @@ impl Engine {
         let c = lock(&self.inner().core);
         let (mut payload_logical_bytes, mut payload_unique_bytes, mut payload_stored_bytes) =
             (0, 0, 0);
-        let mut windows: HashMap<(i64, i64), usize> = HashMap::new();
+        let mut windows: HashMap<(i64, i64, PartKind), usize> = HashMap::new();
         for p in c.vis.parts.iter() {
             let payload = &p.meta.payload;
             payload_logical_bytes += payload.logical_bytes;
             payload_unique_bytes += payload.unique_bytes;
             payload_stored_bytes += payload.stored_bytes;
             *windows
-                .entry((p.meta.window_start_ns, p.meta.window_ns))
+                .entry((p.meta.window_start_ns, p.meta.window_ns, PartKind::Spans))
+                .or_default() += 1;
+        }
+        for p in c.vis.ann_parts.iter() {
+            *windows
+                .entry((
+                    p.meta.window_start_ns,
+                    p.meta.window_ns,
+                    PartKind::Annotations,
+                ))
                 .or_default() += 1;
         }
         EngineStats {
@@ -1222,6 +1247,7 @@ impl Engine {
             duplicate_spans_dropped: c.compaction.duplicates_dropped,
             merge_input_bytes: c.compaction.input_bytes,
             merge_output_bytes: c.compaction.output_bytes,
+            annotations_superseded: c.compaction.annotations_superseded,
             windows_with_many_parts: windows.values().filter(|&&n| n > 1).count(),
             merging: c.compaction.merging,
             last_compaction_error: c.compaction.last_error.clone(),
