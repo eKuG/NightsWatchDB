@@ -57,10 +57,20 @@ the engine writes one log record `[0xA1] + nwdb_segment::encode_batch(items)`
   `InvalidArgument` for the whole call.
 - Admission is the same as for `ingest` and shares its code: `Fatal`,
   `Unavailable` when closing, when the buffer would pass `max_buffered_bytes`
-  and when the log has too many bytes waiting. An annotation counts for 160
-  bytes plus the bytes of its name, source, label and comment, in the
-  in-flight total, in the buffer and everywhere else, so the limit means the
-  same for both kinds of request.
+  and when the log has too many bytes waiting. An annotation counts for the
+  size of its struct (`size_of::<Annotation>()`, 160 bytes) plus 2 x 32 bytes
+  (the allocator's header and rounding for its name and source) plus the bytes
+  of its name and source, plus, for a label and for a comment if present, their
+  bytes and 32 more each; the same in the in-flight total, in the buffer and
+  everywhere else, so the limit means the same for both kinds of request. The
+  figure is set from a measurement with the counting allocator of
+  `nwdb-testkit`: a small annotation (an 8-byte name, a 1-byte source) holds
+  170 bytes of heap and counts for 233, one of the largest size (name, source,
+  label and comment at their limits) holds 4,817 bytes per annotation and
+  counts for 4,896; a test pins that the counted bytes are never below the
+  heap held. What the log keeps in memory for a request (a buffer as large as
+  its largest record) is the log's own bound (`max_wal_pending_bytes`), not
+  counted here.
 - The record's number is the `arrival` of its items: it is stamped when the
   record is applied to the buffer, for live requests and replay alike, and the
   caller's value is ignored. Of all records of one identity the one with the
@@ -182,8 +192,10 @@ failure, not a refusal, and the next start continues from where it stopped.
 | callers | `flush()` runs on the calling thread, serialised with the flusher by a gate; it checks the closing state after taking the gate. `run_maintenance()` runs one pass on the calling thread, serialised with the thread |
 
 One mutex (`Core`) holds the visible state and counters, and is held only to
-move pointers, never across I/O. A snapshot is three `Arc` clones taken under
-it. The only blocking calls in the log's callback path are the queue's short
+move pointers, never across I/O. A snapshot is eight `Arc` clones taken under
+it (the part list, the split map, the buffers of spans and of annotations,
+each an active and a frozen one, and the annotation part list with its window
+index; the frozen ones only while a flush runs). The only blocking calls in the log's callback path are the queue's short
 lock; the log is never called from a callback.
 
 Three more mutexes order the long operations: the flush gate (one flush at a
@@ -208,8 +220,10 @@ runs on a separate thread rather than joining itself.
 **How long shutdown can wait for maintenance.** A pass looks at the stop flag
 between its steps (and compaction between its merges), and shutdown sets it
 in the same critical section that refuses new requests, before it waits for
-them, so no merge starts or finishes after ingest is refused. Shutdown waits for
-the step in progress and no more. A step is one
+them, so no merge is started once ingest is refused; a merge that is running is
+asked to stop and ends at the next place it reads the flag (see The stop flag),
+except one whose output is already written, which is finished (an open and a
+commit are left). Shutdown waits for the step in progress and no more. A step is one
 manifest commit together with the publish that follows it (a file write and two
 syncs; the split map is rebuilt before the gate, see Replacing parts), or the
 deletion of one part directory, or a stretch of a merge that cannot be
@@ -246,17 +260,32 @@ for queries or for a flush's writing of parts.
    `(start_ns, span_id)` and the traces by `(earliest start, trace id)`. A
    trace's window is `window_start` of its earliest span in this buffer.
    **Annotations.** The frozen annotations are reduced to one record per
-   identity (the largest `arrival`). Each goes to a window, the largest (by
-   `(window_start_ns, window_ns)`) of: the window its trace's rows go to in
-   this flush, if the trace has rows in it, and the windows of the live span
-   parts that hold the trace (found in the parts' in-memory trace indexes,
-   newest window first, stopping at the first holder). The largest, because an
-   annotation must never be in an older window than an earlier annotation of
-   the same identity: removing the older window later would otherwise bring
-   an overwritten value back. If no window results (the trace is in no live
-   part and has no rows in this flush: retention removed it between the
-   write and the flush) the annotation is dropped; the number of drops
-   becomes part of `annotations_dropped` at the publish, so a flush that
+   identity (the largest `arrival`), by sorting and picking references into
+   the frozen buffer: nothing of the buffer is copied, so the flush needs 8
+   bytes per annotation on top of the buffer, not a second copy of it. Each
+   record goes to a window, the one that **ends last** of: the window its
+   trace's rows go to in this flush, if the trace has rows in it, and the
+   windows of the live span parts that hold the trace. The end of a window is
+   `window_start_ns + window_ns` in wide arithmetic, exactly what retention
+   compares with the clock; on equal ends the larger start. The window that
+   ends last, because it is the one retention removes last, whatever the
+   widths of the windows (`window_ns` can differ between two runs on one
+   directory): an annotation must never be in a window that expires before
+   the window of an earlier annotation of its identity, or removing the older
+   window later would bring an overwritten value back. (Ordering by start
+   would not do: a window that starts later can end first when the widths
+   differ.) The windows of all annotated traces are found together: the
+   annotated trace ids are sorted once, the live span parts are walked in
+   descending order of window end, and in each part the ids not yet placed
+   that lie inside the part's id range are looked up in its sorted trace index
+   with one forward (galloping) walk; an id is placed at its first holder, or
+   as soon as this flush's window for it ends no earlier than the part being
+   walked. The cost is the annotated traces times the parts that can hold
+   them, with no per-trace search from the start of each index, and a part is
+   asked only about the ids in its range. If no window results (the trace is
+   in no live part and has no rows in this flush: retention removed it
+   between the write and the flush) the annotation is dropped; the number of
+   drops becomes part of `annotations_dropped` at the publish, so a flush that
    fails and is retried counts nothing twice.
 3. **Write parts.** Reserve fresh part ids from the manifest, one per window
    of spans and one per window of annotations, in one reservation. For each window
@@ -268,13 +297,20 @@ for queries or for a flush's writing of parts.
    `nwdb-payload`); without one every value stays in its row. Either way a read
    returns the original bytes, so nothing else here depends on it. The memory
    of a flush is the buffer being written plus, for the part being written,
-   its row group and its de-duplication window (64 MiB by default). After
+   its row group and its de-duplication window (64 MiB by default), plus 8
+   bytes per frozen annotation for the references that reduce them (a test
+   pins that a flush of annotations peaks well below a second copy of them).
+   After
    the span parts, one annotation part per window that received annotations
    is written through `AnnotationWriter` (records in identity order, no
    splitter: annotations are small) and opened with `AnnotationReader`.
    `Stage::PartWritten` is called once per part of either kind, span parts
    first.
-4. **Commit.** Take the publish gate, then one manifest commit adds all the
+4. **Commit.** Take the publish gate. Under it, before the commit, each
+   annotation part is checked against the windows of the live span parts and
+   of this flush's span parts: one whose window has none (retention removed it
+   since the decision of step 2) is not committed, its directory is deleted
+   and its records count as dropped. Then one manifest commit adds all the
    parts, span parts and annotation parts, and sets `wal_flushed_lsn` to the
    frozen position. The gate is taken only now, after the long work of step 3.
    A flush that carries only annotations commits too, even when every
@@ -479,7 +515,12 @@ removes all expired parts of both kinds with one replacement, in one manifest
 version, so retention is atomic for queries: a snapshot sees the expired parts
 or not, never some of them, and never a window's spans without its annotations
 or the other way round (a test reads the manifest versions: the span parts and
-the annotation parts of the expired windows go in one). The clock is `EngineOptions::clock` (Unix nanoseconds; a
+the annotation parts of the expired windows go in one). The expired set is
+decided before the publish gate is taken; a flush can publish a span part or an
+annotation part into an expiring window in between. When the replacement
+patches in what a flush published meanwhile, it removes, in the same commit,
+the parts of either kind whose window is expired by the same cut-off, so the
+window goes whole. The clock is `EngineOptions::clock` (Unix nanoseconds; a
 test facility like the stage hook), by default the system clock. A retention
 of zero and a `maintenance_interval` of zero are refused by `open`.
 
@@ -526,21 +567,24 @@ What this means for particular data:
   queries then return what is left.
 - **The buffer is not touched.** Data in the buffer, expired or not, is
   removed only after a flush has written it into a part.
-- **An annotation lives as long as the newest window that held its trace when
-  it was flushed**, because that is the window of the annotation part it was
-  written to (see The flush). It goes with that window, and nothing else
-  decides: an annotation flushed into the window of a trace's older part
-  expires with that window even if a later window still holds part of the
-  trace (it is then gone while the trace is still readable), and an
-  annotation flushed into the later window outlives the older one. The window
-  rule is what keeps an overwritten value from coming back: of two records of
-  one identity the newer is never in an older window than the other, so
-  expiring the older window can take the older record and never the newer one
-  alone. An annotation part whose window holds no span part any more (it
-  happens when a retention pass removed the trace's part between a flush's
-  window decision and its commit) is removed when its own window expires, like
-  any other; until then `annotations` does not show it, because annotations are
-  looked up through the windows of the trace's span parts.
+- **An annotation lives as long as the window that ends last among those that
+  held its trace when it was flushed**, because that is the window of the
+  annotation part it was written to (see The flush). It goes with that window,
+  and nothing else decides: an annotation flushed into the window of a trace's
+  earlier-ending part expires with that window even if a later-ending window
+  still holds part of the trace (it is then gone while the trace is still
+  readable), and an annotation flushed into the later-ending window outlives
+  the earlier one. The window rule is what keeps an overwritten value from
+  coming back: of two records of one identity the newer is never in a window
+  that ends before the other's, whatever the widths of the windows, so
+  expiring the earlier-ending window can take the older record and never the
+  newer one alone. No annotation part is ever committed into a window that has
+  no span part: a flush decides the windows before it takes the publish gate,
+  and under the gate, before its commit, it checks each annotation part against
+  the windows of the live span parts and of its own span parts. A part whose
+  window was removed by retention in between is not committed (its directory is
+  deleted), and its records count as `annotations_dropped`, like those of a
+  trace that is gone (the data they are about has expired).
 
 Statistics: `maintenance_passes` (every pass counts, failed ones too),
 `retention_parts_removed` and `last_maintenance_error`. A pass that fails
@@ -627,8 +671,12 @@ arrives less often than `quiet` costs one rewrite of the window each time.**
 That is the price of one part per window; lengthen `quiet` to batch late data,
 or switch compaction off for a database that is loaded in arbitrary order.
 
-**The pass.** Retention runs first, so a merge never works on an expired
-window. Then, until the policy returns nothing or shutdown asks maintenance to
+**The pass.** Retention runs first, so a merge that starts at the beginning of
+a pass never works on a window that was already expired then. This holds
+at the start of the pass only: a window can expire while the pass runs
+(retention runs again before a merge once `maintenance_interval` has passed),
+and a merge may then work on a window that has just expired; its output goes
+with the next retention. Then, until the policy returns nothing or shutdown asks maintenance to
 stop (retention and the retry of deletions run again before a merge once
 `maintenance_interval` has passed since they last ran; see Retention):
 
@@ -708,12 +756,19 @@ abandoned because of it ends the loop, so the loop cannot spin while the thread
 exits), and a merge that returns an error while it is
 set is not counted as a failure: no backoff, no `last_compaction_error`, and
 the engine is not put in the fatal state (unless the error is `Fatal`). The
-flag is also handed to `merge_parts` (`MergeOptions::stop`), which ends a
-merge that is running with `Unavailable` at the next place it reads the flag:
-before an input is verified, or before a chunk.
+flag is also handed to the merge of either kind, which ends a merge that is
+running with `Unavailable` at the next place it reads the flag. A span merge
+(`merge_parts`, `MergeOptions::stop`) reads it before an input is verified and
+before each chunk; an annotation merge (`merge_annotation_parts`) reads it
+before an input is verified and after every 64 output blocks. A merge whose
+output is written is not stopped: only its open and its commit are left. After
+an error that says an input is damaged, the annotation inputs are verified
+again to name the damaged one; that is not done once the flag is set (the error
+is not recorded then), so shutdown does not wait for a second read of every
+input.
 
 **Shutdown during a merge.** A merge in progress is abandoned at the next
-place it reads the stop flag (before an input is verified, before a chunk): its temporary output is removed, no part is added or replaced, and the
+place it reads the stop flag (see The stop flag; for both kinds): its temporary output is removed, no part is added or replaced, and the
 inputs stay live; the next start merges them again. A merge that has written
 its output when shutdown begins is finished, since only an open and a commit
 are left. A merge that is abandoned for another reason (the stage hook returns
@@ -725,8 +780,9 @@ source) in the inputs, the record with the largest `arrival`, in identity
 order; the others are counted in `annotations_superseded`. **A delete record is
 never dropped by a merge**, even when it is the winner and nothing older is in
 the inputs: an older record of the same identity can be in an annotation part of
-an older window (an annotation is in the newest window that held its trace
-when it was flushed, so the older version can be in an earlier window), and
+a window that ends earlier (an annotation is in the window that ends last among
+those that held its trace when it was flushed, so the older version can be in an
+earlier-ending window), and
 dropping the delete would show that record again as soon as nothing newer hides
 it. A delete is dropped only when its window expires, with everything else in
 it. What a merge changes for readers: before it `annotations` reads the trace's
@@ -828,7 +884,18 @@ does not block, and is not blocked by, ingest or flush.
   the largest `arrival`, whether it is in a part or the buffer, so a delete in
   a later part or in the buffer hides an older value. `annotations_with_stats`
   returns `AnnotationStats` (parts probed, blocks read). A trace that is only
-  in the buffer has only buffered annotations.
+  in the buffer has only buffered annotations. The winners are streamed out of
+  the merge and the read stops as soon as `limit` winners are held and one more
+  was seen, so what is held is bounded by `limit` (and by the trace's buffered
+  records, which are bounded by the buffer). What is read is not bounded by the
+  limit: the time to read a trace's annotations is proportional to the records
+  stored for that trace, delete records included. A delete of an identity that
+  never existed is stored like any other record until its window expires.
+  `annotations_many(traces, per_trace_limit)` gives the winners of each trace
+  of a slice as `annotations` would, in the order of the slice, with one pass
+  over the buffered annotations for all of them (an index of references sorted
+  by trace id, 24 bytes per buffered annotation, then a lookup per trace); the
+  parts are read per trace.
 - `known_traces(ids)`: for each id, whether the trace has rows in a live part
   or in the buffers. The ids are sorted once; each part's in-memory trace
   index is walked forward with the galloping search of the split map, for the
@@ -866,23 +933,36 @@ does not block, and is not blocked by, ingest or flush.
   applied to the merged summary after the other filters, like `error`, so the
   early stop above holds. How it is evaluated, per candidate trace:
   - A candidate that is split (held by more than one span part), or has any
-    buffered annotation, or exists only in the buffer, goes the exact way:
-    `annotations` and the test on each winner (`annotation_exact_lookups`).
+    buffered annotation, or exists only in the buffer, goes the exact way
+    (`annotation_exact_lookups`): the winners of the trace are streamed out of
+    the merge of its annotation parts and its buffered records, each tested as
+    it comes, and the read stops at the first match. One record is held at a
+    time, besides the trace's buffered records. The buffered annotations are
+    read once per query, on first use, into an index of references sorted by
+    trace id (24 bytes per buffered annotation); a candidate's buffered
+    records are a lookup in it.
   - Every other candidate is in exactly one span part, so all its annotations
     are in the annotation parts of that part's window (an annotation goes to
-    the largest window of its holders, see The flush). For that window the set
-    of trace ids that match is built once, on first use, by one `Latest` scan
+    the window that ends last among its holders, so the one remaining holder's
+    window is the one it went to, see The flush). For that window the set of
+    trace ids that match is built once, on first use, by one `Latest` scan
     over all its annotation parts (`annotation_windows_scanned`); a winner that
     is not a delete and passes the test puts its trace id in the set, and
     membership answers the filter. At most the two most recently used sets are
-    kept. A set holds at most 1,048,576 trace ids (8 bytes of id plus hash
-    table overhead each, so about 40 MB at most per set): past that the query
-    fails with `InvalidArgument` saying more than that many traces of one
-    window match and the filter must be narrowed.
-  - Cost: a filter that most traces match stops with the newest windows
-    (`limit` results come from one or two windows); a filter that few match
-    reads each window that has annotation parts once, with no per-trace
-    block read.
+    kept. A set holds at most 1,048,576 trace ids (16 bytes of id plus hash
+    table overhead each, so about 40 to 50 MB at most per set). When a
+    window's set would pass the cap the set is dropped, the window is
+    remembered for the rest of the query as over the cap (its scan is not
+    repeated), and that window's candidates go the exact way: a filter that
+    broad matches most candidates, so the listing stops early and each exact
+    lookup ends at its first match. The query never fails because of the cap,
+    and its memory stays bounded by the cap.
+  - Cost: one pass over the buffered annotations per query, however many
+    candidates have buffered annotations. A filter that most traces match
+    stops with the newest windows (`limit` results come from one or two
+    windows); a filter that few match reads each window that has annotation
+    parts once, with no per-trace block read; a window over the cap costs its
+    one scan plus one exact lookup per candidate of it.
 - The split map: each part's trace index is sorted by trace id, and when the
   set of parts changes (start-up, a flush publishing parts) the traces that
   are in more than one part are found with a merge over the sorted indexes of
@@ -1020,12 +1100,10 @@ lists of the parts a flush writes have the budgets
   lasts until retention removes the parts. `get_trace` and `search` always show
   exactly one copy of a span, the one with the smallest `arrival`, before and
   after any merge.
-- An annotation lives as long as the newest window that held its trace when it
-  was flushed (see Retention): it goes with that window even if a later window
-  still holds part of the trace, so a trace spread over windows can be readable
-  with its annotations gone. An annotation part whose window no live span part
-  holds is not shown by `annotations` (it is removed when its window expires).
-  Annotation parts of one window are merged into one, and a delete record
+- An annotation lives as long as the window that ends last among those that
+  held its trace when it was flushed (see Retention): it goes with that window
+  even if a later-ending window still holds part of the trace, so a trace
+  spread over windows can be readable with its annotations gone. Annotation parts of one window are merged into one, and a delete record
   stays in the part until the window expires, so a window of mostly deletes
   does not shrink.
 - A span id of an annotation is not checked against the trace's spans (spans
@@ -1033,11 +1111,17 @@ lists of the parts a flush writes have the budgets
   yet is refused ("unknown trace"): annotate after the spans were
   acknowledged.
 - A trace's annotations in the buffer are found by reading every buffered
-  annotation, and `known_traces` reads the trace id column of every buffered
-  batch for ids it did not find in a part; both cost time proportional to the
-  buffer.
+  annotation (`annotations`), or once for a whole list or a page of traces
+  (`list_traces` with a filter, `annotations_many`), and `known_traces` reads
+  the trace id column of every buffered batch for ids it did not find in a
+  part; both cost time proportional to the buffer.
+- Reading a trace's annotations costs time in proportion to the records stored
+  for that trace, delete records included (a delete of an identity that never
+  existed is stored like any other record until its window expires). The
+  limits bound what is returned and held, not what is read.
 - The annotation filter of a list builds one set of matching trace ids per
-  window it meets, up to 1,048,576 ids.
+  window it meets, up to 1,048,576 ids; a window past that is answered trace by
+  trace.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few
@@ -1057,9 +1141,12 @@ lists of the parts a flush writes have the budgets
   small parts, which compaction merges.
 - Retention removes whole parts and nothing else: the buffer and the log are
   not touched by it. There is no object store.
-- A merge is stopped only between inputs being verified and between chunks,
-  so shutdown waits for the one input being verified, the chunk that is running
-  (32 MiB of rows by default) or the writer's `finish`, whichever is longest. A window that gets a
+- A merge is stopped only at the places that read the stop flag: a span merge
+  between inputs being verified and between chunks, an annotation merge between
+  inputs being verified and every 64 output blocks. Shutdown therefore waits
+  for the one input being verified, the chunk (32 MiB of rows by default) or
+  the 64 blocks that are running, or the writer's `finish`, whichever is
+  longest; a merge whose output is written is finished, not stopped. A window that gets a
   small late part more rarely than `quiet` is rewritten whole each time.
 - There is no check of free space before a merge. Its output, up to
   `max_input_bytes` of data, is written while its inputs are still on disk, so

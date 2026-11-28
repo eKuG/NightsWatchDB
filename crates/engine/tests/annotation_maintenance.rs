@@ -495,6 +495,19 @@ fn a_failing_annotation_window_backs_off_without_holding_back_span_merges() {
     compact_fully(&e);
     assert_eq!(e.stats().annotation_parts, 1);
     assert_eq!(values(&e, 1), vec![Some(3.0)]);
+    // One part of each kind in the manifest: the kinds were never merged into
+    // each other.
+    let kinds: Vec<PartKind> = disk_state(dir.path())
+        .0
+        .parts
+        .iter()
+        .map(|p| p.kind)
+        .collect();
+    assert_eq!(kinds.iter().filter(|k| **k == PartKind::Spans).count(), 1);
+    assert_eq!(
+        kinds.iter().filter(|k| **k == PartKind::Annotations).count(),
+        1
+    );
     e.shutdown().unwrap();
 }
 
@@ -591,6 +604,7 @@ fn a_damaged_annotation_input_leaves_its_window_alone_and_span_merges_go_on() {
         "names the part: {why}"
     );
     assert!(why.contains("damaged"), "{why}");
+    assert_eq!(why.matches("corrupt data").count(), 1, "said once: {why}");
     // Window 1's annotation parts were merged in the same pass, and so were
     // the span parts of window 0; window 0's annotation parts are as they
     // were.
@@ -725,6 +739,111 @@ fn shutdown_while_an_annotation_merge_is_in_progress_abandons_it_and_loses_nothi
     for t in 1..=5u128 {
         assert_eq!(values(&e, t), vec![Some(3.0)], "trace {t} after the merge");
     }
+    e.shutdown().unwrap();
+}
+
+/// Shutdown that begins while the merge is writing its output (not before its
+/// first input is verified) stops it at the next check of the stop flag, which
+/// the annotation merge makes every 64 output blocks: the output is removed,
+/// no part is replaced, and every annotation is there after the restart.
+#[test]
+fn shutdown_while_an_annotation_merge_is_writing_its_output_abandons_it() {
+    // A comment of 4000 letters that differs from record to record, so the
+    // output has hundreds of blocks and the merge takes a while.
+    fn comment(seed: u64) -> String {
+        let mut x = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..4000)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                char::from(b'a' + ((x >> 33) % 26) as u8)
+            })
+            .collect()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(compact_opts(dir.path()));
+    ingest(&e, &[span_at(1, 1, 10)]).unwrap();
+    e.flush().unwrap();
+    for round in 0..3u64 {
+        for half in 0..2u64 {
+            let items = (0..750u64)
+                .map(|i| {
+                    let mut a = score(1, None, &format!("r{round}h{half}i{i}"), "s", i as f64);
+                    a.comment = Some(comment(round * 10_000 + half * 1_000 + i));
+                    a
+                })
+                .collect();
+            annotate(&e, items);
+        }
+        e.flush().unwrap();
+    }
+    assert_eq!(e.stats().annotation_parts, 3);
+    let parts = dir.path().join("parts");
+    let watcher = {
+        let e = e.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(60) {
+                let writing = std::fs::read_dir(&parts)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|d| d.file_name().to_string_lossy().ends_with(".tmp"));
+                if writing {
+                    let _ = e.shutdown();
+                    return true;
+                }
+            }
+            false
+        })
+    };
+    let outcome = e.run_maintenance();
+    assert!(watcher.join().unwrap(), "the output was never seen");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let s = e.stats();
+    assert_eq!(s.merges_done, 0, "the merge finished before it was stopped");
+    assert_eq!(s.last_compaction_error, None);
+    assert!(!s.fatal);
+    let after = part_dir_names(dir.path());
+    assert!(after.iter().all(|p| !p.contains("tmp")), "{after:?}");
+    assert!(disk_state(dir.path()).1.is_empty());
+    drop(e);
+
+    let e = open(compact_opts(dir.path()));
+    assert_eq!(e.stats().annotation_parts, 3);
+    assert_eq!(shown(&e, 1).len(), 4_500);
+    e.shutdown().unwrap();
+}
+
+/// Retention removes a window with thousands of annotation parts in one
+/// replacement; the list the replacement publishes is built from a set of the
+/// removed ids, not by searching the list of removed ids for each part (the
+/// work under the publish gate, which flushes wait for).
+#[test]
+fn retention_removes_a_window_of_thousands_of_annotation_parts_in_one_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = Arc::new(AtomicI64::new(0));
+    let e = open(with_clock(dir.path(), false, &now));
+    ingest(&e, &[span_at(1, 1, 10), span_at(2, 1, W + 10)]).unwrap();
+    e.flush().unwrap();
+    for i in 0..1_500 {
+        let trace = 1 + (i % 2);
+        annotate(&e, vec![score(trace, None, &format!("n{i}"), "s", 1.0)]);
+        e.flush().unwrap();
+    }
+    assert_eq!(e.stats().annotation_parts, 1_500);
+    let version = disk_state(dir.path()).0.version;
+    // Window 0 (trace 1, 750 parts) expires; window 1 does not.
+    now.store(2 * W, Ordering::SeqCst);
+    let started = Instant::now();
+    e.run_maintenance().unwrap();
+    let took = started.elapsed();
+    assert_eq!(e.stats().annotation_parts, 750);
+    assert_eq!(disk_state(dir.path()).0.version, version + 1, "one replacement");
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(shown(&e, 1).is_empty());
+    assert_eq!(shown(&e, 2).len(), 750);
     e.shutdown().unwrap();
 }
 

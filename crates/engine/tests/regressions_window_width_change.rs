@@ -1,21 +1,22 @@
-//! Defect: the window rule orders windows by `(window_start_ns, window_ns)`,
-//! but retention removes a window when `window_start_ns + window_ns` has
-//! passed. Once `EngineOptions::window_ns` differs between two runs on one
-//! data directory (nothing refuses that), the "largest" window of a trace can
-//! be the first one retention removes, and an overwritten annotation comes
-//! back.
+//! An annotation lives as long as the window that ends last among those that
+//! held its trace when it was flushed, whatever the widths of the windows:
+//! retention removes a window when `window_start_ns + window_ns` has passed,
+//! and the flush puts an annotation in the window with the largest end (on
+//! equal ends the larger start). `EngineOptions::window_ns` can differ
+//! between two runs on one data directory (nothing refuses that), so a window
+//! with a larger start can end first, and an overwritten annotation must not
+//! come back when it is removed.
 //!
 //! Sequence: run 1 with 10,000 ns windows: trace 7 has a span at 100 (window
 //! `(0, 10000)`), score 1.0 is annotated and flushed into window `(0, 10000)`.
 //! Run 2 with 1,000 ns windows: a late span of trace 7 at 5,500 (window
-//! `(5000, 1000)`) and an overwrite, score 2.0, flushed together. The rule
-//! picks `(5000, 1000)` for the overwrite because 5000 > 0, although that
-//! window ends at 6,000 and the other at 10,000. The clock moves to 7,000
-//! with a retention of 1,000 ns: `(5000, 1000)` expires, `(0, 10000)` does
-//! not. The trace is still there (its span at 100).
+//! `(5000, 1000)`) and an overwrite, score 2.0, flushed together. The overwrite
+//! goes to `(0, 10000)`, which ends at 10,000, not to `(5000, 1000)`, which
+//! ends at 6,000. The clock moves to 7,000 with a retention of 1,000 ns:
+//! `(5000, 1000)` expires, `(0, 10000)` does not. The trace is still there
+//! (its span at 100).
 //!
-//! Expected: the trace shows 2.0, or nothing; never the overwritten 1.0.
-//! Observed: it shows 1.0.
+//! Guaranteed: the trace shows 2.0, never the overwritten 1.0.
 
 mod common;
 

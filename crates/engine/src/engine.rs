@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, TryLockError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -44,18 +44,28 @@ const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
 /// registered under it.
 pub const ANNOTATION_RECORD_TAG: u8 = 0xA1;
 
+/// What the allocator keeps for a small allocation beyond the bytes asked
+/// for: its header and the rounding up to its size class.
+const ALLOCATION_SLACK_BYTES: usize = 32;
+
 /// What an annotation counts for in the buffer, the in-flight total and the
-/// admission check, besides the bytes of its text: the struct, the ids and the
-/// allocations.
-const ANNOTATION_OVERHEAD_BYTES: usize = 160;
+/// admission check, besides the bytes of its text: the struct as it sits in
+/// its list and the slack of the allocations of its two text fields that every
+/// annotation has (name and source). A label and a comment count for their
+/// bytes and their own slack. Measured with the counting allocator, a small
+/// annotation holds its struct plus its text bytes, so the total is never
+/// below the heap held.
+const ANNOTATION_OVERHEAD_BYTES: usize =
+    std::mem::size_of::<Annotation>() + 2 * ALLOCATION_SLACK_BYTES;
 
 /// The bytes one annotation counts for, everywhere.
 fn annotation_bytes(a: &Annotation) -> usize {
+    let optional = |s: &Option<String>| s.as_ref().map_or(0, |s| s.len() + ALLOCATION_SLACK_BYTES);
     ANNOTATION_OVERHEAD_BYTES
         + a.name.len()
         + a.source.len()
-        + a.label.as_ref().map_or(0, String::len)
-        + a.comment.as_ref().map_or(0, String::len)
+        + optional(&a.label)
+        + optional(&a.comment)
 }
 
 /// The result of [`Engine::annotate`].
@@ -396,6 +406,13 @@ impl LiveAnnotationPart {
 /// The window an annotation part belongs to: `(window_start_ns, window_ns)`.
 pub(crate) type WindowKey = (i64, i64);
 
+/// The order of windows by when retention removes them: by end
+/// (`window_start_ns + window_ns`, in wide arithmetic as retention computes
+/// it), then by start. The greatest is the window that expires last.
+pub(crate) fn window_order((start, ns): WindowKey) -> (i128, i64) {
+    (i128::from(start) + i128::from(ns), start)
+}
+
 /// The positions in `parts` of the annotation parts of each window.
 pub(crate) fn annotation_windows(
     parts: &[Arc<LiveAnnotationPart>],
@@ -526,6 +543,9 @@ pub(crate) struct Inner {
     /// so their commit-and-publish steps never interleave. Never held while
     /// parts are written or directories are deleted.
     pub publish_gate: Mutex<()>,
+    /// Index lookups made by flushes to find the windows of annotated traces;
+    /// for tests (see `Engine::annotation_window_probes`).
+    pub window_probes: AtomicU64,
     /// One maintenance pass at a time, whether from the thread or from
     /// [`Engine::run_maintenance`].
     pub maintenance_gate: Mutex<()>,
@@ -909,6 +929,7 @@ impl Engine {
             parts_dir,
             flush_gate: Mutex::new(()),
             publish_gate: Mutex::new(()),
+            window_probes: AtomicU64::new(0),
             maintenance_gate: Mutex::new(()),
             merge_stop: Arc::new(AtomicBool::new(false)),
             undeleted: Mutex::new(Vec::new()),
@@ -1188,6 +1209,13 @@ impl Engine {
     /// [`Snapshot::aggregate_tokens`] on a fresh snapshot.
     pub fn aggregate_tokens(&self, query: &AggQuery) -> Result<Vec<TokenAgg>> {
         self.snapshot().aggregate_tokens(query)
+    }
+
+    /// For tests: the index lookups flushes have made to find the windows of
+    /// annotated traces since the engine opened.
+    #[doc(hidden)]
+    pub fn annotation_window_probes(&self) -> u64 {
+        self.inner().window_probes.load(Ordering::Relaxed)
     }
 
     /// Counters and positions.

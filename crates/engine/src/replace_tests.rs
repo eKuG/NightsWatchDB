@@ -850,6 +850,16 @@ fn both_kinds_are_replaced_in_one_step_and_old_snapshots_keep_reading() {
 
     let old = e.snapshot();
     let stop = Arc::new(AtomicBool::new(false));
+    // Every replacement of window 3 reserves the id of its span part and then
+    // the next id for its annotation part, so in a snapshot that shows either
+    // of them the two ids differ by one; a publish in two steps would show a
+    // new part of one kind with an old part of the other.
+    let first_new_id = part_ids(&e)
+        .into_iter()
+        .chain(ann_ids(&e))
+        .max()
+        .expect("parts")
+        + 1;
     // Readers: the traces of window 3 (3, 13, 23) always show their spans and
     // their winner (the merged parts are never missing, one kind is never
     // swapped before the other); the traces of window 4 show their spans only
@@ -861,6 +871,23 @@ fn both_kinds_are_replaced_in_one_step_and_old_snapshots_keep_reading() {
                 let mut rounds = 0u64;
                 while !stop.load(Ordering::SeqCst) {
                     let s = e.snapshot();
+                    let spans_of_3 = s
+                        .part_traces()
+                        .into_iter()
+                        .filter(|(_, ts)| ts.contains(&tid(3)))
+                        .map(|x| x.0)
+                        .max()
+                        .expect("a part holds trace 3");
+                    let anns_of_3 = s
+                        .annotation_part_info()
+                        .into_iter()
+                        .filter(|x| x.1 == 3_000)
+                        .map(|x| x.0)
+                        .max()
+                        .expect("an annotation part of window 3");
+                    if spans_of_3 >= first_new_id || anns_of_3 >= first_new_id {
+                        assert_eq!(anns_of_3, spans_of_3 + 1, "the two kinds changed in two steps");
+                    }
                     for t in [3u128, 13, 23] {
                         assert!(s.get_trace(tid(t)).unwrap().is_some(), "spans of {t}");
                         assert_eq!(values_of(&s, t), vec![Some(2.0)], "trace {t}");

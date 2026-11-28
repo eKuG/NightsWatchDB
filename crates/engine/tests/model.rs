@@ -584,7 +584,8 @@ fn random_operations_with_annotations_agree_with_the_model() {
 /// (`trace % 8`), so the model can say what expiry takes: a window's spans and
 /// the annotations of its traces go together, and nothing of them comes back.
 /// Not modelled: a trace spread over windows (its annotations live as long as
-/// the newest window that held the trace when they were flushed), which the
+/// the window that ends last among those that held the trace when they were
+/// flushed), which the
 /// engine tests cover with fixed cases.
 #[test]
 fn random_operations_with_annotations_compaction_and_retention_agree_with_the_model() {

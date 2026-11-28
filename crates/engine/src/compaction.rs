@@ -554,9 +554,15 @@ mod tests {
         let parts: Vec<_> = (1..=4).map(|i| ann(i, 0, 10, 1)).collect();
         let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
         assert_eq!((m.rule, m.kind), (Rule::Tiered, PartKind::Annotations));
-        // The piece ceiling does not concern annotation parts.
-        let parts = vec![ann(1, 0, 10, 99), ann(2, 0, 10, 99)];
-        assert!(choose_merge(&o, &parts, 0, &|_| false).is_some());
+        // The piece ceiling holds span parts back (3 + 3 pieces above a
+        // ceiling of 4) and does not concern annotation parts, which carry no
+        // pieces: the same window, the same sizes, the same ceiling.
+        let spans = |i| PartInfo {
+            pieces: 3,
+            ..p(i, 0, 10, 99)
+        };
+        assert!(choose_merge(&o, &[spans(1), spans(2)], 4, &|_| false).is_none());
+        assert!(choose_merge(&o, &[ann(1, 0, 10, 99), ann(2, 0, 10, 99)], 4, &|_| false).is_some());
     }
 
     #[test]

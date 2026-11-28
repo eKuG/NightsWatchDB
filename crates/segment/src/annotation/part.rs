@@ -290,7 +290,10 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 impl AnnotationReader {
     /// Opens the part in `part_dir` and checks, in this order: the magic, the
     /// format version, the footer's checksum, that the part id and window
-    /// are those of `meta`, the length of the file, the table's checksum,
+    /// are those of `meta`, the length of the file against the metadata and
+    /// against the footer's block count (before anything sized by the file's
+    /// content is allocated), that the blocks, table and footer add up to the
+    /// file, the table's checksum,
     /// that blocks are contiguous from offset 0, that first keys do not
     /// decrease, that every block's length is within its ceiling, that there
     /// is at least one block, and that the footer's counts and time range
@@ -327,6 +330,12 @@ impl AnnotationReader {
                 meta.window_ns
             )));
         }
+        if meta.files.get(ANNOTATION_FILE) != Some(&len) {
+            return Err(bad(format!(
+                "file has {len} bytes but the part's metadata says {:?}",
+                meta.files.get(ANNOTATION_FILE)
+            )));
+        }
         let blocks = u64_at(&f, 48);
         let table_bytes = blocks
             .checked_mul(ENTRY_BYTES as u64)
@@ -347,12 +356,6 @@ impl AnnotationReader {
             return Err(bad(format!(
                 "file has {len} bytes but its blocks, table and footer add up to {}",
                 clen_sum + table_bytes + FOOTER_BYTES as u64
-            )));
-        }
-        if meta.files.get(ANNOTATION_FILE) != Some(&len) {
-            return Err(bad(format!(
-                "file has {len} bytes but the part's metadata says {:?}",
-                meta.files.get(ANNOTATION_FILE)
             )));
         }
         if crc32c::crc32c(&r.table) != u32_at(&f, 72) {

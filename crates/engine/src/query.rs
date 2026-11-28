@@ -278,6 +278,16 @@ impl Cursor {
     }
 }
 
+/// The records of `trace` in a [`Snapshot::buffer_index`], in identity order,
+/// several per identity possible.
+fn buffered_of(index: &[(TraceId, &Annotation)], trace: TraceId) -> Vec<Annotation> {
+    let lo = index.partition_point(|(t, _)| *t < trace);
+    let hi = index.partition_point(|(t, _)| *t <= trace);
+    let mut v: Vec<Annotation> = index[lo..hi].iter().map(|(_, a)| (*a).clone()).collect();
+    v.sort_by(|a, b| a.identity_cmp(b));
+    v
+}
+
 impl Snapshot {
     pub(crate) fn new(vis: Visible, limits: BatchLimits, flushed_lsn: u64) -> Self {
         Self {
@@ -496,18 +506,33 @@ impl Snapshot {
     /// The records of the buffers for one trace, in identity order, several
     /// per identity possible. Time proportional to the buffered annotations.
     fn buffer_annotations_of(&self, trace: TraceId) -> Vec<Annotation> {
-        let batches = self
-            .vis
-            .ann_frozen
-            .iter()
-            .flat_map(|f| f.iter())
-            .chain(self.vis.ann_active.iter());
-        let mut v: Vec<Annotation> = batches
-            .flat_map(|b| b.iter())
+        let mut v: Vec<Annotation> = self
+            .buffered_annotations()
             .filter(|a| a.trace_id == trace)
             .cloned()
             .collect();
         v.sort_by(|a, b| a.identity_cmp(b));
+        v
+    }
+
+    fn buffered_annotations(&self) -> impl Iterator<Item = &Annotation> {
+        self.vis
+            .ann_frozen
+            .iter()
+            .flat_map(|f| f.iter())
+            .chain(self.vis.ann_active.iter())
+            .flat_map(|b| b.iter())
+    }
+
+    /// One pass over the buffered annotations: references to all of them
+    /// sorted by trace id (24 bytes each, nothing copied), for
+    /// [`buffered_of`] to look traces up in.
+    fn buffer_index(&self) -> Vec<(TraceId, &Annotation)> {
+        let mut v: Vec<(TraceId, &Annotation)> = self
+            .buffered_annotations()
+            .map(|a| (a.trace_id, a))
+            .collect();
+        v.sort_by_key(|(t, _)| *t);
         v
     }
 
@@ -562,10 +587,40 @@ impl Snapshot {
         trace: TraceId,
         limit: usize,
     ) -> Result<(Vec<Annotation>, bool, AnnotationStats)> {
+        self.annotations_of(trace, limit, self.buffer_annotations_of(trace))
+    }
+
+    /// The winning annotations of each trace, as [`annotations`](Self::annotations)
+    /// gives them, in the order of `traces`; one pass over the buffer for all
+    /// of them.
+    pub fn annotations_many(
+        &self,
+        traces: &[TraceId],
+        per_trace_limit: usize,
+    ) -> Result<Vec<(Vec<Annotation>, bool)>> {
+        let index = self.buffer_index();
+        traces
+            .iter()
+            .map(|&t| {
+                self.annotations_of(t, per_trace_limit, buffered_of(&index, t))
+                    .map(|(a, more, _)| (a, more))
+            })
+            .collect()
+    }
+
+    /// The winners of `trace` over its annotation parts and `buffered` (its
+    /// buffered records). Stops reading once it holds `limit` winners and has
+    /// seen one more.
+    fn annotations_of(
+        &self,
+        trace: TraceId,
+        limit: usize,
+        buffered: Vec<Annotation>,
+    ) -> Result<(Vec<Annotation>, bool, AnnotationStats)> {
         let parts = self.annotation_parts_of(trace);
         let blocks_before: u64 = parts.iter().map(|p| p.reader.blocks_read()).sum();
         let cursors = parts.iter().map(|p| p.reader.cursor(Some(trace))).collect();
-        let mut latest = Latest::new(cursors, self.buffer_annotations_of(trace));
+        let mut latest = Latest::new(cursors, buffered);
         let mut out: Vec<Annotation> = Vec::new();
         let mut more = false;
         while let Some(a) = latest.next()? {
@@ -591,19 +646,43 @@ impl Snapshot {
         Ok((out, more, stats))
     }
 
+    /// Whether some winning, not deleted annotation of `trace` passes `f`:
+    /// the winners are streamed and the first match ends the read, so one
+    /// record is held at a time besides `buffered`.
+    fn trace_matches(
+        &self,
+        trace: TraceId,
+        f: &AnnotationFilter,
+        buffered: Vec<Annotation>,
+    ) -> Result<bool> {
+        let cursors = self
+            .annotation_parts_of(trace)
+            .iter()
+            .map(|p| p.reader.cursor(Some(trace)))
+            .collect();
+        let mut latest = Latest::new(cursors, buffered);
+        while let Some(a) = latest.next()? {
+            if !a.delete && f.matches(&a) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The ids of the traces with a winning, not deleted annotation that
     /// `f` accepts, among the annotation parts of `window`: one scan of all of
     /// them. The caller guarantees these are the only parts the traces it
-    /// asks about can have annotations in. Fails past the cap.
+    /// asks about can have annotations in. `None` once more than the cap
+    /// match: the set is dropped, and the caller answers by trace.
     fn annotation_matches_of_window(
         &self,
         window: WindowKey,
         f: &AnnotationFilter,
         stats: &mut ListStats,
-    ) -> Result<HashSet<TraceId>> {
+    ) -> Result<Option<HashSet<TraceId>>> {
         let mut set = HashSet::new();
         let Some(idx) = self.vis.ann_windows.get(&window) else {
-            return Ok(set);
+            return Ok(Some(set));
         };
         stats.annotation_windows_scanned += 1;
         let cursors = idx
@@ -613,14 +692,10 @@ impl Snapshot {
         let mut latest = Latest::new(cursors, Vec::new());
         while let Some(a) = latest.next()? {
             if !a.delete && f.matches(&a) && set.insert(a.trace_id) && set.len() > self.set_cap {
-                return Err(Error::invalid_argument(format!(
-                    "more than {} traces of one window match the annotation filter; \
-                     narrow the filter",
-                    self.set_cap
-                )));
+                return Ok(None);
             }
         }
-        Ok(set)
+        Ok(Some(set))
     }
 
     /// Partial summaries of the traces in the buffers, one per trace.
@@ -788,9 +863,11 @@ impl Snapshot {
 
         let mut seen: HashSet<TraceId> = HashSet::new();
         // The annotation filter's state: the sets of matching traces of the
-        // two windows used last, and the traces with a buffered annotation.
+        // two windows used last, the windows whose set passed the cap, and
+        // the buffered annotations by trace (one pass, on first use).
         let mut ann_sets: Vec<(WindowKey, HashSet<TraceId>)> = Vec::new();
-        let mut buffered_ann: Option<HashSet<TraceId>> = None;
+        let mut over_cap: HashSet<WindowKey> = HashSet::new();
+        let mut buffered_ann: Option<Vec<(TraceId, &Annotation)>> = None;
         // The worst held result is on top.
         let mut best: BinaryHeap<Ranked> = BinaryHeap::new();
         while let Some((key, k)) = heap.pop() {
@@ -904,45 +981,50 @@ impl Snapshot {
                 // The exact path for a trace whose annotations may be in
                 // several windows or in the buffer; every other candidate is
                 // in one span part, and its annotations are all in the
-                // annotation parts of that part's window.
-                let exact = part_holders.len() != 1
-                    || self.vis.split.holders(&id).is_some()
-                    || buffered_ann
-                        .get_or_insert_with(|| {
-                            self.vis
-                                .ann_frozen
-                                .iter()
-                                .flat_map(|f| f.iter())
-                                .chain(self.vis.ann_active.iter())
-                                .flat_map(|b| b.iter().map(|a| a.trace_id))
-                                .collect()
-                        })
-                        .contains(&id);
-                let pass = if exact {
-                    stats.annotation_exact_lookups += 1;
-                    self.annotations(id, usize::MAX)?
-                        .0
-                        .iter()
-                        .any(|a| f.matches(a))
-                } else {
+                // annotation parts of that part's window (an annotation goes
+                // to the window that ends last among its holders). A window
+                // whose set of matches passed the cap is answered by the exact
+                // path too.
+                let index = buffered_ann.get_or_insert_with(|| self.buffer_index());
+                let buffered = buffered_of(index, id);
+                let by_set = part_holders.len() == 1
+                    && self.vis.split.holders(&id).is_none()
+                    && buffered.is_empty();
+                let mut answer = None;
+                if by_set {
                     let m = &parts[part_holders[0]].meta;
                     let w = (m.window_start_ns, m.window_ns);
                     let at = match ann_sets.iter().position(|(k, _)| *k == w) {
-                        Some(at) => at,
-                        None => {
-                            let set = self.annotation_matches_of_window(w, f, &mut stats)?;
-                            // Only the two most recently used sets stay.
-                            if ann_sets.len() == 2 {
-                                ann_sets.remove(0);
+                        Some(at) => Some(at),
+                        None if over_cap.contains(&w) => None,
+                        None => match self.annotation_matches_of_window(w, f, &mut stats)? {
+                            Some(set) => {
+                                // Only the two most recently used sets stay.
+                                if ann_sets.len() == 2 {
+                                    ann_sets.remove(0);
+                                }
+                                ann_sets.push((w, set));
+                                Some(ann_sets.len() - 1)
                             }
-                            ann_sets.push((w, set));
-                            ann_sets.len() - 1
-                        }
+                            None => {
+                                over_cap.insert(w);
+                                None
+                            }
+                        },
                     };
-                    // The most recently used goes last.
-                    let used = ann_sets.remove(at);
-                    ann_sets.push(used);
-                    ann_sets[ann_sets.len() - 1].1.contains(&id)
+                    if let Some(at) = at {
+                        // The most recently used goes last.
+                        let used = ann_sets.remove(at);
+                        ann_sets.push(used);
+                        answer = Some(ann_sets[ann_sets.len() - 1].1.contains(&id));
+                    }
+                }
+                let pass = match answer {
+                    Some(p) => p,
+                    None => {
+                        stats.annotation_exact_lookups += 1;
+                        self.trace_matches(id, f, buffered)?
+                    }
                 };
                 if !pass {
                     continue;
@@ -969,6 +1051,13 @@ impl Snapshot {
                 (p.meta.part_id, ids.collect())
             })
             .collect()
+    }
+
+    /// For tests: the annotations in the buffers, the frozen ones first, in
+    /// the order they were applied.
+    #[doc(hidden)]
+    pub fn buffered_annotation_list(&self) -> Vec<Annotation> {
+        self.buffered_annotations().cloned().collect()
     }
 
     /// For tests: each live annotation part's id, window start, window width

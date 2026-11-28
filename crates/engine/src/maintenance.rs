@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nwdb_core::{Error, PartKind, Result, part_dir_name};
@@ -87,13 +87,20 @@ impl Replaced {
 /// The error of an annotation merge that found damage, with the damaged input
 /// named (the merge itself reports the file, not the part). Other errors pass
 /// through. Looks only on this error path, so a healthy merge verifies each
-/// input once.
-fn name_damaged_input(inputs: &[&Arc<LiveAnnotationPart>], e: Error) -> Error {
-    if !matches!(e, Error::Corrupt(_)) {
+/// input once, and not at all once `stop` is set: the error is not recorded
+/// then, and shutdown does not wait for a second read of every input.
+fn name_damaged_input(inputs: &[&Arc<LiveAnnotationPart>], stop: &AtomicBool, e: Error) -> Error {
+    if !matches!(e, Error::Corrupt(_)) || stop.load(Ordering::SeqCst) {
         return e;
     }
     for p in inputs {
         if let Err(why) = p.reader.verify() {
+            // `Corrupt` already prints as "corrupt data: ..."; the new error
+            // says it once.
+            let why = match why {
+                Error::Corrupt(m) => m,
+                other => other.to_string(),
+            };
             return Error::corrupt(format!(
                 "merge input {} ({}): {why}",
                 p.meta.part_id,
@@ -147,7 +154,28 @@ impl Inner {
         add: Vec<LivePart>,
         add_ann: Vec<LiveAnnotationPart>,
     ) -> Result<Replaced> {
-        let dirs: Vec<PathBuf> = remove
+        self.replace_parts_expiring(remove, add, add_ann, None)
+    }
+
+    /// [`replace_parts`](Self::replace_parts) for retention: `expire_before`
+    /// is the cut-off it decided the expired parts with (a window is expired
+    /// when `window_start_ns + window_ns` is at or below it). A flush may
+    /// publish a span part or an annotation part into an expiring window
+    /// between that decision and the gate; those parts are removed in the
+    /// same commit, so the window goes whole.
+    pub(crate) fn replace_parts_expiring(
+        &self,
+        remove: &[u64],
+        add: Vec<LivePart>,
+        add_ann: Vec<LiveAnnotationPart>,
+        expire_before: Option<i128>,
+    ) -> Result<Replaced> {
+        let expired = |m: &nwdb_core::PartMeta| {
+            expire_before
+                .is_some_and(|c| i128::from(m.window_start_ns) + i128::from(m.window_ns) <= c)
+        };
+        let mut remove: Vec<u64> = remove.to_vec();
+        let mut dirs: Vec<PathBuf> = remove
             .iter()
             .map(|&id| self.parts_dir.join(part_dir_name(id)))
             .collect();
@@ -181,7 +209,7 @@ impl Inner {
                 .chain(old_ann.iter().map(|p| p.meta.part_id))
                 .collect();
             let mut seen_twice = HashSet::new();
-            for id in remove {
+            for id in &remove {
                 if !live.contains(id) || !seen_twice.insert(*id) {
                     return Err(Error::invalid_argument(format!(
                         "cannot remove part {id}: it is not live or is listed twice"
@@ -200,13 +228,28 @@ impl Inner {
                 .filter(|p| !known.contains(&p.meta.part_id))
                 .cloned()
                 .collect();
+            let removing: HashSet<u64> = remove.iter().copied().collect();
             if old_parts.len() != seen.len() + later.len()
-                || later.iter().any(|p| remove.contains(&p.meta.part_id))
+                || later.iter().any(|p| removing.contains(&p.meta.part_id))
             {
                 return Err(Error::other(
                     "the part list changed while a replacement was being prepared",
                 ));
             }
+            // Parts published since the cut-off was decided that are in an
+            // expired window go with it; they are in `later` and in no map
+            // yet, so they are only left out of what is patched in.
+            let (swept, later): (Vec<_>, Vec<_>) = later.into_iter().partition(|p| expired(&p.meta));
+            let swept_ann: Vec<u64> = old_ann
+                .iter()
+                .filter(|p| expired(&p.meta) && !removing.contains(&p.meta.part_id))
+                .map(|p| p.meta.part_id)
+                .collect();
+            for id in swept.iter().map(|p| p.meta.part_id).chain(swept_ann) {
+                dirs.push(self.parts_dir.join(part_dir_name(id)));
+                remove.push(id);
+            }
+            let removing: HashSet<u64> = remove.iter().copied().collect();
             // The last point where nothing has changed yet.
             self.hook_before_commit(Stage::BeforeReplaceCommit)?;
 
@@ -217,7 +260,7 @@ impl Inner {
                     .map(|p| p.meta.clone())
                     .chain(add_ann.iter().map(|p| p.meta.clone()))
                     .collect(),
-                remove: remove.to_vec(),
+                remove: remove.clone(),
                 ..Edit::default()
             };
             if let Err(e) = self.manifest.commit(edit) {
@@ -240,7 +283,7 @@ impl Inner {
             // now, so parts a flush added meanwhile stay.
             let mut ann: Vec<Arc<LiveAnnotationPart>> = old_ann
                 .iter()
-                .filter(|p| !remove.contains(&p.meta.part_id))
+                .filter(|p| !removing.contains(&p.meta.part_id))
                 .cloned()
                 .chain(add_ann)
                 .collect();
@@ -449,7 +492,8 @@ impl Inner {
         if expired.is_empty() {
             return Ok(());
         }
-        let replaced = self.replace_parts(&expired, Vec::new(), Vec::new())?;
+        let replaced =
+            self.replace_parts_expiring(&expired, Vec::new(), Vec::new(), Some(cutoff))?;
         lock(&self.core).retention_removed += expired.len() as u64;
         replaced.into_result()
     }
@@ -659,18 +703,26 @@ impl Inner {
                     level,
                     Some(&self.merge_stop),
                 )
-                .map_err(|e| name_damaged_input(&ann_inputs, e))?;
+                .map_err(|e| name_damaged_input(&ann_inputs, &self.merge_stop, e))?;
                 (meta, 0, stats.superseded)
             }
         };
 
         // From here the output exists on disk. Until the commit an error
-        // removes it.
+        // removes it. Only the merge of the inputs reports damage of an input
+        // (`Corrupt`); an error from opening or checking the output, or from
+        // the replacement, is an ordinary failure of the merge: the window
+        // backs off and is tried again.
         let abandon = |e: Error| {
             if !matches!(e, Error::Fatal(_)) {
                 let _ = std::fs::remove_dir_all(&dir);
             }
-            e
+            match e {
+                Error::Corrupt(m) => {
+                    Error::other(format!("the output of the merge could not be used: {m}"))
+                }
+                e => e,
+            }
         };
         let output_bytes = meta.size_bytes();
         // The inputs were all quiet when the final rule chose them and

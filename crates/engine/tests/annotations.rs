@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use common::*;
 use nwdb_core::Error;
-use nwdb_engine::{ANNOTATION_RECORD_TAG, Annotation, AnnotationFilter, Engine, ListQuery};
+use nwdb_engine::{
+    ANNOTATION_RECORD_TAG, Annotated, Annotation, AnnotationFilter, Engine, ListQuery, Stage,
+};
 use nwdb_segment::MAX_BATCH_ITEMS;
 use nwdb_wal::{SyncHook, Wal};
 use rand::rngs::StdRng;
@@ -342,6 +344,37 @@ fn a_full_buffer_refuses_annotations_by_the_bytes_they_count_for() {
 
 #[test]
 fn a_closing_engine_refuses_annotations() {
+    // Shutdown sets the closing state first and flushes afterwards, with the
+    // log still open: an annotation made from the flush's stage hook meets
+    // the closing check, not the shut-down branch.
+    let dir = tempfile::tempdir().unwrap();
+    let engine: Arc<Mutex<Option<Engine>>> = Arc::default();
+    let refused: Arc<Mutex<Vec<Result<Annotated, Error>>>> = Arc::default();
+    let (e2, r2) = (engine.clone(), refused.clone());
+    let mut o = opts(dir.path());
+    o.stage_hook = Some(Arc::new(move |stage| {
+        let e = e2.lock().unwrap().clone();
+        if let (Some(e), Stage::FlushFrozen) = (e, stage) {
+            let r = e.annotate(vec![score(1, None, "q", "s", 1.0)], |_| panic!("called"));
+            r2.lock().unwrap().push(r);
+        }
+        Ok(())
+    }));
+    let e = open(o);
+    *engine.lock().unwrap() = Some(e.clone());
+    ingest(&e, &one(1)).unwrap();
+    e.shutdown().unwrap();
+    *engine.lock().unwrap() = None;
+    let refused = refused.lock().unwrap();
+    assert_eq!(refused.len(), 1, "the final flush ran the hook once");
+    match &refused[0] {
+        Err(Error::Unavailable(m)) => assert!(m.contains("shutting down"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_shut_down_engine_refuses_annotations() {
     let dir = tempfile::tempdir().unwrap();
     let e = open(opts(dir.path()));
     ingest(&e, &one(1)).unwrap();

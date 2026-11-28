@@ -833,15 +833,20 @@ rename is `Fatal`: the part may or may not be durable, do not reuse its id.
 4. `part_id`, `window_start_ns` and `window_ns` equal those of the `PartMeta`
    given. This binds the file to its part: the file of another part, even one of
    equal length and equal records, is refused;
-5. the table fits in the file; the file's length equals the sum of the `clen`
-   plus 36 x B plus 80, and equals `meta.files["annotations.nwa"]`;
-6. the table's checksum;
-7. blocks are contiguous from offset 0 (each `offset` is the end of the one
+5. the file's real length equals `meta.files["annotations.nwa"]`, and the table
+   the footer declares (36 x B plus the footer's 80 bytes) fits in it. Both are
+   decided before anything sized by the file's content is allocated, so a long
+   or sparse file that the manifest does not describe is refused without reading
+   its table;
+6. the table is read; the file's length equals the sum of the `clen` plus
+   36 x B plus 80;
+7. the table's checksum;
+8. blocks are contiguous from offset 0 (each `offset` is the end of the one
    before);
-8. first keys do not decrease;
-9. every `ulen` is 1 to 32 KiB and every `clen` 1 to 64 KiB;
-10. B is at least 1;
-11. the footer's record count, trace count and time range equal the `PartMeta`'s.
+9. first keys do not decrease;
+10. every `ulen` is 1 to 32 KiB and every `clen` 1 to 64 KiB;
+11. B is at least 1;
+12. the footer's record count, trace count and time range equal the `PartMeta`'s.
 
 **Read checks**, for every block read, in this order: the CRC of the compressed
 bytes; decompression into exactly `ulen` bytes (the buffer is sized by the table,

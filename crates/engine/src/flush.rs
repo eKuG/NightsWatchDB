@@ -6,6 +6,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard};
 
 use arrow_array::RecordBatch;
@@ -19,10 +20,11 @@ use nwdb_segment::{
 
 use crate::engine::{
     AnnBuf, Inner, LiveAnnotationPart, LivePart, Stage, WindowKey, annotation_windows, run_hook,
+    window_order,
 };
 use crate::lock;
 use crate::rows::group_traces;
-use crate::split::change_parts;
+use crate::split::{change_parts, gallop};
 
 /// Parts written and committed by one flush, opened and not yet published.
 /// Holds the publish gate, which is released when the parts are published.
@@ -266,58 +268,95 @@ impl Inner {
     }
 
     /// Reduces the frozen annotations to one record per identity (the
-    /// largest `arrival`) and puts each in a window: the largest of the
-    /// window its trace's rows go to in this flush and the windows of the live
-    /// span parts that hold the trace. Taking the largest means an annotation
-    /// is never in an older window than an earlier one of its identity, so
-    /// removing the older window later cannot bring an overwritten value
-    /// back. An annotation whose trace has no such window (retention removed
-    /// it) is dropped. Returns the records of each window in identity order,
-    /// and the number dropped.
-    fn annotation_windows_of_flush(
+    /// largest `arrival`) and puts each in a window: the one that ends last
+    /// (`window_start_ns + window_ns`, as retention computes it, and on equal
+    /// ends the larger start) of the window its trace's rows go to in this
+    /// flush and the windows of the live span parts that hold the trace.
+    /// Retention removes a window when its end has passed, so the window that
+    /// ends last is the one it removes last, whatever the widths of the
+    /// windows: an annotation is never in a window that expires before the
+    /// window of an earlier annotation of its identity, and removing the older
+    /// window later cannot bring an overwritten value back. An annotation
+    /// whose trace has no such window (retention removed it) is dropped.
+    /// Returns the records of each window in identity order, and the number
+    /// dropped. The records are borrowed from the frozen buffer: nothing of it
+    /// is copied.
+    ///
+    /// The windows are looked up for all annotated traces together: the live
+    /// span parts are walked once, in descending order of window end, and in
+    /// each the ids not yet placed are looked up in its sorted index with one
+    /// forward walk. An id is placed at its first holder (the holder that
+    /// ends last), or as soon as the window of this flush ends no earlier
+    /// than the part being walked.
+    fn annotation_windows_of_flush<'a>(
         &self,
-        ann_frozen: &AnnBuf,
+        ann_frozen: &'a AnnBuf,
         flush_windows: &HashMap<TraceId, WindowKey>,
-    ) -> (BTreeMap<WindowKey, Vec<Annotation>>, u64) {
-        let mut records: Vec<Annotation> =
-            ann_frozen.iter().flat_map(|b| b.iter().cloned()).collect();
+    ) -> (BTreeMap<WindowKey, Vec<&'a Annotation>>, u64) {
+        let mut records: Vec<&Annotation> = ann_frozen.iter().flat_map(|b| b.iter()).collect();
         records.sort_by(|a, b| a.identity_cmp(b).then(a.arrival.cmp(&b.arrival)));
-        let mut reduced: Vec<Annotation> = Vec::with_capacity(records.len());
+        let mut reduced: Vec<&Annotation> = Vec::with_capacity(records.len());
         for a in records {
-            match reduced.last() {
-                Some(last) if last.identity_cmp(&a).is_eq() => {
-                    let n = reduced.len() - 1;
-                    reduced[n] = a;
-                }
+            match reduced.last_mut() {
+                Some(last) if last.identity_cmp(a).is_eq() => *last = a,
                 _ => reduced.push(a),
             }
         }
+        let mut unplaced: Vec<TraceId> = reduced.iter().map(|a| a.trace_id).collect();
+        unplaced.sort_unstable();
+        unplaced.dedup();
+        let mut window_of: HashMap<TraceId, WindowKey> = HashMap::with_capacity(unplaced.len());
+
         let live = lock(&self.core).vis.parts.clone();
-        let mut by_window: Vec<&Arc<LivePart>> = live.iter().collect();
-        by_window.sort_by_key(|p| Reverse((p.meta.window_start_ns, p.meta.window_ns)));
-        let newest_part = by_window
-            .first()
-            .map(|p| (p.meta.window_start_ns, p.meta.window_ns));
-        let wanted: HashSet<TraceId> = reduced.iter().map(|a| a.trace_id).collect();
-        let mut window_of: HashMap<TraceId, Option<WindowKey>> = HashMap::new();
-        for id in wanted {
-            let mut best = flush_windows.get(&id).copied();
-            // The parts are in descending window order, so the first holder
-            // is the largest window; nothing to look for if this flush's
-            // window is already past every part.
-            if best.is_none_or(|b| Some(b) < newest_part)
-                && let Some(p) = by_window.iter().find(|p| p.reader.find_trace(id).is_some())
-            {
-                let w = (p.meta.window_start_ns, p.meta.window_ns);
-                best = Some(best.map_or(w, |b| b.max(w)));
+        let mut by_end: Vec<&Arc<LivePart>> = live.iter().collect();
+        by_end.sort_by_key(|p| Reverse(window_order((p.meta.window_start_ns, p.meta.window_ns))));
+        for p in by_end {
+            if unplaced.is_empty() {
+                break;
             }
-            window_of.insert(id, best);
+            let w = (p.meta.window_start_ns, p.meta.window_ns);
+            // The flush's window wins over this part and every later one.
+            unplaced.retain(|id| match flush_windows.get(id) {
+                Some(&f) if window_order(f) >= window_order(w) => {
+                    window_of.insert(*id, f);
+                    false
+                }
+                _ => true,
+            });
+            let entries = p.reader.trace_entries();
+            let (Some(first), Some(last)) = (entries.first(), entries.last()) else {
+                continue;
+            };
+            // Only the ids inside the part's range can be in it.
+            let lo = unplaced.partition_point(|id| *id < first.trace_id);
+            let hi = unplaced.partition_point(|id| *id <= last.trace_id);
+            let mut at = 0;
+            let mut found: Vec<TraceId> = Vec::new();
+            for id in &unplaced[lo..hi] {
+                self.window_probes.fetch_add(1, Ordering::Relaxed);
+                at = gallop(entries, at, *id);
+                if entries.get(at).is_some_and(|e| e.trace_id == *id) {
+                    found.push(*id);
+                }
+            }
+            if !found.is_empty() {
+                unplaced.retain(|id| found.binary_search(id).is_err());
+                for id in found {
+                    window_of.insert(id, w);
+                }
+            }
         }
-        let mut out: BTreeMap<WindowKey, Vec<Annotation>> = BTreeMap::new();
+        // Not in a part ending later than the flush's window, or in none.
+        for id in unplaced {
+            if let Some(&f) = flush_windows.get(&id) {
+                window_of.insert(id, f);
+            }
+        }
+        let mut out: BTreeMap<WindowKey, Vec<&'a Annotation>> = BTreeMap::new();
         let mut dropped = 0;
         for a in reduced {
-            match window_of[&a.trace_id] {
-                Some(w) => out.entry(w).or_default().push(a),
+            match window_of.get(&a.trace_id) {
+                Some(&w) => out.entry(w).or_default().push(a),
                 None => dropped += 1,
             }
         }
@@ -359,7 +398,7 @@ impl Inner {
             .filter(|t| wanted.contains(&t.trace_id))
             .map(|t| (t.trace_id, (window_start(t.start_ns, window_ns), window_ns)))
             .collect();
-        let (ann_by_window, ann_dropped) =
+        let (ann_by_window, mut ann_dropped) =
             self.annotation_windows_of_flush(ann_frozen, &flush_windows);
 
         // Ids come from the manifest and are never reused, even by a retry
@@ -421,6 +460,33 @@ impl Inner {
             // ours must each see the list the other left. Taken only now, so
             // the long work above never holds it.
             gate = Some(lock(&self.publish_gate));
+            // Retention may have removed the window an annotation part was
+            // decided for since the decision was made. An annotation part is
+            // committed only into a window that a live span part, or a span
+            // part of this flush, has: otherwise the data it is about is
+            // expired, and its records are dropped like those of a trace that
+            // is gone. Nothing changes the part list until the publish.
+            let mut span_windows: HashSet<WindowKey> = lock(&self.core)
+                .vis
+                .parts
+                .iter()
+                .map(|p| (p.meta.window_start_ns, p.meta.window_ns))
+                .collect();
+            span_windows.extend(metas.iter().map(|m| (m.window_start_ns, m.window_ns)));
+            let mut kept = Vec::new();
+            for (m, r) in ann_metas.drain(..).zip(ann_readers.drain(..)) {
+                if span_windows.contains(&(m.window_start_ns, m.window_ns)) {
+                    kept.push((m, r));
+                } else {
+                    let _ = std::fs::remove_dir_all(self.parts_dir.join(part_dir_name(m.part_id)));
+                    ann_written -= m.rows;
+                    ann_dropped += m.rows;
+                }
+            }
+            for (m, r) in kept {
+                ann_metas.push(m);
+                ann_readers.push(r);
+            }
             self.manifest.commit(Edit {
                 add: metas.iter().chain(&ann_metas).cloned().collect(),
                 wal_flushed_lsn: Some(lsn),

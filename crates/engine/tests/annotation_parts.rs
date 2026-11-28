@@ -21,7 +21,8 @@ use support::{disk_state, tree};
 
 const W: i64 = 1_000;
 
-type Seen = Vec<(Stage, Vec<Option<f64>>)>;
+/// A stage, and the annotation records in the buffers and in parts then.
+type Seen = Vec<(Stage, usize, u64)>;
 
 /// One trace with a single span starting at `start`.
 fn span_at(trace: u128, span: u64, start: i64) -> TSpan {
@@ -131,6 +132,61 @@ fn an_annotation_goes_to_the_largest_window_of_its_trace() {
     );
     for t in 1..=3 {
         assert_eq!(values(&shown(&e, t)), vec![Some(t as f64)], "trace {t}");
+    }
+    assert_eq!(e.stats().annotations_dropped, 0);
+    e.shutdown().unwrap();
+
+    // Two widths in one directory: the window that ends last is chosen, not
+    // the one with the larger start. A narrow window that starts later ends
+    // first ...
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.window_ns = 10_000;
+    let e = open(o);
+    ingest(&e, &[span_at(7, 1, 100)]).unwrap();
+    e.flush().unwrap();
+    e.shutdown().unwrap();
+    let mut o = opts(dir.path());
+    o.window_ns = 1_000;
+    let e = open(o);
+    // (the part of the first run is window (0, 10000); this flush's window is
+    // (5000, 1000), which ends at 6000)
+    ingest(&e, &[TSpan::new(7, 2, 5_500)]).unwrap();
+    annotate(&e, vec![score(7, None, "q", "s", 1.0)]);
+    e.flush().unwrap();
+    assert_eq!(windows_of_parts(&e), vec![(0, 10_000)]);
+    // ... and a wide one that starts earlier ends last: here the flush's own
+    // window is the one that ends last.
+    ingest(&e, &[span_at(8, 1, 5_100)]).unwrap();
+    e.flush().unwrap();
+    e.shutdown().unwrap();
+    let mut o = opts(dir.path());
+    o.window_ns = 10_000;
+    let e = open(o);
+    ingest(&e, &[TSpan::new(8, 2, 100)]).unwrap();
+    annotate(&e, vec![score(8, None, "q", "s", 2.0)]);
+    e.flush().unwrap();
+    assert_eq!(windows_of_parts(&e), vec![(0, 10_000), (0, 10_000)]);
+    // On equal ends the larger start: windows (0, 2000) and (1000, 1000).
+    e.shutdown().unwrap();
+    let mut o = opts(dir.path());
+    o.window_ns = 2_000;
+    let e = open(o);
+    ingest(&e, &[span_at(9, 1, 100)]).unwrap();
+    e.flush().unwrap();
+    e.shutdown().unwrap();
+    let mut o = opts(dir.path());
+    o.window_ns = 1_000;
+    let e = open(o);
+    ingest(&e, &[TSpan::new(9, 2, 1_500)]).unwrap();
+    annotate(&e, vec![score(9, None, "q", "s", 3.0)]);
+    e.flush().unwrap();
+    assert_eq!(
+        windows_of_parts(&e),
+        vec![(0, 10_000), (0, 10_000), (1_000, 1_000)]
+    );
+    for (t, v) in [(7, 1.0), (8, 2.0), (9, 3.0)] {
+        assert_eq!(values(&shown(&e, t)), vec![Some(v)], "trace {t}");
     }
     assert_eq!(e.stats().annotations_dropped, 0);
     e.shutdown().unwrap();
@@ -308,8 +364,10 @@ fn an_annotation_is_visible_exactly_once_at_every_stage_of_a_flush() {
     o.stage_hook = Some(Arc::new(move |stage| {
         let e = e2.lock().unwrap().clone();
         if let Some(e) = e {
-            let v = values(&e.snapshot().annotations(tid(1), 10).unwrap().0);
-            s2.lock().unwrap().push((stage, v));
+            let snap = e.snapshot();
+            let in_buffers = snap.buffered_annotation_list().len();
+            let in_parts: u64 = snap.annotation_part_info().iter().map(|p| p.3).sum();
+            s2.lock().unwrap().push((stage, in_buffers, in_parts));
         }
         Ok(())
     }));
@@ -335,9 +393,14 @@ fn an_annotation_is_visible_exactly_once_at_every_stage_of_a_flush() {
         stages.iter().filter(|s| **s == Stage::PartWritten).count(),
         2
     );
-    for (stage, v) in &seen {
-        assert_eq!(*v, vec![Some(7.0)], "at {stage:?}");
+    // The record is in the buffers until the publish step and in a part
+    // from it, never in both and never in neither.
+    for (stage, in_buffers, in_parts) in &seen {
+        let published = matches!(stage, Stage::Published | Stage::LogRotated | Stage::Trimmed);
+        let want = if published { (0, 1) } else { (1, 0) };
+        assert_eq!((*in_buffers, *in_parts), want, "at {stage:?}");
     }
+    assert_eq!(values(&shown(&e, 1)), vec![Some(7.0)]);
     *engine.lock().unwrap() = None;
     e.shutdown().unwrap();
 }
@@ -578,15 +641,16 @@ fn a_filter_that_most_traces_match_stops_early() {
             .len(),
         600
     );
-    let err = e
+    // One under the cap: every window is over it, so its set is dropped and
+    // its 60 candidates are answered one by one; the answer is the same.
+    let (rows, stats) = e
         .snapshot()
         .with_annotation_set_cap(59)
-        .list_traces(&q)
-        .unwrap_err();
-    let Error::InvalidArgument(msg) = &err else {
-        panic!("{err}")
-    };
-    assert!(msg.contains("more than 59 traces of one window"), "{msg}");
+        .list_traces_with_stats(&q)
+        .unwrap();
+    assert_eq!(rows.len(), 600);
+    assert_eq!(stats.annotation_windows_scanned, 10);
+    assert_eq!(stats.annotation_exact_lookups, 600);
     e.shutdown().unwrap();
 }
 
@@ -751,6 +815,8 @@ fn an_injected_error_while_an_annotation_part_is_written_loses_nothing() {
     );
     let before = e.stats();
     let order: Vec<Vec<Annotation>> = (1..=2).map(|t| shown(&e, t)).collect();
+    let buffered = e.snapshot().buffered_annotation_list();
+    assert_eq!(buffered.len(), 3);
     armed.store(true, Ordering::SeqCst);
     assert!(e.flush().is_err());
     let after = e.stats();
@@ -762,7 +828,14 @@ fn an_injected_error_while_an_annotation_part_is_written_loses_nothing() {
     assert_eq!(after.parts, 1);
     assert!(part_dirs_only_live(dir.path(), &e));
     let restored: Vec<Vec<Annotation>> = (1..=2).map(|t| shown(&e, t)).collect();
-    assert_eq!(restored, order, "the buffer was restored in order");
+    assert_eq!(restored, order);
+    // The buffer holds the same records, with the same arrival, in the same
+    // order, none of them folded into another.
+    assert_eq!(
+        e.snapshot().buffered_annotation_list(),
+        buffered,
+        "the buffer was restored in order"
+    );
 
     e.flush().unwrap();
     let done = e.stats();
