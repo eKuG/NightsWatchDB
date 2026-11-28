@@ -350,18 +350,28 @@ from the log. A panic in the stage hook after the commit is ignored.
 
 Parts are immutable and a flush only adds them. Everything that takes parts
 away (retention and merging) goes through one internal operation,
-`Inner::replace_parts(remove: &[u64], add: Vec<LivePart>) -> Result<Replaced>`:
-the ids of live parts to remove and zero or more new parts, each already
-written to `parts/` with its `PartMeta` and an open `PartReader` (ids reserved
-with `manifest.reserve_part_ids`). It is "replace these by those". In this
-order:
+`Inner::replace_parts(remove: &[u64], add: Vec<LivePart>, add_ann:
+Vec<LiveAnnotationPart>) -> Result<Replaced>`: the ids of live parts to remove,
+of either kind, and zero or more new span parts and new annotation parts, each
+already written to `parts/` with its `PartMeta` and an open reader
+(`PartReader` or `AnnotationReader`; ids reserved with
+`manifest.reserve_part_ids`, one id space for both kinds). It is "replace these
+by those". Every id in `remove` must be live in exactly one of the two lists
+(span parts, annotation parts), otherwise the call is refused as below. There
+are two lists but one edit, one commit and one publish:
 
-1. **Commit.** One manifest commit that removes and adds them.
-2. **Publish.** The new part list and a split map that matches it replace the
-   old ones in one step under the core lock. A snapshot sees the list from
-   before or the list from after, each with its own map; never a removed part
-   and its replacement both present or both absent. The list and the map are
-   built before the gate is taken (see below).
+1. **Commit.** One manifest commit that removes and adds them, parts of both
+   kinds in the same edit.
+2. **Publish.** The new span list, a split map that matches it, the new
+   annotation list and its window index replace the old ones in one step under
+   the core lock. A snapshot sees the state from before or the state from
+   after, each with its own map; never a removed part and its replacement both
+   present or both absent, and never one kind changed without the other (a
+   window's spans without its annotations after both were removed together, or
+   a merged annotation part missing). The span list and the map are built
+   before the gate is taken (see below); the annotation list is small and is
+   rebuilt under the gate from the list as it is then, so annotation parts a
+   flush published in the meantime stay.
 3. **Delete.** The directories of the removed parts are deleted, one at a
    time, and `parts/` is synced.
 
@@ -372,7 +382,7 @@ Rules:
   a replacement alike. Each therefore reads the list the other left, and each
   commit's edit is valid against the state it was built from. Nothing long
   happens under it: a flush takes it only after its parts are written, a
-  replacement only after its list and split map are built, and deleting
+  replacement only after its span list and split map are built, and deleting
   directories comes after it is released. The part list stays in part
   id order whichever of the two published first (a replacement can reserve an
   id, a flush then reserve and publish higher ones, and the replacement publish
@@ -393,7 +403,7 @@ Rules:
   directory is unreferenced, so a restart removes it too). A stage hook's
   result or panic after the commit is ignored.
 - **Old snapshots are not disturbed.** A snapshot taken before the removal reads
-  the removed parts from files its readers hold open, so a read never fails
+  the removed parts, of either kind, from files its readers hold open, so a read never fails
   because a directory is gone. A directory that is already gone when the
   deletion gets to it is not an error.
 
@@ -414,7 +424,11 @@ that (a part seen is gone, or a part to remove was added since), the
 replacement is refused before its commit and changes nothing; this does not
 happen while the rule above holds. The stage `ReplaceMapBuilt` marks the point
 between the two steps, and a test publishes a flush there and compares the
-resulting map with one built from scratch.
+resulting map with one built from scratch. The annotation list needs none of
+this: a flush only adds to it, so the list under the gate is the list that
+results from removing the ids and adding the new parts, whatever a flush
+published meanwhile (a test flushes annotation parts into the window being
+replaced while the replacement waits at `ReplaceMapBuilt`, and none is lost).
 
 How the map is rebuilt:
 
@@ -445,6 +459,11 @@ disk is never reused, so no new rule is needed:
 | `ReplacePublished` (before any deletion) | as above | as above |
 | `PartDirDeleted` (once per directory; in the middle of deleting several) | some of the removed directories deleted, the rest unreferenced | the rest are deleted at start-up |
 
+The rows hold for both kinds: the directories of span parts and of annotation
+parts, removed or new, are all "parts" to the manifest, and one edit changes
+them together, so after a crash either every removed part of both kinds is
+still live or none is.
+
 After each crash the database reopens with exactly the surviving data (what
 the manifest lists, plus the log's records after `wal_flushed_lsn`), and
 nothing acknowledged is lost: a replacement does not touch `wal_flushed_lsn`
@@ -453,11 +472,14 @@ or the log.
 ## Retention
 
 `EngineOptions::retention` is `None` (keep everything, the default) or a
-duration. A part is expired when its whole time window is older than the
-retention: `window_start_ns + window_ns <= now - retention`, computed without
-overflow. A maintenance pass removes all expired parts with one replacement,
-so retention is atomic for queries: a snapshot sees the expired parts or not,
-never some of them. The clock is `EngineOptions::clock` (Unix nanoseconds; a
+duration. A part, of either kind (span part or annotation part), is expired
+when its whole time window is older than the retention: `window_start_ns +
+window_ns <= now - retention`, computed without overflow. A maintenance pass
+removes all expired parts of both kinds with one replacement, in one manifest
+version, so retention is atomic for queries: a snapshot sees the expired parts
+or not, never some of them, and never a window's spans without its annotations
+or the other way round (a test reads the manifest versions: the span parts and
+the annotation parts of the expired windows go in one). The clock is `EngineOptions::clock` (Unix nanoseconds; a
 test facility like the stage hook), by default the system clock. A retention
 of zero and a `maintenance_interval` of zero are refused by `open`.
 
@@ -504,6 +526,21 @@ What this means for particular data:
   queries then return what is left.
 - **The buffer is not touched.** Data in the buffer, expired or not, is
   removed only after a flush has written it into a part.
+- **An annotation lives as long as the newest window that held its trace when
+  it was flushed**, because that is the window of the annotation part it was
+  written to (see The flush). It goes with that window, and nothing else
+  decides: an annotation flushed into the window of a trace's older part
+  expires with that window even if a later window still holds part of the
+  trace (it is then gone while the trace is still readable), and an
+  annotation flushed into the later window outlives the older one. The window
+  rule is what keeps an overwritten value from coming back: of two records of
+  one identity the newer is never in an older window than the other, so
+  expiring the older window can take the older record and never the newer one
+  alone. An annotation part whose window holds no span part any more (it
+  happens when a retention pass removed the trace's part between a flush's
+  window decision and its commit) is removed when its own window expires, like
+  any other; until then `annotations` does not show it, because annotations are
+  looked up through the windows of the trace's span parts.
 
 Statistics: `maintenance_passes` (every pass counts, failed ones too),
 `retention_parts_removed` and `last_maintenance_error`. A pass that fails
@@ -520,14 +557,22 @@ window that has stopped receiving data should be one part. A merge is
 trace split over the inputs is one run, a span that occurs more than once is
 kept once (the copy that arrived first, the one with the smallest `arrival`,
 wins; the order of the inputs only breaks a tie) and text is shared across the inputs and
-never rebuilt. `EngineOptions::compaction` (`CompactionOptions`, validated by
+never rebuilt. Annotation parts are merged too, by
+`nwdb_segment::merge_annotation_parts`: the annotation parts of one window
+become one part holding, of each identity, the record with the largest
+`arrival` (see below for what is kept). **The two kinds are never mixed**: a
+merge has inputs of one kind and one window. `EngineOptions::compaction` (`CompactionOptions`, validated by
 `open`) holds the settings; `compaction.rs` holds the policy.
 
-**The policy** is a pure function of the live parts: for each part its id,
+**The policy** is a pure function of the live parts: for each part its id, kind,
 window, size on disk (the sum of the files in its metadata), level and how long
 ago it became live in this process (parts the manifest listed at start-up count
 from start-up, and a merged part from the moment it was published). It returns
-at most one merge, of parts of one window; a merge never crosses windows.
+at most one merge, of parts of one kind in one window; a merge never crosses
+windows or kinds. The parts are grouped by (kind, window), and every rule below
+is applied to one such group: the span parts of a window and its annotation
+parts are two groups, each with its own count, its own tiers and its own
+"quiet". The size of an annotation part is its file size from `PartMeta.files`.
 
 - **Tiered.** Within a window, sort the parts by size. If some run of at least
   `min_parts` (4) parts has its largest at most `size_ratio` (4) times its
@@ -560,10 +605,15 @@ at most one merge, of parts of one window; a merge never crosses windows.
   skipped, as for the byte cap. Such a window stays in more than one part
   (`windows_with_many_parts` counts it), and nothing is retried, because
   nothing is attempted. The piece count of a part is `meta.payload.pieces`; the
-  ceiling is the one the engine writes parts with
-  (`EngineOptions::max_pieces`, a test facility).
-- Among the windows that qualify, the one with the most parts goes first (the
-  oldest on a tie). Windows that are backing off or damaged are left out.
+  the ceiling is the one the engine writes parts with
+  (`EngineOptions::max_pieces`, a test facility). It does not concern
+  annotation parts, which have no pieces.
+- Among the groups that qualify, the one with the most parts goes first, across
+  kinds (the oldest window on a tie, span parts before annotation parts within
+  one window), so neither kind starves the other. Groups that are backing off
+  or damaged are left out: **the failing and damaged groups are remembered per
+  (kind, window)**, so an annotation part that cannot be merged does not stop
+  the span merges of its window, and the other way round.
 
 One huge part and many tiny ones: the tiny ones are merged among themselves and
 climb tiers; the huge one is in a run only when `min_parts - 1` other parts are
@@ -583,12 +633,22 @@ stop (retention and the retry of deletions run again before a merge once
 `maintenance_interval` has passed since they last ran; see Retention):
 
 1. the policy chooses a merge; an id is reserved;
-2. the stage `MergeStarting` is called, then `merge_parts` with the inputs oldest first (by part id; the order
-   decides only between copies of a span with the same `arrival`), the
-   window of the inputs, the writer options a flush uses (`splitter`,
-   `dedup_window_bytes`) and a level one above the highest input level;
-3. a reader is opened on the result and the stage `MergeWritten` is called;
-4. `replace_parts(inputs, [result])` replaces them (see Replacing parts).
+2. the stage `MergeStarting` is called, then, by the kind of the plan,
+   `merge_parts` (span parts) or `merge_annotation_parts` (annotation parts)
+   with the inputs oldest first (by part id; the order decides only between
+   copies of a span, or records of an identity, with the same `arrival`), the
+   window of the inputs and a level one above the highest input level; a span
+   merge also gets the writer options a flush uses (`splitter`,
+   `dedup_window_bytes`); both get the stop flag;
+3. a reader is opened on the result (`PartReader::open` or
+   `AnnotationReader::open`) and the stage `MergeWritten` is called;
+4. `replace_parts` replaces the inputs by it (see Replacing parts), in the
+   list of its kind.
+
+The two kinds share everything around the merge call itself (the id, the level,
+the stages, abandoning the output, the replacement, the statistics, the failure
+handling below); only the input list, the merge function and the reader that
+opens the result differ.
 
 A merge holds no lock while it reads and writes; only step 4's commit and
 publish hold the publish gate, as a flush does. Flushes, queries and retention
@@ -611,6 +671,13 @@ start-up deletes the directories the manifest does not reference.
 | `ReplaceCommitted`, `ReplacePublished` | the manifest lists the merged part; the inputs' directories remain, unreferenced | the manifest decides; the directories are deleted at start-up |
 | `PartDirDeleted` | some input directories deleted | the rest are deleted at start-up |
 
+The same table holds for a merge of annotation parts: the output is an
+`annotations.nwa` part directory instead of a span part, and every row is the
+same (the crash tests abort at each stage of an annotation merge and of a
+retention replacement that holds annotation parts, and check that every
+acknowledged annotation is there once as the winner, or gone with its expired
+window, and that no directory is left over).
+
 A merge does not touch the log or `wal_flushed_lsn`, so every acknowledged
 record is in live parts or in the log whichever side of the commit the crash
 fell on; the crash tests abort at each stage and check that the reopened
@@ -623,9 +690,11 @@ not known and the directory is left for the next start). It is recorded in
 `last_maintenance_error`). The window is left alone for `retry_backoff` (30 s,
 doubling with each failure in a row up to 64 times that; zero retries
 at the next pass) and for the rest of the pass, so a failure that persists
-neither spins in a pass nor holds back the other windows. Damage found in an
-input is `Corrupt` (`merge_parts` checks every input in full before it starts
-and names the input and its directory); the message also says which parts, the
+neither spins in a pass nor holds back the other windows or the other kind of
+the same window. Damage found in an
+input is `Corrupt` (`merge_parts` and `merge_annotation_parts` check every
+input in full before they start; the engine names the damaged annotation input
+and its directory in the error); the message also says which parts, the
 window is not tried again until the next start, the inputs stay live and
 readable as far as they are, and the engine is not put in the fatal state. A
 failure to delete an input directory after the commit is not a failed merge:
@@ -651,6 +720,20 @@ are left. A merge that is abandoned for another reason (the stage hook returns
 an error at `MergeWritten` or `BeforeReplaceCommit`) deletes its output and
 leaves nothing behind; tests do both.
 
+**Annotation merges.** The output holds, of each identity (trace, span, name,
+source) in the inputs, the record with the largest `arrival`, in identity
+order; the others are counted in `annotations_superseded`. **A delete record is
+never dropped by a merge**, even when it is the winner and nothing older is in
+the inputs: an older record of the same identity can be in an annotation part of
+an older window (an annotation is in the newest window that held its trace
+when it was flushed, so the older version can be in an earlier window), and
+dropping the delete would show that record again as soon as nothing newer hides
+it. A delete is dropped only when its window expires, with everything else in
+it. What a merge changes for readers: before it `annotations` reads the trace's
+records from several parts of the window and takes the largest `arrival`, after
+it from one, with the same winners, the same deletes and the same filtered
+listings; a snapshot taken before keeps reading the inputs.
+
 **What a merge changes for queries.** A trace that was split over parts is one
 run in one part and leaves the split map; a duplicate span (a sender's retry
 that crossed a flush) is counted once by `list_traces` and `aggregate_tokens`
@@ -662,10 +745,14 @@ one span in different windows; those are not in one merge and stay duplicates
 for the summaries, while `get_trace` and `search` still show one.
 
 Statistics (`EngineStats`, `/api/v1/stats`): `merges_done`,
-`parts_merged_away`, `duplicate_spans_dropped`, `merge_input_bytes` and
-`merge_output_bytes` (bytes on disk) since the engine opened;
-`windows_with_many_parts` (windows that now have more than one live part, so
-`0` means every window is settled); `merging` (a merge is being written or
+`parts_merged_away`, `merge_input_bytes` and `merge_output_bytes` (bytes on
+disk) count merges of both kinds; `duplicate_spans_dropped` (span merges) and
+`annotations_superseded` (annotation merges: records dropped because a newer
+record of the identity was in the same window) since the engine opened;
+`retention_parts_removed` counts parts of both kinds;
+`windows_with_many_parts` (pairs of a window and a kind of part with more than
+one live part, so `0` means every window is settled, for span parts and for
+annotation parts alike: a script that waits for it waits for both); `merging` (a merge is being written or
 replaced); `last_compaction_error`. `Engine::run_maintenance()` runs a pass,
 merges included. `CompactionOptions::background` false (a test facility) keeps
 the thread from merging so a test decides when.
@@ -934,11 +1021,13 @@ lists of the parts a flush writes have the budgets
   exactly one copy of a span, the one with the smallest `arrival`, before and
   after any merge.
 - An annotation lives as long as the newest window that held its trace when it
-  was flushed: it sits in that window's annotation part, and retention (and
-  merging) of annotation parts, which are not done yet, will have to treat
-  those windows. Until then annotation parts are never merged or removed, and
-  one whose window no live span part holds any more is not shown by
-  `annotations`.
+  was flushed (see Retention): it goes with that window even if a later window
+  still holds part of the trace, so a trace spread over windows can be readable
+  with its annotations gone. An annotation part whose window no live span part
+  holds is not shown by `annotations` (it is removed when its window expires).
+  Annotation parts of one window are merged into one, and a delete record
+  stays in the part until the window expires, so a window of mostly deletes
+  does not shrink.
 - A span id of an annotation is not checked against the trace's spans (spans
   may arrive later), and an annotation for a trace the engine does not know
   yet is refused ("unknown trace"): annotate after the spans were
