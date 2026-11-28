@@ -2,8 +2,29 @@ use crate::PayloadTotals;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// What a part holds.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PartKind {
+    /// Spans, in the files of a span part. The default, and what a manifest
+    /// written before annotations existed means.
+    #[default]
+    Spans,
+    /// Annotations (scores, labels, comments) in one `annotations.nwa` file.
+    Annotations,
+}
+
 /// Metadata describing one immutable part, as recorded in the manifest and
 /// next to the part's files.
+///
+/// For a part of kind [`PartKind::Annotations`] the fields mean: `rows` is the
+/// number of records, `traces` the number of distinct trace ids,
+/// `min_start_ns` and `max_end_ns` the smallest and largest `time_ns` of the
+/// records, `window_start_ns` and `window_ns` the window the part belongs to,
+/// `files` its one file, `payload` zero totals, and `format_version` the
+/// annotation format version.
 ///
 /// Field names are part of the on-disk format and must not change. Unknown
 /// fields are ignored when reading, so a reader built before a field was added
@@ -18,7 +39,7 @@ pub struct PartMeta {
     pub window_start_ns: i64,
     /// Width of the window, nanoseconds.
     pub window_ns: i64,
-    /// Number of span rows.
+    /// Number of span rows (records, for an annotation part).
     pub rows: u64,
     /// Number of distinct traces.
     pub traces: u64,
@@ -36,6 +57,10 @@ pub struct PartMeta {
     /// the store existed, where it reads as all zeros.
     #[serde(default)]
     pub payload: PayloadTotals,
+    /// What the part holds. Absent in manifests written before annotations
+    /// existed, where it reads as spans; an unknown value is an error.
+    #[serde(default)]
+    pub kind: PartKind,
 }
 
 impl PartMeta {
@@ -73,6 +98,7 @@ mod tests {
             created_unix_ms: 1_700_000_000_000,
             format_version: 1,
             payload: PayloadTotals::default(),
+            kind: PartKind::Spans,
         }
     }
 
@@ -90,6 +116,7 @@ mod tests {
                 "created_unix_ms",
                 "files",
                 "format_version",
+                "kind",
                 "level",
                 "max_end_ns",
                 "min_start_ns",
@@ -101,6 +128,28 @@ mod tests {
                 "window_start_ns"
             ]
         );
+    }
+
+    #[test]
+    fn a_part_without_kind_reads_as_spans() {
+        let mut v = serde_json::to_value(sample()).unwrap();
+        assert_eq!(v["kind"], "spans");
+        v.as_object_mut().unwrap().remove("kind");
+        let m: PartMeta = serde_json::from_value(v).unwrap();
+        assert_eq!(m.kind, PartKind::Spans);
+        assert_eq!(m, sample());
+    }
+
+    #[test]
+    fn annotation_kind_round_trips_and_an_unknown_kind_is_refused() {
+        let mut m = sample();
+        m.kind = PartKind::Annotations;
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains(r#""kind":"annotations""#));
+        assert_eq!(serde_json::from_str::<PartMeta>(&json).unwrap(), m);
+        let mut v = serde_json::to_value(sample()).unwrap();
+        v["kind"] = serde_json::json!("scores");
+        assert!(serde_json::from_value::<PartMeta>(v).is_err());
     }
 
     #[test]

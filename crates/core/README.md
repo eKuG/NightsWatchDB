@@ -13,7 +13,14 @@ Layer 0 of NightsWatchDB: the types every other crate shares.
   holds a 4-byte key, so a large resource shared by many spans is not copied
   into every row. `SpanColumns::record` hands out plain slices as before.
 - `TraceSummary`, `SummaryBuilder`, `summary_schema`
-- `PartMeta`, with `PayloadTotals`: what the part's piece store holds
+- `PartMeta`, with `PayloadTotals`: what the part's piece store holds, and
+  `PartKind` (`spans`, the default when the manifest has no `kind`, or
+  `annotations`; an unknown kind is an error). For an annotation part `rows` is
+  the number of records, `traces` the number of distinct trace ids,
+  `min_start_ns` and `max_end_ns` the smallest and largest `time_ns` of its
+  records, `window_start_ns` and `window_ns` the window it belongs to, `files`
+  its one file, `payload` zero totals, and `format_version` the annotation
+  format version.
 - `RecordDecoder` (replaying the write-ahead log) and `PayloadSplitter` with
   `RawColumn`: the interface through which the part writer asks the OTLP crate
   which bytes of a raw column to store out of line, once per distinct content

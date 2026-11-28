@@ -810,6 +810,7 @@ impl PartWriter {
                 .map_or(0, |d| d.as_millis() as u64),
             format_version: FORMAT_VERSION,
             payload: store.totals,
+            kind: nwdb_core::PartKind::Spans,
         })
     }
 

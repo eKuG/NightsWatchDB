@@ -59,7 +59,7 @@ pub use error::{Error, Result};
 pub use id::{SpanId, TraceId};
 pub use limits::BatchLimits;
 pub use origin::{Origin, OriginKeys};
-pub use part::{PartMeta, part_dir_name};
+pub use part::{PartKind, PartMeta, part_dir_name};
 pub use payload::{PayloadSplitter, PayloadTotals, RawColumn};
 pub use record::SpanRecord;
 pub use schema::{col, span_schema};
