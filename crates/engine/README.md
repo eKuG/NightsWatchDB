@@ -33,6 +33,54 @@ engine.shutdown()?;
 5. After a crash `open` loads the manifest, opens the parts and replays the log
    from the position the manifest records through the registered decoders.
 
+### Annotations
+
+An annotation is a score, label or comment attached, after the spans were
+written, to a trace or to one span of it (`nwdb_segment::Annotation`; its
+identity is the trace, the span or none, the name and the source). A door does
+not decode them: `annotate(items, on_durable)` takes the items themselves and
+the engine writes one log record `[0xA1] + nwdb_segment::encode_batch(items)`
+(`ANNOTATION_RECORD_TAG`). The life of such a request is the one above:
+
+- `annotate` first checks each item, in this order: `validate` fails, the item
+  is rejected with its message; the trace is unknown, it is rejected with
+  "unknown trace". A trace is known if it has rows in the buffers or in a live
+  part (`Snapshot::known_traces`, see Reads). The span id is not checked
+  against the trace's spans, because spans may arrive later. The rejected
+  items come back with their index in the request.
+- Two accepted items of one request with the same identity: the later one
+  wins, the earlier counts as accepted and is not logged (the log body never
+  repeats an identity). If nothing is left to log (every item rejected) nothing
+  is logged or admitted, `on_durable` is dropped uncalled and the call returns
+  `Ok` with the rejections; admission errors are not returned for such a
+  request. No items, or more than `MAX_BATCH_ITEMS` (1000), is
+  `InvalidArgument` for the whole call.
+- Admission is the same as for `ingest` and shares its code: `Fatal`,
+  `Unavailable` when closing, when the buffer would pass `max_buffered_bytes`
+  and when the log has too many bytes waiting. An annotation counts for 160
+  bytes plus the bytes of its name, source, label and comment, in the
+  in-flight total, in the buffer and everywhere else, so the limit means the
+  same for both kinds of request.
+- The record's number is the `arrival` of its items: it is stamped when the
+  record is applied to the buffer, for live requests and replay alike, and the
+  caller's value is ignored. Of all records of one identity the one with the
+  largest `arrival` wins; a winning delete means there is no annotation.
+  `time_ns` plays no part.
+- Visibility is that of spans: the items enter the annotation buffer in log
+  order, in the same step that makes a span record visible, and only then is
+  `on_durable` called. They are not visible when `annotate` returns, and are
+  visible to the sender when `on_durable` runs. `on_durable` is called exactly
+  once, if and only if something was logged.
+- Replay decodes annotation records with the record's number as `arrival`.
+  The start-up pre-check reads them like any record (see Start-up), so one
+  that does not decode refuses the start with the directory unchanged.
+
+`EngineStats::annotations_buffered` counts the annotations in the buffers.
+
+A binary that does not know the tag meets it in the log and refuses to start
+with "unknown format tag" before it changes anything, so an older binary cannot
+silently drop annotations.
+
 ## Directory layout
 
 ```
@@ -51,7 +99,8 @@ tail, its removal of files that lie wholly inside parts (see step 3), and the
 manifest crate's removal of its temporary files. In this order; each step
 finishes before the next.
 
-0. Validate the arguments: the options and duplicate decoder tags.
+0. Validate the arguments: the options and duplicate decoder tags. A decoder
+   registered under the annotation tag 0xA1 is `InvalidArgument`.
 1. Create the directory if allowed, then lock it: the lock is `File::try_lock`
    on the open directory itself, so no file in it can be deleted to get around
    it, and no `LOCK` file exists. A second `open` is `Conflict`. The lock is
@@ -77,8 +126,10 @@ finishes before the next.
    refuse here.
 4. Check the records to be replayed. Read every record from
    `wal_flushed_lsn + 1` once and check exactly what the replay would refuse:
-   not empty, a known tag, decodes, decodes to the span table, numbers
-   contiguous, the count as expected. Each record's batches are dropped at
+   not empty, a known tag (a registered decoder's, or the annotation tag),
+   decodes, decodes to the span table (for an annotation record: it decodes),
+   numbers contiguous, the count as
+   expected. Each record's batches are dropped at
    once, so one record's worth of memory is held. Any failure is `Corrupt` and
    nothing has changed. The stage `OpenChecked` is reached only after this
    pass.
@@ -640,6 +691,17 @@ does not block, and is not blocked by, ingest or flush.
   (the copy with the smallest `arrival` kept, then the first found), ordered by `(start_ns, span_id)`, returned in
   byte-bounded batches. A trace in a single part that is already in order is
   returned untouched.
+- `annotations(trace, limit)`: the winning annotations of a trace, on the
+  trace and on its spans, deletes applied (a deleted identity is absent), in
+  identity order (trace-level first, then by span id, name, source), at most
+  `limit`, and a flag that says more exist. Cost: one pass over the annotations
+  in the buffers; the annotation buffers are visible in a snapshot as `Arc`s,
+  like the span buffers.
+- `known_traces(ids)`: for each id, whether the trace has rows in a live part
+  or in the buffers. The ids are sorted once; each part's in-memory trace
+  index is walked forward with the galloping search of the split map, for the
+  ids still unknown, with no I/O; only if some are still unknown, one pass over
+  the trace id column of every buffered batch.
 - `list_traces`: late spans can put one trace in several parts and the buffer,
   each holding a partial summary. A trace's merged start is the smallest
   partial start, so any trace that belongs in the result has a partial whose
@@ -664,6 +726,14 @@ does not block, and is not blocked by, ingest or flush.
   most one lookup per part), which only buffered traces pay. Memory: the results, the ids of
   the traces seen so far, one summary row group per part being read, and the
   buffer's summaries (the buffer is summarised on every call).
+- The annotation filter of `list_traces` (`ListQuery::annotation`): a trace
+  matches if some winning, not deleted annotation on the trace or on any of its
+  spans has the filter's `name`, and its `source` if one is given, a value of
+  at least `min` and at most `max` if given (an annotation without a value
+  matches neither bound) and its `label` if given. It is a per-trace test
+  applied to the merged summary after the other filters, like `error`, so the
+  early stop above holds. It is evaluated per candidate trace through
+  `annotations`, which costs one pass over the buffered annotations each.
 - The split map: each part's trace index is sorted by trace id, and when the
   set of parts changes (start-up, a flush publishing parts) the traces that
   are in more than one part are found with a merge over the sorted indexes of
@@ -801,6 +871,12 @@ lists of the parts a flush writes have the budgets
   lasts until retention removes the parts. `get_trace` and `search` always show
   exactly one copy of a span, the one with the smallest `arrival`, before and
   after any merge.
+- Annotations and the flush: flushing while annotations are in the buffer is
+  not supported; do not flush an engine that holds buffered annotations.
+- A trace's annotations are found in the buffer by reading every buffered
+  annotation, and `known_traces` reads the trace id column of every buffered
+  batch for ids it did not find in a part; both cost time proportional to the
+  buffer.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few
