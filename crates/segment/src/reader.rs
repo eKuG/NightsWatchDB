@@ -42,8 +42,8 @@ use bytes::Bytes;
 use nwdb_core::{
     BatchLimits, Error, PayloadTotals, Result, TraceId, col, span_schema, summary_schema,
 };
+use nwdb_payload::PieceReader;
 use nwdb_payload::rope::{self, RopeError, Segment};
-use nwdb_payload::{FileSum, PieceReader};
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
@@ -69,10 +69,6 @@ const MAX_BATCH_ROWS: usize = 8_192;
 const VERIFY_CHUNK: usize = 1 << 20;
 const READ_BUFFER: usize = 64 * 1024;
 
-fn corrupt(file: &str, msg: impl std::fmt::Display) -> Error {
-    Error::corrupt(format!("{file}: {msg}"))
-}
-
 /// Runs `f`, turning a panic into [`Error::Corrupt`] naming `file`.
 fn guard<T>(file: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|payload| Err(panicked(file, payload)))
@@ -84,7 +80,7 @@ fn panicked(file: &str, payload: Box<dyn std::any::Any + Send>) -> Error {
         .map(|s| s.to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic".into());
-    corrupt(
+    Error::corrupt_in(
         file,
         format!("the Parquet library panicked ({msg}): the file is damaged"),
     )
@@ -183,7 +179,7 @@ const RAW_NAMES: [&str; 3] = [col::ATTRS, col::EVENTS, col::LINKS];
 
 fn rope_error(e: RopeError) -> Error {
     match e {
-        RopeError::Malformed(what) => corrupt(
+        RopeError::Malformed(what) => Error::corrupt_in(
             SPANS_FILE,
             format!("a stored value is malformed ({what}): the file is damaged"),
         ),
@@ -194,14 +190,14 @@ fn rope_error(e: RopeError) -> Error {
 }
 
 fn value_length_error() -> Error {
-    corrupt(
+    Error::corrupt_in(
         SPANS_FILE,
         "a stored value does not add up to the length it carries: the file is damaged",
     )
 }
 
 fn value_checksum_error() -> Error {
-    corrupt(
+    Error::corrupt_in(
         SPANS_FILE,
         "a stored value does not rebuild to the checksum it carries: the file or the piece \
          store is damaged",
@@ -256,7 +252,7 @@ fn rope_size(store: &PieceReader, rope: &[u8]) -> Result<RopeSize> {
 }
 
 fn too_many_references(limit: u64) -> Error {
-    corrupt(
+    Error::corrupt_in(
         SPANS_FILE,
         format!(
             "stored values refer to more bytes of pieces than the whole part does ({limit}): the \
@@ -283,7 +279,7 @@ struct Rebuilt {
 }
 
 fn unrepresentable() -> Error {
-    corrupt(
+    Error::corrupt_in(
         SPANS_FILE,
         "the stored values rebuild to more bytes than a batch can hold: the file is damaged",
     )
@@ -293,7 +289,7 @@ fn unrepresentable() -> Error {
 /// a damaged file asks for must not abort the process.
 fn allocate(n: u64) -> Result<Vec<u8>> {
     let refused = || {
-        corrupt(
+        Error::corrupt_in(
             SPANS_FILE,
             format!(
                 "a stored value of {n} bytes cannot be allocated: the file is damaged, or the \
@@ -481,13 +477,10 @@ impl Table {
         expected: &SchemaRef,
         recorded_len: u64,
     ) -> Result<Self> {
-        let file = File::open(dir.join(name)).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => corrupt(name, "file is missing from the part"),
-            _ => Error::Io(e),
-        })?;
+        let file = File::open(dir.join(name)).map_err(|e| Error::part_file_open(name, e))?;
         let len = file.metadata()?.len();
         if recorded_len != len {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 name,
                 format!("file has {len} bytes but {INDEX_FILE} recorded {recorded_len}"),
             ));
@@ -502,7 +495,7 @@ impl Table {
             .with_offset_index_policy(PageIndexPolicy::Required)
             .with_column_index_policy(PageIndexPolicy::Optional);
         let meta = guard(name, || {
-            ArrowReaderMetadata::load(&file, options).map_err(|e| corrupt(name, e))
+            ArrowReaderMetadata::load(&file, options).map_err(|e| Error::corrupt_in(name, e))
         })?;
 
         // The version was checked from the index before this, so a schema
@@ -515,13 +508,17 @@ impl Table {
                 .zip(expected.fields())
                 .all(|(h, w)| h.name() == w.name() && h.data_type() == w.data_type());
         if !same {
-            return Err(corrupt(name, "columns do not match the expected schema"));
+            return Err(Error::corrupt_in(
+                name,
+                "columns do not match the expected schema",
+            ));
         }
 
         let mut group_starts = vec![0u64];
         let mut batch_rows = Vec::new();
         for group in meta.metadata().row_groups() {
-            let rows = u64::try_from(group.num_rows()).map_err(|_| corrupt(name, "row count"))?;
+            let rows = u64::try_from(group.num_rows())
+                .map_err(|_| Error::corrupt_in(name, "row count"))?;
             group_starts.push(group_starts.last().expect("never empty") + rows);
             // Rows per batch such that a batch of average rows stays near
             // the byte bound, from the group's uncompressed size.
@@ -712,7 +709,7 @@ impl Table {
             if let Some(p) = projection {
                 builder = builder.with_projection(p.mask.clone());
             }
-            builder.build().map_err(|e| corrupt(self.name, e))
+            builder.build().map_err(|e| Error::corrupt_in(self.name, e))
         })
     }
 
@@ -724,7 +721,7 @@ impl Table {
     ) -> Option<Result<RecordBatch>> {
         let batch = match catch_unwind(AssertUnwindSafe(|| reader.next())) {
             Ok(None) => return None,
-            Ok(Some(batch)) => batch.map_err(|e| corrupt(self.name, e)),
+            Ok(Some(batch)) => batch.map_err(|e| Error::corrupt_in(self.name, e)),
             Err(payload) => Err(panicked(self.name, payload)),
         };
         Some(batch.and_then(|b| match projection {
@@ -793,7 +790,7 @@ impl Table {
     fn overlapping(&self, column: &str, min: Option<i64>, max: Option<i64>) -> Result<Vec<usize>> {
         guard(self.name, || {
             groups_overlapping(self.meta.metadata(), column, min, max)
-                .ok_or_else(|| corrupt(self.name, format!("no column `{column}`")))
+                .ok_or_else(|| Error::corrupt_in(self.name, format!("no column `{column}`")))
         })
     }
 
@@ -808,7 +805,7 @@ impl Table {
                 .columns()
                 .iter()
                 .position(|c| c.path().string() == column)
-                .ok_or_else(|| corrupt(self.name, format!("no column `{column}`")))?;
+                .ok_or_else(|| Error::corrupt_in(self.name, format!("no column `{column}`")))?;
             Ok(match meta.row_group(group).column(idx).statistics() {
                 Some(Statistics::Int64(s)) => s.max_opt().copied().unwrap_or(i64::MAX),
                 _ => i64::MAX,
@@ -849,7 +846,7 @@ impl Table {
         }
         let recorded = store.totals().logical_bytes;
         if refs != recorded {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 SPANS_FILE,
                 format!(
                     "the stored values refer to {refs} bytes of pieces but {PIECES_IDX} records \
@@ -862,53 +859,20 @@ impl Table {
 
     /// Re-reads the whole file and compares its length and CRC-32C.
     fn verify(&self, want: FileChecksum) -> Result<()> {
-        check_sum(self.name, self.file.len, self.file_sum()?, want)
-    }
-
-    /// Length and CRC-32C of the file as it is now.
-    fn file_sum(&self) -> Result<FileChecksum> {
-        let want = FileChecksum {
-            len: self.file.len,
-            crc32c: 0,
-        };
-        let now = self.file.file.metadata()?.len();
-        if now != want.len {
-            return Err(corrupt(
-                self.name,
-                format!(
-                    "file has {now} bytes but had {} when it was opened",
-                    want.len
-                ),
-            ));
-        }
-        let mut crc = 0u32;
-        let mut buf = vec![0u8; VERIFY_CHUNK];
-        let mut pos = 0u64;
-        while pos < want.len {
-            let n = (want.len - pos).min(VERIFY_CHUNK as u64) as usize;
-            self.file
-                .file
-                .read_exact_at(&mut buf[..n], pos)
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        corrupt(self.name, "file ended before its recorded length")
-                    }
-                    _ => Error::Io(e),
-                })?;
-            crc = crc32c::crc32c_append(crc, &buf[..n]);
-            pos += n as u64;
-        }
-        Ok(FileChecksum {
-            len: want.len,
-            crc32c: crc,
-        })
+        let now = file_checksum(self.name, &self.file.file, self.file.len)?;
+        check_sum(self.name, self.file.len, now, want)
     }
 }
 
 /// Compares a file's length and CRC-32C with the ones `traces.idx` recorded.
-fn check_sum(name: &str, opened_len: u64, now: FileChecksum, want: FileChecksum) -> Result<()> {
+pub(crate) fn check_sum(
+    name: &str,
+    opened_len: u64,
+    now: FileChecksum,
+    want: FileChecksum,
+) -> Result<()> {
     if now.len != want.len || opened_len != want.len {
-        return Err(corrupt(
+        return Err(Error::corrupt_in(
             name,
             format!(
                 "file has {} bytes (opened with {opened_len}) but {INDEX_FILE} recorded {}",
@@ -917,7 +881,7 @@ fn check_sum(name: &str, opened_len: u64, now: FileChecksum, want: FileChecksum)
         ));
     }
     if now.crc32c != want.crc32c {
-        return Err(corrupt(
+        return Err(Error::corrupt_in(
             name,
             format!(
                 "checksum mismatch: CRC-32C is {:#010x}, {INDEX_FILE} recorded {:#010x}",
@@ -926,6 +890,34 @@ fn check_sum(name: &str, opened_len: u64, now: FileChecksum, want: FileChecksum)
         ));
     }
     Ok(())
+}
+
+/// Length and CRC-32C of a file read in full. The file must still be `len`
+/// bytes long.
+pub(crate) fn file_checksum(name: &str, file: &File, len: u64) -> Result<FileChecksum> {
+    let now = file.metadata()?.len();
+    if now != len {
+        return Err(Error::corrupt_in(
+            name,
+            format!("file has {now} bytes but had {len} when it was opened"),
+        ));
+    }
+    let mut crc = 0u32;
+    let mut buf = vec![0u8; VERIFY_CHUNK];
+    let mut pos = 0u64;
+    while pos < len {
+        let n = (len - pos).min(VERIFY_CHUNK as u64) as usize;
+        file.read_exact_at(&mut buf[..n], pos)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    Error::corrupt_in(name, "file ended before its recorded length")
+                }
+                _ => Error::Io(e),
+            })?;
+        crc = crc32c::crc32c_append(crc, &buf[..n]);
+        pos += n as u64;
+    }
+    Ok(FileChecksum { len, crc32c: crc })
 }
 
 /// Row groups whose statistics for the root column named `column` overlap the
@@ -1094,10 +1086,8 @@ impl PartReader {
     /// here; see [`verify`](Self::verify).
     pub fn open(part_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = part_dir.as_ref();
-        let mut index_file = File::open(dir.join(INDEX_FILE)).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => corrupt(INDEX_FILE, "file is missing from the part"),
-            _ => Error::Io(e),
-        })?;
+        let mut index_file =
+            File::open(dir.join(INDEX_FILE)).map_err(|e| Error::part_file_open(INDEX_FILE, e))?;
         let mut index_bytes = Vec::new();
         index_file.read_to_end(&mut index_bytes)?;
         let index_len = index_bytes.len() as u64;
@@ -1109,21 +1099,17 @@ impl PartReader {
         // The store checks the lengths before it reads anything, and the
         // checksum of `pieces.idx`, which holds the checksum of every block, so
         // that files of another part, whatever their lengths, are refused.
-        let sum = |c: FileChecksum| FileSum {
-            len: c.len,
-            crc32c: c.crc32c,
-        };
         let store = Arc::new(PieceReader::open_recorded(
             dir,
-            sum(checksums.pieces_blk),
-            sum(checksums.pieces_idx),
+            checksums.pieces_blk,
+            checksums.pieces_idx,
         )?);
         spans.store = Some(store.clone());
         let text = TextFiles::open(dir, &checksums, store.totals().pieces)?;
 
         check_ranges(&entries, spans.rows())?;
         if summary.rows() != entries.len() as u64 {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 SUMMARY_FILE,
                 format!(
                     "{} rows but the index lists {} traces",
@@ -1206,10 +1192,6 @@ impl PartReader {
             (PIECES_BLK, blk, self.checksums.pieces_blk),
             (PIECES_IDX, idx, self.checksums.pieces_idx),
         ] {
-            let now = FileChecksum {
-                len: now.len,
-                crc32c: now.crc32c,
-            };
             check_sum(name, now.len, now, recorded)?;
         }
         self.store.verify()
@@ -1223,7 +1205,7 @@ impl PartReader {
     fn verify_index(&self) -> Result<()> {
         let now = self.index_file.metadata()?.len();
         if now != self.index_len {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 INDEX_FILE,
                 format!(
                     "file has {now} bytes but had {} when it was opened",
@@ -1235,7 +1217,7 @@ impl PartReader {
         self.index_file.read_exact_at(&mut bytes, 0)?;
         let now = index::decode(&bytes)?;
         if now.entries != self.entries || now.checksums != self.checksums {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 INDEX_FILE,
                 "file differs from what it was when opened",
             ));
@@ -1495,7 +1477,7 @@ fn check_ranges(entries: &[TraceEntry], rows: u64) -> Result<()> {
     let mut next = 0;
     for (start, end) in ranges {
         if start != next || end <= start {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 INDEX_FILE,
                 format!("row range {start}..{end} does not follow the previous trace's rows"),
             ));
@@ -1503,7 +1485,7 @@ fn check_ranges(entries: &[TraceEntry], rows: u64) -> Result<()> {
         next = end;
     }
     if next != rows {
-        return Err(corrupt(
+        return Err(Error::corrupt_in(
             INDEX_FILE,
             format!("covers {next} rows but {SPANS_FILE} has {rows}"),
         ));

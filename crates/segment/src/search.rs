@@ -13,7 +13,7 @@
 //! [`WriterOptions::max_pieces`](crate::WriterOptions::max_pieces) pieces).
 
 use crate::index::{FileChecksum, FileChecksums};
-use crate::reader::PartReader;
+use crate::reader::{PartReader, check_sum, file_checksum};
 use crate::{TEXT_INDEX_FILE, TEXT_ROWS_FILE};
 use nwdb_core::{Error, Result};
 use nwdb_textindex::{
@@ -21,7 +21,6 @@ use nwdb_textindex::{
     phrase_matches,
 };
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// How much work and memory one search of one part may use. A query over the
@@ -78,10 +77,6 @@ pub(crate) struct TextFiles {
     checksums: (FileChecksum, FileChecksum),
 }
 
-fn corrupt(file: &str, msg: impl std::fmt::Display) -> Error {
-    Error::corrupt(format!("{file}: {msg}"))
-}
-
 /// A library error that names no file gets the file's name; a short read of a
 /// file whose length was checked means the file changed under us. A key the
 /// file does not have is a file that does not match the part, not a missing
@@ -90,9 +85,9 @@ fn named(file: &str, e: Error) -> Error {
     match e {
         // An error that already names the file is left as it is.
         Error::Corrupt(m) if m.starts_with(&format!("{file}: ")) => Error::Corrupt(m),
-        Error::Corrupt(m) | Error::NotFound(m) => corrupt(file, m),
+        Error::Corrupt(m) | Error::NotFound(m) => Error::corrupt_in(file, m),
         Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
-            corrupt(file, "file ended before its recorded length")
+            Error::corrupt_in(file, "file ended before its recorded length")
         }
         other => other,
     }
@@ -102,7 +97,7 @@ fn named(file: &str, e: Error) -> Error {
 /// it is not the file this part wrote, whatever its length.
 fn check_footer(file: &str, found: u32, recorded: u32) -> Result<()> {
     if found != recorded {
-        return Err(corrupt(
+        return Err(Error::corrupt_in(
             file,
             format!(
                 "footer checksum is {found:#010x} but {} recorded {recorded:#010x}: not the \
@@ -115,13 +110,10 @@ fn check_footer(file: &str, found: u32, recorded: u32) -> Result<()> {
 }
 
 fn open_file(dir: &Path, name: &str, recorded_len: u64) -> Result<File> {
-    let file = File::open(dir.join(name)).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => corrupt(name, "file is missing from the part"),
-        _ => Error::Io(e),
-    })?;
+    let file = File::open(dir.join(name)).map_err(|e| Error::part_file_open(name, e))?;
     let len = file.metadata()?.len();
     if len != recorded_len {
-        return Err(corrupt(
+        return Err(Error::corrupt_in(
             name,
             format!(
                 "file has {len} bytes but {} recorded {recorded_len}",
@@ -155,7 +147,7 @@ impl TextFiles {
         )?;
         // Both files are made for exactly this part's pieces.
         if index.doc_count() != pieces {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 TEXT_INDEX_FILE,
                 format!(
                     "{} documents but the piece store has {pieces} pieces",
@@ -164,7 +156,7 @@ impl TextFiles {
             ));
         }
         if rows.keys() != pieces {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 TEXT_ROWS_FILE,
                 format!(
                     "{} lists but the piece store has {pieces} pieces",
@@ -180,32 +172,6 @@ impl TextFiles {
             checksums: (sums.text_index, sums.text_rows),
         })
     }
-}
-
-/// Length and CRC-32C of a file read in full.
-fn file_checksum(name: &str, file: &File, len: u64) -> Result<FileChecksum> {
-    let now = file.metadata()?.len();
-    if now != len {
-        return Err(corrupt(
-            name,
-            format!("file has {now} bytes but had {len} when it was opened"),
-        ));
-    }
-    let (mut crc, mut pos) = (0u32, 0u64);
-    let mut buf = vec![0u8; 1 << 20];
-    while pos < len {
-        let n = (len - pos).min(buf.len() as u64) as usize;
-        file.read_exact_at(&mut buf[..n], pos)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => {
-                    corrupt(name, "file ended before its recorded length")
-                }
-                _ => Error::Io(e),
-            })?;
-        crc = crc32c::crc32c_append(crc, &buf[..n]);
-        pos += n as u64;
-    }
-    Ok(FileChecksum { len, crc32c: crc })
 }
 
 /// True if evaluating the query needs the set of all rows: it holds a `Not`,
@@ -244,17 +210,7 @@ impl PartReader {
             (TEXT_ROWS_FILE, &t.rows_file, t.checksums.1),
         ] {
             let now = file_checksum(name, file, want.len)?;
-            if now.crc32c != want.crc32c {
-                return Err(corrupt(
-                    name,
-                    format!(
-                        "checksum mismatch: CRC-32C is {:#010x}, {} recorded {:#010x}",
-                        now.crc32c,
-                        crate::INDEX_FILE,
-                        want.crc32c
-                    ),
-                ));
-            }
+            check_sum(name, want.len, now, want)?;
         }
         t.index.verify().map_err(|e| named(TEXT_INDEX_FILE, e))?;
         // The CRC-32C above covers every list of `text.rows`, so the lists are
@@ -268,7 +224,7 @@ impl PartReader {
     fn check_pieces(&self, pieces: &[u32]) -> Result<()> {
         let count = self.text.rows.keys();
         if let Some(&bad) = pieces.iter().find(|&&p| u64::from(p) >= count) {
-            return Err(corrupt(
+            return Err(Error::corrupt_in(
                 TEXT_INDEX_FILE,
                 format!("document {bad} but the part has {count} pieces"),
             ));
@@ -311,7 +267,7 @@ impl PartReader {
                 )));
             }
             let rows = u32::try_from(rows).map_err(|_| {
-                corrupt(crate::SPANS_FILE, "more rows than the text lists can name")
+                Error::corrupt_in(crate::SPANS_FILE, "more rows than the text lists can name")
             })?;
             (0..rows).collect()
         } else {
@@ -445,7 +401,7 @@ impl PartReader {
                 if let Some(&last) = ids.last()
                     && u64::from(last) >= row_count
                 {
-                    return Err(corrupt(
+                    return Err(Error::corrupt_in(
                         TEXT_ROWS_FILE,
                         format!("piece {piece} lists row {last} but the part has {row_count} rows"),
                     ));

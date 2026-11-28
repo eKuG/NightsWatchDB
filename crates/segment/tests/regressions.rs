@@ -1,5 +1,5 @@
-//! Regression tests for the defects found in review of the span part crate:
-//! the first three tests are the reviewer's, the rest cover the other fixes.
+//! Regression tests for fixed defects of the span part crate: the first three
+//! tests are the original ones, the rest cover the other fixes.
 
 use arrow_array::{Array, LargeBinaryArray, RecordBatch};
 use nwdb_core::{BatchLimits, SpanBatchBuilder, SpanId, SpanRecord, TraceId, part_dir_name};
@@ -92,7 +92,7 @@ fn a_flipped_byte_in_span_data_is_caught_by_verify() {
     bytes[at + 5] ^= 0x01;
     std::fs::write(&path, &bytes).unwrap();
 
-    // Changed from the reviewer's version: damage is detected by `verify`,
+    // Changed from the original version: damage is detected by `verify`,
     // which the brief keeps out of `open` and out of every read, so a read
     // alone may still return the damaged bytes. The data is therefore either
     // refused by `verify` or, when `verify` is skipped, the reader may return

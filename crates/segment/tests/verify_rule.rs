@@ -11,11 +11,12 @@ use nwdb_core::{
 use nwdb_segment::{PartReader, PartWriter, WriterOptions};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
-use std::fs::OpenOptions;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod support;
+use support::flip;
 
 struct Chunks(usize);
 
@@ -58,19 +59,6 @@ fn write_part(parts: &Path, traces: u8, len: usize) -> PathBuf {
     w.write(&b.finish()).unwrap();
     w.finish().unwrap();
     parts.join(part_dir_name(1))
-}
-
-/// Flips one bit of the byte at `at` of `path`, in place.
-fn flip(path: &Path, at: u64, bit: u8) {
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap();
-    let mut byte = [0u8];
-    f.read_exact_at(&mut byte, at).unwrap();
-    byte[0] ^= 1 << bit;
-    f.write_all_at(&byte, at).unwrap();
 }
 
 /// Checks the rule for one flip at `at` of `file`.

@@ -273,20 +273,23 @@ impl Lists {
                 self.pieces
             )));
         }
-        while self.next_key < u64::from(piece) {
-            self.writer.push(&[])?;
-            self.next_key += 1;
-        }
+        self.fill_to(u64::from(piece))?;
         self.writer.push(rows)?;
         self.next_key += 1;
         Ok(())
     }
 
-    fn finish(mut self) -> Result<IdListMeta> {
-        while self.next_key < self.pieces {
+    /// Pushes empty lists until the next key is `end`.
+    fn fill_to(&mut self, end: u64) -> Result<()> {
+        while self.next_key < end {
             self.writer.push(&[])?;
             self.next_key += 1;
         }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<IdListMeta> {
+        self.fill_to(self.pieces)?;
         self.writer.finish()
     }
 }

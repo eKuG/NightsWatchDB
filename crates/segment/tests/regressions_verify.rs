@@ -10,11 +10,12 @@ use nwdb_core::{
 use nwdb_segment::{INDEX_FILE, PIECES_IDX, PartReader, PartWriter, WriterOptions};
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
-use std::fs::OpenOptions;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod support;
+use support::flip;
 
 struct Chunks(usize);
 
@@ -60,20 +61,6 @@ fn write_part(parts: &Path) -> PathBuf {
     parts.join(part_dir_name(1))
 }
 
-/// Flips one bit of the byte at `at` of `path`, in place.
-fn flip(path: &Path, at: u64) {
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap();
-    let mut byte = [0u8];
-    f.read_exact_at(&mut byte, at).unwrap();
-    byte[0] ^= 0x10;
-    f.write_all_at(&byte, at).unwrap();
-    f.sync_all().unwrap();
-}
-
 #[test]
 fn verify_finds_damage_in_the_last_four_bytes_of_pieces_idx() {
     let tmp = tempfile::tempdir().unwrap();
@@ -86,7 +73,7 @@ fn verify_finds_damage_in_the_last_four_bytes_of_pieces_idx() {
     // is open.
     let idx = dir.join(PIECES_IDX);
     let len = std::fs::metadata(&idx).unwrap().len();
-    flip(&idx, len - 1);
+    flip(&idx, len - 1, 4);
 
     // The part can no longer be opened...
     match PartReader::open(&dir) {
@@ -113,7 +100,7 @@ fn verify_finds_damage_in_traces_idx() {
 
     // One bit of the recorded checksum of spans.parquet rots on disk while the
     // part is open.
-    flip(&dir.join(INDEX_FILE), 24);
+    flip(&dir.join(INDEX_FILE), 24, 4);
 
     match PartReader::open(&dir) {
         Err(Error::Corrupt(m)) => assert!(m.contains(INDEX_FILE), "{m}"),

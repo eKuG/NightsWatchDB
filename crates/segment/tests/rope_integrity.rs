@@ -13,17 +13,18 @@
 //! instead of taking the test runner down.
 
 use nwdb_core::{
-    BatchLimits, Error, PayloadSplitter, RawColumn, SpanBatchBuilder, SpanColumns, SpanId,
-    SpanRecord, TraceId, part_dir_name,
+    BatchLimits, PayloadSplitter, RawColumn, SpanBatchBuilder, SpanColumns, SpanId, SpanRecord,
+    TraceId, part_dir_name,
 };
 use nwdb_payload::{PieceReader, PieceWriter, PieceWriterOptions, StoreSummary};
 use nwdb_segment::{INDEX_FILE, PIECES_BLK, PIECES_IDX, PartReader, PartWriter, WriterOptions};
-use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+
+mod support;
+use support::{corrupt, random};
 
 /// Set in the child: the part directory to read.
 const CHILD: &str = "NWDB_ROPE_INTEGRITY_PART";
@@ -65,12 +66,6 @@ fn write_part(parts: &Path, attrs: &[Vec<u8>], chunk: usize) -> PathBuf {
     parts.join(part_dir_name(1))
 }
 
-fn random(seed: u64, len: usize) -> Vec<u8> {
-    let mut v = vec![0u8; len];
-    StdRng::seed_from_u64(seed).fill_bytes(&mut v);
-    v
-}
-
 /// Puts the piece files written in `store` into `part` and patches the
 /// lengths and checksums `traces.idx` records for them, and its own checksum.
 fn install(part: &Path, store: &Path, sum: &StoreSummary) {
@@ -86,13 +81,6 @@ fn install(part: &Path, store: &Path, sum: &StoreSummary) {
     let crc = crc32c::crc32c(&index[..body]);
     index[body..].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(part.join(INDEX_FILE), &index).unwrap();
-}
-
-fn corrupt(e: Error) -> String {
-    match e {
-        Error::Corrupt(m) => m,
-        other => panic!("expected Corrupt, got {other:?}"),
-    }
 }
 
 fn attrs_of(reader: &PartReader) -> Vec<Vec<u8>> {

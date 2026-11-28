@@ -16,16 +16,10 @@ const RECORD_LEN: usize = 44;
 const CRC_LEN: usize = 4;
 
 /// Length and CRC-32C (Castagnoli) of one file of a part, computed while the
-/// file was written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileChecksum {
-    /// Length of the file in bytes.
-    pub len: u64,
-    /// CRC-32C of every byte of the file, except for `pieces.idx`, where it
-    /// is of every byte but the last four (the file's own checksum: over the
-    /// whole file the value would be the same for every part).
-    pub crc32c: u32,
-}
+/// file was written: the piece store's [`FileSum`](nwdb_payload::FileSum),
+/// whose `crc32c` covers every byte of the file except for `pieces.idx`,
+/// where it is of every byte but the last four.
+pub use nwdb_payload::FileSum as FileChecksum;
 
 /// Where one trace's spans are stored in `spans.parquet`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +96,7 @@ fn push_records(out: &mut Vec<u8>, entries: &[TraceEntry]) {
 }
 
 fn corrupt(msg: impl std::fmt::Display) -> Error {
-    Error::corrupt(format!("{INDEX_FILE}: {msg}"))
+    Error::corrupt_in(INDEX_FILE, msg)
 }
 
 /// Decodes and checks the whole file: magic, version, length, checksum and

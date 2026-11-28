@@ -5,8 +5,8 @@
 //! it rebuilds to, in a part that was written and in one that was merged.
 
 use nwdb_core::{
-    BatchLimits, Error, PayloadSplitter, RawColumn, SpanBatchBuilder, SpanColumns, SpanId,
-    SpanRecord, TraceId, part_dir_name,
+    BatchLimits, PayloadSplitter, RawColumn, SpanBatchBuilder, SpanColumns, SpanId, SpanRecord,
+    TraceId, part_dir_name,
 };
 use nwdb_payload::rope;
 use nwdb_payload::{PieceWriter, PieceWriterOptions, StoreSummary};
@@ -15,11 +15,12 @@ use nwdb_segment::{
     INDEX_FILE, MergeOptions, PIECES_BLK, PIECES_IDX, PartReader, PartWriter, TEXT_INDEX_FILE,
     TEXT_ROWS_FILE, WriterOptions, merge_parts,
 };
-use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod support;
+use support::{corrupt, random};
 
 const WINDOW_NS: i64 = 900_000_000_000;
 
@@ -51,12 +52,6 @@ fn options(chunk: usize) -> WriterOptions {
         min_piece_bytes: 1,
         ..WriterOptions::default()
     }
-}
-
-fn random(seed: u64, len: usize) -> Vec<u8> {
-    let mut v = vec![0u8; len];
-    StdRng::seed_from_u64(seed).fill_bytes(&mut v);
-    v
 }
 
 /// Writes part `id` of the traces `traces`, one span each, whose value in
@@ -151,13 +146,6 @@ fn install_text(part: &Path, pieces: u32) {
     let crc = crc32c::crc32c(&index[..body]);
     index[body..].copy_from_slice(&crc.to_le_bytes());
     std::fs::write(part.join(INDEX_FILE), &index).unwrap();
-}
-
-fn corrupt(e: Error) -> String {
-    match e {
-        Error::Corrupt(m) => m,
-        other => panic!("expected Corrupt, got {other:?}"),
-    }
 }
 
 #[test]

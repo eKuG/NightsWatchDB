@@ -288,10 +288,6 @@ impl Digest {
     }
 }
 
-fn pq(e: parquet::errors::ParquetError) -> Error {
-    Error::other(e)
-}
-
 /// A file shared between the Parquet writer, which owns it for writing, and
 /// the part writer, which syncs it after the Parquet writer has finished. It
 /// digests every byte that reaches the file.
@@ -334,8 +330,8 @@ fn new_parquet_writer(
             digest: digest.clone(),
         },
     );
-    let writer =
-        ArrowWriter::try_new(sink, schema, Some(parquet_props(rows, spans))).map_err(pq)?;
+    let writer = ArrowWriter::try_new(sink, schema, Some(parquet_props(rows, spans)))
+        .map_err(Error::other)?;
     Ok((writer, file, digest))
 }
 
@@ -626,9 +622,11 @@ impl PartWriter {
                     break;
                 }
             }
-            spans.write(&batch.slice(start, end - start)).map_err(pq)?;
+            spans
+                .write(&batch.slice(start, end - start))
+                .map_err(Error::other)?;
             if group_is_full(&options, self.group_rows, self.group_bytes) {
-                spans.flush().map_err(pq)?;
+                spans.flush().map_err(Error::other)?;
                 self.group_rows = 0;
                 self.group_bytes = 0;
             }
@@ -711,7 +709,7 @@ impl PartWriter {
         }
 
         let spans = self.spans.take().expect("writer is open");
-        spans.close().map_err(pq)?;
+        spans.close().map_err(Error::other)?;
         self.spans_file.sync_all()?;
 
         let PayloadSink { pieces, text, .. } = self.sink.take().expect("writer is open");
@@ -724,11 +722,7 @@ impl PartWriter {
         } = text.finish(store.totals.pieces)?;
         let spans_sum = self.spans_digest.get();
         let summary_sum = self.write_summary()?;
-        let sum_of = |s: nwdb_payload::FileSum| FileChecksum {
-            len: s.len,
-            crc32c: s.crc32c,
-        };
-        let (blk_sum, idx_sum) = (sum_of(store.blocks), sum_of(store.index));
+        let (blk_sum, idx_sum) = (store.blocks, store.index);
         for (name, sum) in [
             (SPANS_FILE, spans_sum),
             (SUMMARY_FILE, summary_sum),
@@ -832,13 +826,13 @@ impl PartWriter {
         for summary in &self.summaries {
             builder.append(summary);
             if builder.len() >= SUMMARY_BATCH_ROWS {
-                writer.write(&builder.finish()).map_err(pq)?;
+                writer.write(&builder.finish()).map_err(Error::other)?;
             }
         }
         if !builder.is_empty() {
-            writer.write(&builder.finish()).map_err(pq)?;
+            writer.write(&builder.finish()).map_err(Error::other)?;
         }
-        writer.close().map_err(pq)?;
+        writer.close().map_err(Error::other)?;
         file.sync_all()?;
         Ok(digest.get())
     }
