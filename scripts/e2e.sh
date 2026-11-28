@@ -60,7 +60,10 @@ check() {
   for id in $ids; do
     n=$((n + 1))
     want=$(printf '%s\n' "$counts" | sed -n "${n}p")
-    have=$(curl -fsS "http://$API/api/v1/traces/$id" | grep -o '"span_id":"' | wc -l | tr -d ' ')
+    # A span-level annotation carries a span id too: count only what comes
+    # before the annotations, which follow the spans.
+    have=$(curl -fsS "http://$API/api/v1/traces/$id" | sed 's/\(.*\),"annotations":\[.*/\1/' |
+      grep -o '"span_id":"' | wc -l | tr -d ' ')
     [ "$have" = "$want" ] || fail "$label: trace $id has $have spans, its summary says $want"
   done
   echo "ok: $label: $got spans, $n traces opened"
