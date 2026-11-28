@@ -847,6 +847,7 @@ dependencies = [
  "ahash",
  "crc32c",
  "nwdb-core",
+ "nwdb-testkit",
  "rand",
  "tempfile",
  "zstd",

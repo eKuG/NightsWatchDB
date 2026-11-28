@@ -16,6 +16,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+nwdb-testkit = { path = "../testkit" }
 tempfile.workspace = true
 
 [lints]

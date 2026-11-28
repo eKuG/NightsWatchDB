@@ -12,6 +12,7 @@
 #![cfg(target_os = "linux")]
 
 use nwdb_payload::{PieceReader, PieceWriter, PieceWriterOptions};
+use nwdb_testkit::mem::peak;
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 use std::path::Path;
@@ -21,14 +22,6 @@ const BLOCK: usize = MIB;
 const TOTAL: usize = 192 * MIB;
 const SMALL: usize = 16 * MIB;
 const LARGE: usize = 64 * MIB;
-
-/// Peak resident memory of this process, in bytes.
-fn peak() -> usize {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
-    let kb: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-    kb * 1024
-}
 
 /// The pieces of a run: random bytes of 1 KiB to 48 KiB, never repeated.
 fn pieces(seed: u64) -> impl Iterator<Item = Vec<u8>> {
