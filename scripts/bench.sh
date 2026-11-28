@@ -133,9 +133,12 @@ docker volume create "$NAME" >/dev/null
 
 # --- helpers ---------------------------------------------------------------
 
+# The poller and querybench reach the API by the container's name on the Docker
+# network, which the API's Host check only answers when it is listed.
 start_server() { # first start; the settings stay for every restart
   docker run -d --name "$SERVER" --network "$NAME" --cpus "$CPUS" --memory "$MEM" --memory-swap "$MEM" \
     -e NWDB_COMPACTION_QUIET="$QUIET" -e NWDB_NO_COMPACTION="$NO_COMPACTION" \
+    -e NWDB_API_ALLOWED_HOSTS="$SERVER" \
     -v "$NAME":/var/lib/nightswatchdb -p 127.0.0.1::4320 "$SERVER_IMG" >/dev/null
   wait_ready
 }
@@ -321,23 +324,37 @@ TOTAL_SPANS=$((SPANS + EXTRA_SPANS))
 PEAK_START=$(mem_peak)
 
 echo "== queries ($QB_N per kind, $QB_WARMUP warm-up, concurrency $QB_CONC)" >&2
+# Two runs, so that the peak of memory is read between them: the first has every
+# kind but the annotation phase (the figure that compares with earlier results),
+# the second only the annotation phase.
 docker run --rm --network "$NAME" "$QB_IMG" -addr "$SERVER:4320" -n "$QB_N" -warmup "$QB_WARMUP" \
-  -concurrency "$QB_CONC" -annotate="$([ "$NO_ANNOTATIONS" = 1 ] && echo false || echo true)" > "$OUT/querybench.json" || fail "querybench failed"
+  -concurrency "$QB_CONC" -annotate=false > "$OUT/querybench.json" || fail "querybench failed"
 PEAK_QUERY=$(mem_peak)
 QB_SPANS=$(grep -o '"server_span_count":[0-9]*' "$OUT/querybench.json" | cut -d: -f2)
 [ "$QB_SPANS" = "$TOTAL_SPANS" ] || fail "querybench saw $QB_SPANS spans, expected $TOTAL_SPANS"
+QB_FILES="$OUT/querybench.json"
+PEAK_ANN=null
+if [ "$NO_ANNOTATIONS" != 1 ]; then
+  echo "== annotations" >&2
+  docker run --rm --network "$NAME" "$QB_IMG" -addr "$SERVER:4320" -n "$QB_N" -warmup "$QB_WARMUP" \
+    -concurrency "$QB_CONC" -annotate-only > "$OUT/querybench-annotations.json" || fail "querybench failed in the annotation phase"
+  PEAK_ANN=$(mem_peak)
+  QB_SPANS=$(grep -o '"server_span_count":[0-9]*' "$OUT/querybench-annotations.json" | cut -d: -f2)
+  [ "$QB_SPANS" = "$TOTAL_SPANS" ] || fail "querybench saw $QB_SPANS spans after the annotations, expected $TOTAL_SPANS"
+  QB_FILES="$OUT/querybench.json $OUT/querybench-annotations.json"
+fi
 
-# querybench printed its annotation step on one line starting with "annotation":
+# The annotation phase printed its step on one line starting with "annotation":
 # (null when it was skipped).
 ANN_ENABLED=false
-if grep -q '^"annotation":{' "$OUT/querybench.json"; then ANN_ENABLED=true; fi
-ann_num() { grep '^"annotation":' "$OUT/querybench.json" | grep -o "\"$1\":[0-9.]*" | head -n 1 | cut -d: -f2; }
+if [ -f "$OUT/querybench-annotations.json" ] && grep -q '^"annotation":{' "$OUT/querybench-annotations.json"; then ANN_ENABLED=true; fi
+ann_num() { grep '^"annotation":' "$OUT/querybench-annotations.json" | grep -o "\"$1\":[0-9.]*" | head -n 1 | cut -d: -f2; }
 if [ "$ANN_ENABLED" = true ]; then
   ANN_SENT=$(ann_num sent); ANN_ACCEPTED=$(ann_num accepted); ANN_REJECTED=$(ann_num rejected)
   ANN_POST_S=$(ann_num seconds); ANN_PER_S=$(ann_num per_s); ANN_FLUSH_S=$(ann_num flush_wait_s)
   ANN_PARTS_FLUSH=$(ann_num annotation_parts); ANN_BYTES_FLUSH=$(ann_num annotation_bytes)
   [ -n "$ANN_SENT" ] && [ -n "$ANN_PER_S" ] && [ -n "$ANN_FLUSH_S" ] && [ -n "$ANN_BYTES_FLUSH" ] ||
-    fail "could not read the annotation step of querybench.json"
+    fail "could not read the annotation step of querybench-annotations.json"
   [ "$ANN_REJECTED" = 0 ] && [ "$ANN_ACCEPTED" = "$ANN_SENT" ] ||
     fail "querybench sent $ANN_SENT annotations, the server accepted $ANN_ACCEPTED and rejected $ANN_REJECTED"
   if [ "$NO_COMPACTION" = 1 ]; then
@@ -425,7 +442,9 @@ cat > "$OUT/result.json" <<EOF
   "restart": {"clean_ms": $CLEAN_MS, "crash_ms": $CRASH_MS, "crash_batch_spans": $EXTRA_SPANS, "server_peak_memory_after_restarts_bytes": $(nn "$PEAK_START")},
   "annotations": $ANN_JSON,
   "queries": $(cat "$OUT/querybench.json"),
-  "server_peak_memory_after_queries_bytes": $(nn "$PEAK_QUERY")
+  "annotation_queries": $(if [ -f "$OUT/querybench-annotations.json" ]; then cat "$OUT/querybench-annotations.json"; else echo null; fi),
+  "server_peak_memory_after_queries_bytes": $(nn "$PEAK_QUERY"),
+  "server_peak_memory_after_annotations_bytes": $(nn "$PEAK_ANN")
 }
 EOF
 
@@ -466,9 +485,10 @@ mb() { awk -v b="$1" 'BEGIN {if (b == "null" || b == "") print "n/a"; else print
   echo "| Clean restart to /healthz (ms) | $CLEAN_MS |"
   echo "| Crash restart to /healthz (ms), after $EXTRA_SPANS more spans | $CRASH_MS |"
   echo "| Server peak memory since the last start, after queries (MiB) | $(mb "$(nn "$PEAK_QUERY")") |"
+  [ "$ANN_ENABLED" != true ] || echo "| Server peak memory since the last start, after the annotation phase (MiB) | $(mb "$(nn "$PEAK_ANN")") |"
   if [ "$ANN_ENABLED" = true ]; then
     echo
-    echo "| Annotations (written by querybench after the queries) | |"
+    echo "| Annotations (written by querybench after the queries; 10% of the traces get a quality score and 1% a human label, and the two sets are disjoint) | |"
     echo "|---|---|"
     echo "| Sent / accepted / rejected | $ANN_SENT / $ANN_ACCEPTED / $ANN_REJECTED |"
     echo "| Annotations per second (requests of 500, one at a time) / seconds | $ANN_PER_S / $ANN_POST_S |"
@@ -485,7 +505,7 @@ mb() { awk -v b="$1" 'BEGIN {if (b == "null" || b == "") print "n/a"; else print
   echo
   echo "| Query | Count | Errors | p50 ms | p95 ms | p99 ms | max ms | Bytes received |"
   echo "|---|---|---|---|---|---|---|---|"
-  sed -n 's/^{"kind":"\([a-z_0-9]*\)","count":\([0-9]*\),"errors":\([0-9]*\),"p50_ms":\([^,]*\),"p95_ms":\([^,]*\),"p99_ms":\([^,]*\),"max_ms":\([^,]*\),"bytes":\([0-9]*\).*/| \1 | \2 | \3 | \4 | \5 | \6 | \7 | \8 |/p' "$OUT/querybench.json"
+  sed -n 's/^{"kind":"\([a-z_0-9]*\)","count":\([0-9]*\),"errors":\([0-9]*\),"p50_ms":\([^,]*\),"p95_ms":\([^,]*\),"p99_ms":\([^,]*\),"max_ms":\([^,]*\),"bytes":\([0-9]*\).*/| \1 | \2 | \3 | \4 | \5 | \6 | \7 | \8 |/p' $QB_FILES
   echo
   # The three exp_* rows are the earlier experiment's list1, list2 and agg,
   # run with the parameters it derives (also in result.json, queries.exp_params).

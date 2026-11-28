@@ -40,8 +40,8 @@ pub struct ServerOptions {
     /// Bytes of export requests that may be read, decoded or waiting for the
     /// log at one time. Default 512 MiB; the README says what it bounds.
     pub max_inflight_bytes: usize,
-    /// Host names the API answers to besides `localhost`, the loopback
-    /// addresses and the address it is bound to. Default none.
+    /// Host names the API answers to besides `localhost` and IP address
+    /// literals, which it always answers to. Default none.
     pub api_allowed_hosts: Vec<String>,
     /// How long shutdown waits for open connections before it drops them.
     /// Default 5 s.
@@ -173,7 +173,7 @@ impl Server {
 
         let listener = TcpListener::bind(options.api_addr).await?;
         let api_addr = listener.local_addr()?;
-        let hosts = api::HostCheck::new(api_addr.ip(), &options.api_allowed_hosts);
+        let hosts = api::HostCheck::new(&options.api_allowed_hosts);
         let service = TowerToHyperService::new(api::router(
             engine.clone(),
             fatal.clone(),

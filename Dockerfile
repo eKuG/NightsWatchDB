@@ -20,7 +20,9 @@ VOLUME /var/lib/nightswatchdb
 EXPOSE 4317 4320
 # The binary listens on loopback by default because it has no authentication
 # or TLS. In a container the published ports are the access control, so it
-# listens on every interface here.
+# listens on every interface here. The API's Host check is on all the same: a
+# client that reaches it by a name (a container name on a Docker network) needs
+# NWDB_API_ALLOWED_HOSTS; an IP address or localhost always works.
 ENTRYPOINT ["nightswatchdb", \
     "--data-dir", "/var/lib/nightswatchdb", \
     "--otlp-grpc-addr", "0.0.0.0:4317", \

@@ -205,6 +205,18 @@ func TestBuildAnnotations(t *testing.T) {
 	if string(ab) == string(cb) {
 		t.Error("another seed must give other items")
 	}
+	// The traces with a human label have no score: the two sets are disjoint.
+	scored := map[string]bool{}
+	for _, x := range a {
+		if x.Name == "quality" {
+			scored[x.TraceID] = true
+		}
+	}
+	for _, x := range a {
+		if x.Name == "human" && scored[x.TraceID] {
+			t.Errorf("trace %s has both a quality score and a human label", x.TraceID)
+		}
+	}
 	humans := 0
 	for _, x := range a {
 		switch x.Name {

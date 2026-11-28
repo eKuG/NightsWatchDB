@@ -1,6 +1,8 @@
 //! `POST /api/v1/annotations` against a real server, and how annotations show
 //! in the trace view, the list and the stats.
 
+mod common;
+
 use bytes::{Buf, BufMut, Bytes};
 use nwdb_server::{Server, ServerOptions};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -10,12 +12,12 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::io::{BufRead, BufReader};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tonic::client::Grpc;
 use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::http::uri::PathAndQuery;
@@ -79,73 +81,9 @@ async fn export(addr: SocketAddr, body: Vec<u8>) {
     .unwrap();
 }
 
-struct Resp {
-    status: u16,
-    body: Vec<u8>,
-}
+use common::Resp;
 
-impl Resp {
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body)
-            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&self.body)))
-    }
-    fn error(&self) -> String {
-        self.json()["error"].as_str().unwrap().to_owned()
-    }
-}
-
-fn dechunk(mut raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let eol = raw.windows(2).position(|w| w == b"\r\n").unwrap();
-        let size =
-            usize::from_str_radix(std::str::from_utf8(&raw[..eol]).unwrap().trim(), 16).unwrap();
-        if size == 0 {
-            return out;
-        }
-        out.extend_from_slice(&raw[eol + 2..eol + 2 + size]);
-        raw = &raw[eol + 2 + size + 2..];
-    }
-}
-
-/// One request on its own connection. `declared` replaces the body's length
-/// in `Content-Length`.
-fn send_blocking(
-    addr: SocketAddr,
-    method: &str,
-    target: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-    declared: Option<usize>,
-) -> Resp {
-    let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    let mut head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
-        declared.unwrap_or(body.len())
-    );
-    for (k, v) in headers {
-        head.push_str(&format!("{k}: {v}\r\n"));
-    }
-    head.push_str("\r\n");
-    s.write_all(head.as_bytes()).unwrap();
-    s.write_all(body).unwrap();
-    let mut raw = Vec::new();
-    // The server may close with the rest of a refused body unread.
-    let _ = s.read_to_end(&mut raw);
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let head = String::from_utf8(raw[..split].to_vec()).unwrap();
-    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    Resp {
-        status,
-        body: if head.to_lowercase().contains("transfer-encoding: chunked") {
-            dechunk(&raw[split + 4..])
-        } else {
-            raw[split + 4..].to_vec()
-        },
-    }
-}
-
+/// One request; `declared` replaces the body's length in `Content-Length`.
 async fn send(
     addr: SocketAddr,
     method: &str,
@@ -154,22 +92,17 @@ async fn send(
     body: Vec<u8>,
     declared: Option<usize>,
 ) -> Resp {
-    let (method, target) = (method.to_owned(), target.to_owned());
-    let headers: Vec<(String, String)> = headers
+    let headers: String = headers
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
         .collect();
-    tokio::task::spawn_blocking(move || {
-        send_blocking(addr, &method, &target, &headers, &body, declared)
-    })
-    .await
-    .unwrap()
+    common::http_body(addr, method, target, &headers, Some(body), declared).await
 }
 
 const JSON: (&str, &str) = ("Content-Type", "application/json");
 
 async fn get(api: SocketAddr, target: &str) -> Resp {
-    send(api, "GET", target, &[], Vec::new(), None).await
+    common::http(api, "GET", target, "").await
 }
 
 async fn get_json(api: SocketAddr, target: &str) -> Value {
@@ -210,20 +143,13 @@ async fn post_ok(api: SocketAddr, items: Vec<Value>) {
 // ---- data ----
 
 fn opts(dir: &Path) -> ServerOptions {
-    let mut o = ServerOptions::new(dir);
-    o.otlp_grpc_addr = "127.0.0.1:0".parse().unwrap();
-    o.api_addr = "127.0.0.1:0".parse().unwrap();
+    let mut o = common::opts(dir);
     // Nothing is flushed during a test, so everything stays in the buffers.
     o.engine.flush_interval = Duration::from_secs(3600);
     o
 }
 
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-}
+use common::now_ns;
 
 fn kv(key: &str, v: &str) -> KeyValue {
     KeyValue {
@@ -364,9 +290,13 @@ async fn annotate_read_back_overwrite_and_delete() {
             == 2
     );
 
-    // The list shows them too.
+    // The list shows them too, without the comments.
     let list = get_json(api, "/api/v1/traces").await;
-    assert_eq!(list["traces"][0]["annotations"], json!(got));
+    let mut without_comments = got.clone();
+    for a in &mut without_comments {
+        a.as_object_mut().unwrap().remove("comment");
+    }
+    assert_eq!(list["traces"][0]["annotations"], json!(without_comments));
     assert!(list["traces"][0].get("annotations_truncated").is_none());
 
     // The latest write of one identity wins, and a given time is kept.
@@ -493,12 +423,12 @@ async fn the_reply_comes_only_after_the_log_sync() {
         .to_string()
         .into_bytes();
     std::thread::spawn(move || {
-        let r = send_blocking(
+        let r = common::http_body_blocking(
             api,
             "POST",
             "/api/v1/annotations",
-            &[("Content-Type".into(), "application/json".into())],
-            &body,
+            "Content-Type: application/json\r\n",
+            Some(&body),
             None,
         );
         let _ = tx.send(r.status);
@@ -633,7 +563,16 @@ async fn a_request_that_is_not_of_the_shape_is_a_400() {
     let item = format!(r#"{{"trace_id":"{t}","name":"n","value":1}}"#);
     let cases: Vec<(&str, String)> = vec![
         ("invalid JSON", "{".into()),
-        ("not an object", "[]".into()),
+        // An array is not an object even when its elements would fit.
+        ("body is an array", format!(r#"[[{item}]]"#)),
+        (
+            "body is an array of the request",
+            format!(r#"[{{"annotations":[{item}]}}]"#),
+        ),
+        (
+            "item is an array",
+            format!(r#"{{"annotations":[["{t}",null,"n",null,null,1,null,null,null]]}}"#),
+        ),
         ("no list", "{}".into()),
         ("null list", r#"{"annotations":null}"#.into()),
         ("list is an object", r#"{"annotations":{}}"#.into()),
@@ -751,8 +690,9 @@ async fn at_most_1000_items() {
     assert_eq!(r.status, 400);
     assert!(r.error().contains("at most 1000"), "{}", r.error());
 
-    // The 1001st is not even read as an item: it is not one, and the answer
-    // is still the limit, not a complaint about its type.
+    // The 1001st element is skipped, not built as an item: it only has to
+    // be there. A value that is not an item gets the answer for the limit,
+    // not a complaint about its type.
     let r = post_bytes(api, body(1000, ",12345").as_bytes()).await;
     assert_eq!(r.status, 400);
     assert!(r.error().contains("at most 1000"), "{}", r.error());
@@ -987,7 +927,7 @@ async fn the_list_filters_by_annotation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_list_shows_at_most_32_annotations_per_trace() {
+async fn the_list_shows_at_most_8_annotations_per_trace_without_comments() {
     let dir = tempfile::tempdir().unwrap();
     let server = server_with(dir.path(), 1).await;
     let api = server.api_addr();
@@ -996,18 +936,37 @@ async fn the_list_shows_at_most_32_annotations_per_trace() {
             .map(|i| score(1, &format!("n{i:02}"), i as f64))
             .collect()
     };
-    post_ok(api, batch(0, 32)).await;
+    post_ok(api, batch(0, 8)).await;
     let v = get_json(api, "/api/v1/traces").await;
-    assert_eq!(v["traces"][0]["annotations"].as_array().unwrap().len(), 32);
+    assert_eq!(v["traces"][0]["annotations"].as_array().unwrap().len(), 8);
     assert!(v["traces"][0].get("annotations_truncated").is_none());
 
-    post_ok(api, batch(32, 33)).await;
+    post_ok(api, batch(8, 9)).await;
     let v = get_json(api, "/api/v1/traces").await;
-    assert_eq!(v["traces"][0]["annotations"].as_array().unwrap().len(), 32);
+    assert_eq!(v["traces"][0]["annotations"].as_array().unwrap().len(), 8);
     assert_eq!(v["traces"][0]["annotations_truncated"], true);
-    assert_eq!(v["traces"][0]["annotations"][31]["name"], "n31");
-    // The trace view still has all 33.
-    assert_eq!(annotations_of(api, 1).await.len(), 33);
+    assert_eq!(v["traces"][0]["annotations"][7]["name"], "n07");
+    // The trace view still has all 9.
+    assert_eq!(annotations_of(api, 1).await.len(), 9);
+
+    // A comment is in the trace view and not in the list; the other fields
+    // are in both.
+    post_ok(
+        api,
+        vec![json!({"trace_id": trace_hex(1), "name": "a",
+                    "source": "human", "value": 2.5, "label": "l", "comment": "why"})],
+    )
+    .await;
+    let v = get_json(api, "/api/v1/traces").await;
+    let listed = &v["traces"][0]["annotations"][0];
+    assert_eq!(listed["name"], "a");
+    assert_eq!(listed["source"], "human");
+    assert_eq!(listed["value"], 2.5);
+    assert_eq!(listed["label"], "l");
+    assert!(listed.get("comment").is_none(), "{listed}");
+    let viewed = &annotations_of(api, 1).await[0];
+    assert_eq!(viewed["name"], "a");
+    assert_eq!(viewed["comment"], "why");
     server.shutdown().await.unwrap();
 }
 

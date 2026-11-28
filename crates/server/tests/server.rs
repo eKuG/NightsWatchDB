@@ -900,6 +900,8 @@ async fn the_host_header_is_checked_on_a_loopback_api() {
         format!("localhost:{port}"),
         format!("127.0.0.1:{port}"),
         format!("[::1]:{port}"),
+        // An address literal cannot be re-pointed: no configuration needed.
+        format!("10.1.2.3:{port}"),
         format!("traces.internal:{port}"),
         "TRACES.INTERNAL".to_string(),
     ] {
@@ -909,7 +911,6 @@ async fn the_host_header_is_checked_on_a_loopback_api() {
     for host in [
         format!("evil.example:{port}"),
         "evil.example".to_string(),
-        format!("10.1.2.3:{port}"),
         "localhost.evil.example".to_string(),
         String::new(),
     ] {
@@ -924,7 +925,7 @@ async fn the_host_header_is_checked_on_a_loopback_api() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_host_check_is_off_on_a_non_loopback_bind_without_names() {
+async fn the_host_check_is_on_for_a_non_loopback_bind_without_names() {
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts(dir.path());
     o.api_addr = "0.0.0.0:0".parse().unwrap();
@@ -932,10 +933,11 @@ async fn the_host_check_is_off_on_a_non_loopback_bind_without_names() {
     let api = SocketAddr::from(([127, 0, 0, 1], server.api_addr().port()));
     assert_eq!(
         http_host(api, "anything.example", "/healthz").await.status,
-        200
+        421
     );
+    assert_eq!(http_host(api, "10.9.8.7", "/healthz").await.status, 200);
     server.shutdown().await.unwrap();
-    // With names configured it is on again.
+    // With names configured, those are answered too.
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts(dir.path());
     o.api_addr = "0.0.0.0:0".parse().unwrap();

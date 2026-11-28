@@ -118,15 +118,15 @@ check_search() {
 
 # --- annotations ---------------------------------------------------------------
 
-# Three traces from the listing of the last check (newest first) and a span of
+# Four traces from the listing of the last check (newest first) and a span of
 # the first, read from its trace view before it has any annotation.
 pick_traces() {
   set -- $ids
-  [ $# -ge 3 ] || fail "annotations: the listing has fewer than three traces"
-  T1=$1 T2=$2 T3=$3
+  [ $# -ge 4 ] || fail "annotations: the listing has fewer than four traces"
+  T1=$1 T2=$2 T3=$3 T4=$4
   SPAN1=$(curl -fsS "http://$API/api/v1/traces/$T1" | grep -o '"span_id":"[0-9a-f]*"' | head -n 1 | cut -d'"' -f4)
   [ -n "$SPAN1" ] || fail "annotations: trace $T1 shows no span"
-  echo "annotating traces $T1, $T2 and $T3 (span $SPAN1 of the first)"
+  echo "annotating traces $T1, $T2, $T3 and $T4 (span $SPAN1 of the first)"
 }
 
 # Drops the white space of a JSON text, so that a match does not depend on how
@@ -165,6 +165,10 @@ post_annotations() {
   post_ann_ok "$(ann "$T1" '"span_id":"'"$SPAN1"'","name":"thumbs","label":"down","comment":"off-topic"')"
   post_ann_ok "$(ann "$T2" '"name":"quality","source":"e2e","value":0.8')"
   post_ann_ok "$(ann "$T2" '"name":"quality","source":"e2e","delete":true')"
+  # Trace 4 has a high score and the label up: the filters for a low score and
+  # for the label down must not list it.
+  post_ann_ok "$(ann "$T4" '"name":"quality","source":"e2e","value":0.9')"
+  post_ann_ok "$(ann "$T4" '"name":"thumbs","label":"up"')"
   # One valid item and one for a trace the server does not have.
   RND=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
   post_ann '{"annotations":[{"trace_id":"'"$T1"'","name":"checked","label":"yes"},{"trace_id":"'"$RND"'","name":"checked","label":"yes"}]}'
@@ -191,7 +195,7 @@ lists_has() {
     fail "$1: the listing for '$2' should have trace $3: $4, but has it: $have. Answer: $(head -c 2000 "$OUT/list")"
 }
 
-# Needs: T1 T2 T3 SPAN1. The annotations are in the trace view and the list in
+# Needs: T1 T2 T3 T4 SPAN1. The annotations are in the trace view and the list in
 # every state: in the memory buffer after the writes, from the replayed log
 # after kill -9, from parts after a clean stop.
 check_annotations() {
@@ -217,12 +221,24 @@ check_annotations() {
   v3=$(curl -fsS "http://$API/api/v1/traces/$T3" | compact)
   case $v3 in *'"annotations":['*) fail "$label: trace $T3 shows annotations, but every write for it was refused: $v3" ;; esac
 
+  # Each filter must keep what passes it and drop what does not: a server that
+  # ignored one of them would list a trace marked "no" here.
   lists_has "$label" 'annotation=quality&annotation_max=0.5' "$T1" yes
   lists_has "$label" 'annotation=quality&annotation_max=0.5' "$T2" no
   lists_has "$label" 'annotation=quality&annotation_max=0.5' "$T3" no
+  lists_has "$label" 'annotation=quality&annotation_max=0.5' "$T4" no
   lists_has "$label" 'annotation=quality&annotation_min=0.5' "$T1" no
+  lists_has "$label" 'annotation=quality&annotation_min=0.5' "$T4" yes
   lists_has "$label" 'annotation=thumbs&annotation_label=down' "$T1" yes
-  echo "ok: $label: annotations of trace $T1 (overwrite, span-level, checked), delete on $T2, no change on $T3, annotation filters"
+  lists_has "$label" 'annotation=thumbs&annotation_label=down' "$T4" no
+  lists_has "$label" 'annotation=thumbs&annotation_label=up' "$T4" yes
+  lists_has "$label" 'annotation=thumbs&annotation_label=up' "$T1" no
+  # Trace 2's quality was deleted: it is not listed for it, with or without a
+  # source or a value.
+  lists_has "$label" 'annotation=quality' "$T1" yes
+  lists_has "$label" 'annotation=quality' "$T2" no
+  lists_has "$label" 'annotation=quality&annotation_source=e2e' "$T2" no
+  echo "ok: $label: annotations of trace $T1 (overwrite, span-level, checked), delete on $T2, no change on $T3, annotation filters (max, min, label, deleted)"
 }
 
 # need_stat NAME: the value of a number in /api/v1/stats; fails by name when

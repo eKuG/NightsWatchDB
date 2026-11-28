@@ -2,20 +2,50 @@
 //! answers.
 
 use super::body::JsonBody;
-use super::{Api, ApiError, Slot, json_response, now_ns};
+use super::{Api, ApiError, Slot, json_response, json_str, now_ns, short};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use nwdb_core::{SpanId, TraceId};
 use nwdb_engine::Annotation;
-use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::fmt;
+use std::io::{self, Write};
+use std::marker::PhantomData;
 use tokio::sync::oneshot;
 
 /// Items in one request; the engine's limit.
 const MAX_ITEMS: usize = 1000;
+/// Bytes of a parse error that a 400 repeats; a parse error can quote the
+/// offending text.
+const ERROR_DETAIL: usize = 160;
+
+/// A `T` that is read from a JSON object only. serde builds a derived struct
+/// from a JSON array as well, field by field, and `deny_unknown_fields` does
+/// not apply to that form; this wrapper asks for a map, so an array is an
+/// error, and then lets `T` read the map as usual.
+struct Object<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = T;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map))
+            }
+        }
+        d.deserialize_map(V(PhantomData)).map(Object)
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,8 +85,8 @@ fn items<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Item>, D::Error> {
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<Item>, A::Error> {
             let mut out = Vec::new();
             while out.len() < MAX_ITEMS {
-                match seq.next_element::<Item>()? {
-                    Some(item) => out.push(item),
+                match seq.next_element::<Object<Item>>()? {
+                    Some(item) => out.push(item.0),
                     None => return Ok(out),
                 }
             }
@@ -71,12 +101,30 @@ fn items<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Item>, D::Error> {
     d.deserialize_seq(V)
 }
 
+/// serde_json's message without the " at line L column C" it ends with.
+fn without_position(e: &serde_json::Error) -> String {
+    let text = e.to_string();
+    let suffix = format!(" at line {} column {}", e.line(), e.column());
+    match text.strip_suffix(&suffix) {
+        Some(m) => m.to_owned(),
+        None => text,
+    }
+}
+
 fn parse(body: &[u8]) -> Result<Vec<Item>, ApiError> {
     if body.is_empty() {
         return Err(ApiError::bad("the request body is empty"));
     }
-    let req: Req = serde_json::from_slice(body)
-        .map_err(|e| ApiError::bad(format!("not a valid annotation request: {e}")))?;
+    let Object(req): Object<Req> = serde_json::from_slice(body).map_err(|e| {
+        // The message can quote the text that did not fit; the reply must not
+        // grow with the request.
+        ApiError::bad(format!(
+            "not a valid annotation request: {} (line {}, column {})",
+            short(&without_position(&e), ERROR_DETAIL),
+            e.line(),
+            e.column()
+        ))
+    })?;
     if req.annotations.is_empty() {
         return Err(ApiError::bad("`annotations` must not be empty"));
     }
@@ -125,6 +173,9 @@ pub(super) async fn annotate(
     JsonBody(body): JsonBody,
 ) -> Result<Response, ApiError> {
     let items = parse(&body)?;
+    // The items own their text; the body is not needed while they are checked
+    // and logged.
+    drop(body);
     let now = now_ns();
     let mut rejected: Vec<(usize, String)> = Vec::new();
     let mut valid = Vec::with_capacity(items.len());
@@ -180,28 +231,50 @@ pub(super) async fn annotate(
     ))
 }
 
-/// One annotation as the API shows it.
-fn annotation_json(a: &Annotation) -> Value {
-    let mut m = Map::new();
-    if let Some(s) = a.span_id {
-        m.insert("span_id".into(), s.to_string().into());
-    }
-    m.insert("name".into(), a.name.as_str().into());
-    if !a.source.is_empty() {
-        m.insert("source".into(), a.source.as_str().into());
-    }
-    m.insert("time_ns".into(), a.time_ns.into());
-    if let Some(v) = a.value {
-        m.insert("value".into(), v.into());
-    }
-    for (k, v) in [("label", &a.label), ("comment", &a.comment)] {
-        if let Some(v) = v {
-            m.insert(k.into(), v.as_str().into());
+/// The annotations of one trace as a JSON array. The keys are in the order
+/// of the keys of an object serde_json builds (alphabetical). A list shows no
+/// comments.
+pub(super) fn write_annotations(
+    out: &mut dyn Write,
+    list: &[Annotation],
+    comments: bool,
+) -> io::Result<()> {
+    out.write_all(b"[")?;
+    for (i, a) in list.iter().enumerate() {
+        if i > 0 {
+            out.write_all(b",")?;
         }
+        write_annotation(out, a, comments)?;
     }
-    Value::Object(m)
+    out.write_all(b"]")
 }
 
-pub(super) fn annotations_json(list: &[Annotation]) -> Value {
-    Value::Array(list.iter().map(annotation_json).collect())
+fn write_annotation(out: &mut dyn Write, a: &Annotation, comment: bool) -> io::Result<()> {
+    out.write_all(b"{")?;
+    let mut sep = "";
+    if comment && let Some(c) = &a.comment {
+        out.write_all(b"\"comment\":")?;
+        json_str(out, c)?;
+        sep = ",";
+    }
+    if let Some(l) = &a.label {
+        write!(out, "{sep}\"label\":")?;
+        json_str(out, l)?;
+        sep = ",";
+    }
+    write!(out, "{sep}\"name\":")?;
+    json_str(out, &a.name)?;
+    if !a.source.is_empty() {
+        out.write_all(b",\"source\":")?;
+        json_str(out, &a.source)?;
+    }
+    if let Some(s) = a.span_id {
+        write!(out, ",\"span_id\":\"{s}\"")?;
+    }
+    write!(out, ",\"time_ns\":{}", a.time_ns)?;
+    if let Some(v) = a.value {
+        out.write_all(b",\"value\":")?;
+        serde_json::to_writer(&mut *out, &v).map_err(io::Error::from)?;
+    }
+    out.write_all(b"}")
 }

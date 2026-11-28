@@ -68,18 +68,55 @@ impl Resp {
     }
 }
 
+impl Resp {
+    /// The `error` text of a JSON error reply.
+    pub fn error(&self) -> String {
+        self.json()["error"].as_str().unwrap().to_owned()
+    }
+}
+
 /// One request with `Connection: close`. `headers` are the lines sent after
-/// `Host: localhost`, each ending in `\r\n`.
+/// `Host: localhost` (unless they name a `Host` themselves), each ending in
+/// `\r\n`.
 pub fn http_blocking(addr: SocketAddr, method: &str, target: &str, headers: &str) -> Resp {
+    http_body_blocking(addr, method, target, headers, None, None)
+}
+
+/// [`http_blocking`] with a body. A body is sent with a `Content-Length` of
+/// its own length, or of `declared` when that is given, so that a test can
+/// announce more than it sends. A server that refuses the request may close
+/// before it has read all of the body; that is not an error here.
+pub fn http_body_blocking(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &str,
+    body: Option<&[u8]>,
+    declared: Option<usize>,
+) -> Resp {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    write!(
-        s,
-        "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{headers}Connection: close\r\n\r\n"
-    )
-    .unwrap();
+    let mut head = format!("{method} {target} HTTP/1.1\r\n");
+    if !headers.to_ascii_lowercase().contains("host:") {
+        head.push_str("Host: localhost\r\n");
+    }
+    head.push_str(headers);
+    if let Some(body) = body {
+        head.push_str(&format!(
+            "Content-Length: {}\r\n",
+            declared.unwrap_or(body.len())
+        ));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+    s.write_all(head.as_bytes()).unwrap();
+    if let Some(body) = body {
+        let _ = s.write_all(body);
+    }
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap();
+    let read = s.read_to_end(&mut raw);
+    if body.is_none() {
+        read.unwrap();
+    }
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     let head = String::from_utf8(raw[..split].to_vec()).unwrap();
     let status = head.split(' ').nth(1).unwrap().parse().unwrap();
@@ -95,10 +132,23 @@ pub fn http_blocking(addr: SocketAddr, method: &str, target: &str, headers: &str
 }
 
 pub async fn http(addr: SocketAddr, method: &str, target: &str, headers: &str) -> Resp {
+    http_body(addr, method, target, headers, None, None).await
+}
+
+pub async fn http_body(
+    addr: SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &str,
+    body: Option<Vec<u8>>,
+    declared: Option<usize>,
+) -> Resp {
     let (method, target, headers) = (method.to_owned(), target.to_owned(), headers.to_owned());
-    tokio::task::spawn_blocking(move || http_blocking(addr, &method, &target, &headers))
-        .await
-        .unwrap()
+    tokio::task::spawn_blocking(move || {
+        http_body_blocking(addr, &method, &target, &headers, body.as_deref(), declared)
+    })
+    .await
+    .unwrap()
 }
 
 // ---- HTTP/2 client ----

@@ -447,7 +447,9 @@ func frac(n, den int) int {
 
 // buildAnnotations picks, with the seed, 10% of the ids for a quality
 // annotation (value uniform in [0,1), label good from 0.5, else bad) and 1%
-// for a human annotation (label down). The same ids and seed always give the
+// for a human annotation (label down). The two sets are disjoint: the quality
+// ones are the first of one permutation of the ids and the human ones the last
+// (with a single id, both are that one). The same ids and seed always give the
 // same items. It also returns the ids that got a quality annotation.
 func buildAnnotations(ids []string, seed int64) (items []annotation, annotated []string) {
 	rng := rand.New(rand.NewSource(seed))
@@ -461,7 +463,7 @@ func buildAnnotations(ids []string, seed int64) (items []annotation, annotated [
 		items = append(items, annotation{TraceID: ids[i], Name: "quality", Source: "bench", Value: &v, Label: label})
 		annotated = append(annotated, ids[i])
 	}
-	for _, i := range perm[:frac(len(ids), 100)] {
+	for _, i := range perm[len(perm)-frac(len(ids), 100):] {
 		items = append(items, annotation{TraceID: ids[i], Name: "human", Source: "bench", Label: "down"})
 	}
 	return items, annotated
@@ -610,6 +612,7 @@ func realMain() error {
 	seed := flag.Int64("seed", 1, "seed for choosing trace ids")
 	conc := flag.Int("concurrency", 1, "requests in flight")
 	annotate := flag.Bool("annotate", true, "after the other kinds, write annotations and time the queries that use them (false for a server without annotations)")
+	annotateOnly := flag.Bool("annotate-only", false, "run only the annotation phase, with the queries that use the annotations (the second half of a run whose first half was -annotate=false)")
 	wait := flag.String("wait", "", "URL: poll until it answers 200, print the Unix ns of the answer, and exit")
 	elapsed := flag.Bool("elapsed", false, "with two arguments STARTED READY_NS: print the milliseconds between them")
 	flag.Parse()
@@ -678,36 +681,38 @@ func realMain() error {
 	add := func(k string, req func(int) (string, url.Values)) {
 		kinds = append(kinds, run(c, k, *warm, *n, *conc, req))
 	}
-	add("open_trace", func(i int) (string, url.Values) { return "/api/v1/traces/" + pick[i], nil })
-	add("list_newest_50", list(nil))
-	add("list_service_50", list(url.Values{"service": {service}}))
-	add("list_model_50", list(url.Values{"model": {model}}))
-	add("list_error_50", list(url.Values{"error": {"true"}}))
-	add("tokens_range", tokens(*from, *to))
-	add("tokens_hour", tokens(*hourFrom, *hourFrom+hourNs))
-	// The queries of the earlier experiment, with its parameters.
-	add("exp_list1", listIn(exp.FromNs, exp.ToNs, url.Values{"service": {exp.Service}}))
-	add("exp_list2", listIn(exp.FromNs, exp.ToNs, url.Values{"model": {exp.Model}, "error": {"true"}}))
-	add("exp_agg", tokensOp(exp.FromNs, exp.ToNs, "chat"))
-	// Search of message text, newest 20 spans of the whole range (without
-	// from and to the server searches the last hour only). A dataset without
-	// text answers with no spans; the bytes column shows which.
-	search := func(q string) func(int) (string, url.Values) {
-		return func(int) (string, url.Values) {
-			return "/api/v1/search", url.Values{"q": {q}, "from": {ns(*from)}, "to": {ns(*to)}, "limit": {"20"}}
+	if !*annotateOnly {
+		add("open_trace", func(i int) (string, url.Values) { return "/api/v1/traces/" + pick[i], nil })
+		add("list_newest_50", list(nil))
+		add("list_service_50", list(url.Values{"service": {service}}))
+		add("list_model_50", list(url.Values{"model": {model}}))
+		add("list_error_50", list(url.Values{"error": {"true"}}))
+		add("tokens_range", tokens(*from, *to))
+		add("tokens_hour", tokens(*hourFrom, *hourFrom+hourNs))
+		// The queries of the earlier experiment, with its parameters.
+		add("exp_list1", listIn(exp.FromNs, exp.ToNs, url.Values{"service": {exp.Service}}))
+		add("exp_list2", listIn(exp.FromNs, exp.ToNs, url.Values{"model": {exp.Model}, "error": {"true"}}))
+		add("exp_agg", tokensOp(exp.FromNs, exp.ToNs, "chat"))
+		// Search of message text, newest 20 spans of the whole range (without
+		// from and to the server searches the last hour only). A dataset without
+		// text answers with no spans; the bytes column shows which.
+		search := func(q string) func(int) (string, url.Values) {
+			return func(int) (string, url.Values) {
+				return "/api/v1/search", url.Values{"q": {q}, "from": {ns(*from)}, "to": {ns(*to)}, "limit": {"20"}}
+			}
 		}
+		add("search_word", search("traceback"))
+		add("search_common_word", search("error"))
+		add("search_and", search("error timeout"))
+		add("search_or", search("timeout OR retry"))
+		add("search_not", search("error -import"))
+		add("search_phrase", search(`"not found"`))
+		add("search_prefix", search("config*"))
+		add("search_no_hit", search("zqxjkvw"))
 	}
-	add("search_word", search("traceback"))
-	add("search_common_word", search("error"))
-	add("search_and", search("error timeout"))
-	add("search_or", search("timeout OR retry"))
-	add("search_not", search("error -import"))
-	add("search_phrase", search(`"not found"`))
-	add("search_prefix", search("config*"))
-	add("search_no_hit", search("zqxjkvw"))
 
 	var ann *annReport
-	if *annotate {
+	if *annotate || *annotateOnly {
 		items, annotated := buildAnnotations(ids, *seed)
 		fmt.Fprintf(os.Stderr, "annotating: %d items on %d traces\n", len(items), len(annotated))
 		r, err := c.annotate(items, 500)

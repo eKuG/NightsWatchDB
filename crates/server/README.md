@@ -17,13 +17,20 @@ model output. For that reason both listeners default to the loopback address
 
 - **Host check.** A web page can make a browser send requests to
   `127.0.0.1` under the page's own host name (DNS rebinding) and read the
-  answers. The API therefore refuses, with 421 and a JSON error, every request
-  whose `Host` header (port ignored) is not `localhost`, a loopback IP address,
-  the IP address the API is bound to, or a name from `--api-allowed-hosts`.
-  If the API is bound to a non-loopback address and no allowed hosts are
-  configured, the check is **off**: whoever exposed it did so on purpose, and
-  the server cannot know which names reach it. Set `--api-allowed-hosts`
-  whenever the API is reachable by a name other than an IP address.
+  answers, and write, because such a request is same-origin and needs no
+  preflight. The check is **always on**, whatever address the API listens on:
+  every request (`/healthz` and `/api/v1/stats` included) whose `Host` header
+  is not allowed is refused with 421 and a JSON error that names
+  `--api-allowed-hosts`. Allowed without any configuration: `localhost` and an
+  IP address literal (IPv4, or IPv6 in brackets), each with or without a
+  port. A rebinding attack needs a DNS name in `Host`, and a literal or
+  `localhost` cannot be pointed somewhere else. Every other name is allowed
+  only if it is listed in `--api-allowed-hosts`. The port is ignored; case is
+  ignored; one trailing dot is ignored (`Traces.Internal.:80` is
+  `traces.internal`); there are no wildcards, and a subdomain of a listed name
+  is not listed. A missing or empty `Host` is refused. Anything that reaches the
+  API by a name has to list it: a container reached by its name on a Docker
+  network (`http://nwdb:4320`) needs `--api-allowed-hosts nwdb`.
 - **The write endpoint.** `POST /api/v1/annotations` is the only way to write
   through the API. With no authentication, any local client that passes the
   rules below can attach annotations (scores, labels, comments) to traces that
@@ -31,8 +38,9 @@ model output. For that reason both listeners default to the loopback address
   the list show. It cannot create, change or delete traces or spans, and it
   cannot annotate a trace the server does not hold.
 - **Cross-site requests to write endpoints.** Write endpoints take a POST with
-  a JSON body. A web page can make a browser send a POST to `127.0.0.1` with the
-  right `Host`, so the host check does not stop it. The defence is to refuse
+  a JSON body. A web page of another site can make a browser send a POST to
+  `127.0.0.1:4320` itself, which carries a `Host` the check allows, so the host
+  check does not stop it. The defence is to refuse
   every request a page can send across sites without a CORS preflight, and to
   never answer a preflight with permission: no response of the API carries an
   `Access-Control-*` header, and an `OPTIONS` request is answered 405 (404 on
@@ -47,11 +55,16 @@ model output. For that reason both listeners default to the loopback address
   authentication, anything on the machine that can reach the port can still
   write.
 - **Docker.** The container image listens on `0.0.0.0` inside the container,
-  so the published port is the access control. Publish the ports on the
-  loopback address only: `-p 127.0.0.1:4317:4317 -p 127.0.0.1:4320:4320`.
-  `-p 4320:4320` publishes to every interface of the host. The host check does
-  not protect that case (see above); a network firewall or `-p 127.0.0.1:...`
-  does.
+  so the published port is the access control for other machines. Publish the
+  ports on the loopback address only: `-p 127.0.0.1:4317:4317 -p
+  127.0.0.1:4320:4320`. `-p 4320:4320` publishes to every interface of the
+  host, and anything that can reach it can read and write (there is no
+  authentication); a network firewall or `-p 127.0.0.1:...` is what stops that.
+  The host check is on in the container too, so a web page in the user's own
+  browser cannot reach a port published on the loopback address through a
+  rebound name; reached by the address or `localhost` it works as before. A
+  client that uses another name sets `NWDB_API_ALLOWED_HOSTS` (see the Docker
+  network case above).
 - **Files.** A data directory that the server creates has mode 0700. An
   existing directory is not changed.
 
@@ -93,7 +106,7 @@ Both `--flag value` and `--flag=value` work.
 | `--data-dir` | `NWDB_DATA_DIR` | `./data` |
 | `--otlp-grpc-addr` | `NWDB_OTLP_GRPC_ADDR` | `127.0.0.1:4317` |
 | `--api-addr` | `NWDB_API_ADDR` | `127.0.0.1:4320` |
-| `--api-allowed-hosts` | `NWDB_API_ALLOWED_HOSTS` | none; comma-separated host names |
+| `--api-allowed-hosts` | `NWDB_API_ALLOWED_HOSTS` | none; comma-separated host names besides `localhost` and IP address literals, which are always allowed (see Security) |
 | `--accept-lost-log` | `NWDB_ACCEPT_LOST_LOG` | off; a switch (the variable is `1`, `true`, `0` or `false`) |
 | `--retention` | `NWDB_RETENTION` | unset: keep everything; otherwise a positive whole number and a unit `s`, `m`, `h` or `d`, such as `7d` |
 | `--no-compaction` | `NWDB_NO_COMPACTION` | off; a switch like `--accept-lost-log`: do not merge parts |
@@ -303,7 +316,8 @@ What remains **outside** the budget, and its bound:
 The API speaks HTTP/1.1 only. It serves at most 256 connections at once (more
 wait in the accept queue), gives a client 10 s to send the request headers,
 and runs at most 64 requests at once (more wait), except `/healthz` and
-`/api/v1/stats`, which answer from memory and never wait for a slot. A request
+`/api/v1/stats`, which answer from memory and never wait for a slot (they
+pass the `Host` check like every other request). A request
 holds its slot until its response has been sent, and also as long as work for it
 is running: a query that was started keeps the slot until it has finished even
 if the client has gone, and the task that renders a trace keeps it for as long
@@ -316,8 +330,9 @@ task that renders the response ends, and its rows and its slot are freed. A
 client that reads slowly but steadily is not cut off.
 
 **Write requests.** `/api/v1/annotations` takes a POST and every other route a
-GET. A path that takes a POST answers 405 to a GET, and every other path
-answers 405 to a POST. A handler of a write path receives the body through
+GET. A path that takes a POST answers 405 to a GET; a path of the API that
+takes only GET answers 405 to a POST; a path that does not exist answers 404
+whatever the method. A handler of a write path receives the body through
 `JsonBody` (in `src/api/body.rs`), which applies these rules after the `Host`
 check and after the request has its concurrency slot, so the bodies held in
 memory at one time are at most the limit x 64 slots. The body is handed over as
@@ -328,12 +343,16 @@ UTF-8 or for a `Content-Encoding` other than `identity` (the API does not
 decompress), 413 for a body over the limit, 408 for a body not received in
 time. A `Content-Length` over the limit is refused before any byte of the body
 is read; a body without one (chunked) is read up to the limit and refused once
-it passes it. A sender that has to be cut off for 408 or 413 has its
-connection closed after the response.
+it passes it. A 408 or a 413 carries `Connection: close` and the connection
+ends after the response, whatever of the body was already received. A 403 or a
+415 does not close the connection by itself: the body is not read, and when it
+was sent whole the next request on the connection is served; when the rest of
+the body has not arrived, the connection ends after the response.
 
 | Limit | Default |
 |---|---|
 | Request body (`api_max_body_bytes`) | 1 MiB; worst-case memory for bodies is limit x 64 slots, 64 MiB by default |
+| 64 concurrent annotate requests, each the largest (1000 items filling the 1 MiB body) | at most 3 x limit x 64 slots, 192 MiB by default: the body, the items parsed from it (the body is freed once it is parsed) and the annotations the engine keeps in its buffers until they are flushed. Measured: a peak of 112 MiB, 67 MiB of it kept by the engine's buffers afterwards (`tests/regressions_annotate_memory.rs`) |
 | Time to receive a whole request body (`api_body_timeout`) | 30 s from the moment the request has its slot, then 408 and the slot is freed |
 
 Neither has a command-line flag. The body timeout is a total, not a time
@@ -342,7 +361,10 @@ deadline like one that stops, so no sender holds a slot longer than the
 timeout.
 
 All responses are JSON, except `/healthz` and the protobuf form of a trace.
-Errors are always `{"error": "<message>"}`: 400 for bad input (including an
+Errors are always `{"error": "<message>"}`, and small whatever was sent: a
+message that would repeat the request is cut (at most 160 bytes of the text of
+a malformed body, with its line and column; at most 64 bytes of the name of an
+unknown parameter). 400 for bad input (including an
 unknown parameter name and percent-encoding that is wrong or not UTF-8), 404
 for a missing trace or path, 405 for a method the path does not take, 408, 413
 and 415 for write requests (above), 421 for a `Host`
@@ -408,7 +430,11 @@ holds at most 1000 annotations, ordered by span id (trace-level ones first),
 name, then source; when more exist the answer has `"annotations_truncated":
 true`. An annotation has `name`, `time_ns` and, when present, `span_id`,
 `source` (left out when empty), `value`, `label` and `comment`. The spans and
-the annotations are read from one snapshot. The protobuf form (below) has no
+the annotations are read from one snapshot. At most 1000 annotations of at
+most about 9.4 KB of JSON each (a comment of 4096 characters that JSON writes
+as two bytes each) make at most about 9.4 MB of JSON; they are written one at
+a time into the stream, never held as JSON, and their rows (at most about
+4.6 KB each) are held like the spans' rows. The protobuf form (below) has no
 annotations and is the same bytes with or without them.
 
 A span has `span_id`, `parent_span_id`, `name`, `kind`, `start_ns`, `end_ns`,
@@ -452,9 +478,22 @@ without a value passes neither), and `annotation_label`. The last four are
 refused with 400 without `annotation`, and `annotation_min` and
 `annotation_max` must be finite numbers (`inf`, `NaN` and `1e400` are 400).
 Every listed trace shows its annotations (all of them, not only the one that
-matched) as `annotations`, at most 32, with `"annotations_truncated": true`
-when there are more; both are left out when it has none. They are read from the
-snapshot the list was read from.
+matched) as `annotations`, **at most 8 and without their `comment`** (the trace
+view has the comments and up to 1000 annotations), with
+`"annotations_truncated": true` when there are more than 8; both are left out
+when it has none. They are read from the snapshot the list was read from. The
+reply is written trace by trace into the response (`Transfer-Encoding:
+chunked`) and never held as JSON; if the server fails in the middle, the
+connection is cut. **Worst case of one list reply:** an annotation of a list is
+at most about 1.1 KB of JSON (name, source and label of the longest length,
+made of characters JSON writes as two bytes), so the annotations of a trace are
+at most about 9 KB and the 1000 traces of the largest list about 9 MB; the
+summaries come on top (a few hundred bytes of ids and numbers, and the
+service, root name, session, user and model strings of the stored spans, which
+this server does not shorten). The heap one list request needs is the
+summaries, the 64 KiB chunks in flight (at most 5) and the 8 annotations rows
+of one trace: measured 0.45 MiB for that largest list, asserted below 2 MiB
+(`tests/regressions_list_reply_memory.rs`).
 
 ```sh
 curl 'http://127.0.0.1:4320/api/v1/traces?service=agent&error=true&limit=5'
@@ -497,9 +536,12 @@ nothing is written for: a body that is not JSON of this shape (an empty body, a
 wrong type, a missing `trace_id` or `name`, a field twice, a field that is not
 listed, text after the JSON, a number that is not a finite 64-bit float such as
 `1e400`, a `time_ns` that is not a 64-bit integer, a string with an unpaired
-surrogate), no items, and more than 1000 items (the list is read one item at a
-time and refused at the 1001st, which is not parsed, so a body of many small
-items is never built up). A problem in one item's own content is a **rejected
+surrogate), a body or an item that is not a JSON object (a JSON array in
+either place, which would otherwise be read field by field, is refused), no
+items, and more than 1000 items (the list is read one item at a time and
+refused at the 1001st, which is skipped without being built as an item, so a
+body of many small items is never built up). The message of such a 400 names the
+place (line and column) and quotes at most 160 bytes of what was wrong. A problem in one item's own content is a **rejected
 item**: the other items are still written. That is an id that is not hex of the
 right length or is all zeros, a name, label or comment that is too long or
 holds characters not allowed, a `value` with `delete`, no `value` or `label`,
@@ -519,7 +561,9 @@ its rejections instead).
 **Identity.** An annotation is identified by (trace, span or none, name,
 source). Writing one with an identity that exists replaces it as a whole, and
 the latest write wins; with `"delete": true` it removes it. A delete of an
-annotation that does not exist is accepted and does nothing. A trace must exist
+annotation that does not exist is accepted and stored as a delete record like
+any other: it takes space and costs a read until the time window of its trace
+expires, and changes nothing that is shown. A trace must exist
 for an annotation to be written: one that is sent before the trace's spans
 arrived (or after they expired) is rejected with `unknown trace`; retry it once
 the spans are in. An annotation is stored with the time window of its trace, so

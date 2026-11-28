@@ -4,7 +4,7 @@
 
 use axum::Router;
 use axum::extract::{Extension, RawQuery, Request, State};
-use axum::http::header::{ACCEPT, CONTENT_TYPE, HOST};
+use axum::http::header::{ACCEPT, CONNECTION, CONTENT_TYPE, HOST};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -43,14 +43,15 @@ const PROTOBUF: &str = "application/x-protobuf";
 const TRACE_PREFIX: &str = "/api/v1/traces/";
 /// Annotations a trace view shows; one more means `annotations_truncated`.
 const TRACE_ANNOTATIONS: usize = 1000;
-/// Annotations each trace of a list shows.
-const LIST_ANNOTATIONS: usize = 32;
+/// Annotations each trace of a list shows, without their comments; one more
+/// means `annotations_truncated`.
+const LIST_ANNOTATIONS: usize = 8;
 
 mod annotate;
 mod body;
 pub(crate) use body::BodyLimits;
 
-use annotate::annotations_json;
+use annotate::write_annotations;
 
 #[derive(Clone)]
 struct Api {
@@ -61,43 +62,30 @@ struct Api {
 
 /// Which `Host` headers the API answers to. A web page can make a browser send
 /// requests to the loopback address under its own host name (DNS rebinding)
-/// and then read the answers; those requests carry the page's host name.
+/// and then read the answers, and write, if the request is a same-origin one;
+/// those requests carry the page's host name. The check is always on: an IP
+/// address literal and `localhost` cannot be pointed somewhere else, so they
+/// need no configuration; any other name must be listed.
 pub(crate) struct HostCheck {
-    enabled: bool,
-    bound: IpAddr,
     allowed: Vec<String>,
 }
 
 impl HostCheck {
-    /// The check is on when the API listens on a loopback address, or when
-    /// the operator named hosts. An API exposed on another address with no
-    /// names configured was exposed on purpose, and we cannot guess its names.
-    pub(crate) fn new(bound: IpAddr, allowed: &[String]) -> Self {
+    pub(crate) fn new(allowed: &[String]) -> Self {
         let allowed: Vec<String> = allowed
             .iter()
             .map(|h| normalize(host_name(h.trim())))
             .filter(|h| !h.is_empty())
             .collect();
-        Self {
-            enabled: bound.is_loopback() || !allowed.is_empty(),
-            bound,
-            allowed,
-        }
+        Self { allowed }
     }
 
     fn allows(&self, host: Option<&HeaderValue>) -> bool {
-        if !self.enabled {
-            return true;
-        }
         let Some(host) = host.and_then(|h| h.to_str().ok()) else {
             return false;
         };
         let name = normalize(host_name(host));
-        name == "localhost"
-            || name
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback() || ip == self.bound)
-            || self.allowed.contains(&name)
+        name == "localhost" || name.parse::<IpAddr>().is_ok() || self.allowed.contains(&name)
     }
 }
 
@@ -108,7 +96,17 @@ fn normalize(name: &str) -> String {
 /// The host of a `Host` header value without its port.
 fn host_name(h: &str) -> &str {
     if let Some(inner) = h.strip_prefix('[') {
-        return inner.split(']').next().unwrap_or(inner);
+        return match inner.split_once(']') {
+            Some((ip, rest))
+                if rest.is_empty()
+                    || rest
+                        .strip_prefix(':')
+                        .is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                ip
+            }
+            _ => h,
+        };
     }
     if h.parse::<IpAddr>().is_ok() {
         return h;
@@ -253,7 +251,19 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        json_response(self.0, &json!({ "error": self.1 }))
+        let close = matches!(
+            self.0,
+            StatusCode::PAYLOAD_TOO_LARGE | StatusCode::REQUEST_TIMEOUT
+        );
+        let mut response = json_response(self.0, &json!({ "error": self.1 }));
+        // The sender is cut off: what is left of its body is not read as a
+        // request, and the connection ends after this response.
+        if close {
+            response
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("close"));
+        }
+        response
     }
 }
 
@@ -373,10 +383,26 @@ impl Params {
 
     fn finish(self) -> Result<(), ApiError> {
         match self.0.first() {
-            Some((k, _)) => Err(ApiError::bad(format!("unknown parameter `{k}`"))),
+            Some((k, _)) => Err(ApiError::bad(format!(
+                "unknown parameter `{}`",
+                short(k, 64)
+            ))),
             None => Ok(()),
         }
     }
+}
+
+/// At most `max` bytes of `s`, cut on a character boundary, with `...` when
+/// something was cut. Used wherever a reply would repeat what a client sent.
+pub(crate) fn short(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
 }
 
 fn now_ns() -> i64 {
@@ -525,11 +551,21 @@ async fn get_trace(
             Ok((batches, annotations, more))
         })
         .await?;
-    // The JSON is written by a blocking task and sent in chunks through a
-    // small channel, so a trace is never held as JSON. A client that is slow
-    // holds the task back; one that is gone, or that makes no progress for
-    // the write timeout (the connection is then closed), ends it. The task
-    // holds the slot as long as it holds the rows.
+    Ok(stream(slot, move |out| {
+        render_trace(trace_id, &batches, &annotations, more, out)
+    }))
+}
+
+/// Sends what `render` writes as the body of a 200 JSON response. The JSON is
+/// written by a blocking task and sent in chunks through a small channel, so
+/// a reply is never held as JSON. A client that is slow holds the task back;
+/// one that is gone, or that makes no progress for the write timeout (the
+/// connection is then closed), ends it. The task holds the slot as long as it
+/// holds the rows it renders.
+fn stream(
+    slot: Slot,
+    render: impl FnOnce(&mut dyn Write) -> io::Result<()> + Send + 'static,
+) -> Response {
     let (tx, rx) = mpsc::channel(CHUNKS_IN_FLIGHT);
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
@@ -537,8 +573,7 @@ async fn get_trace(
             tx,
             buf: Vec::with_capacity(CHUNK),
         };
-        let result = render_trace(trace_id, &batches, &annotations, more, &mut out)
-            .and_then(|()| out.flush());
+        let result = render(&mut out).and_then(|()| out.flush());
         if let Err(e) = result {
             // A failure other than the client leaving ends the body with an
             // error, so that the client sees a cut-off response and not a
@@ -548,12 +583,12 @@ async fn get_trace(
             }
         }
     });
-    Ok((
+    (
         StatusCode::OK,
         [(CONTENT_TYPE, "application/json")],
         axum::body::Body::new(Chunks(rx)),
     )
-        .into_response())
+        .into_response()
 }
 
 /// The spans of a trace in `snapshot`; not found when it has none.
@@ -644,8 +679,7 @@ fn render_trace(
     out.write_all(b"]")?;
     if !annotations.is_empty() {
         out.write_all(b",\"annotations\":")?;
-        serde_json::to_writer(&mut *out, &annotations_json(annotations))
-            .map_err(io::Error::from)?;
+        write_annotations(out, annotations, true)?;
         if more {
             out.write_all(b",\"annotations_truncated\":true")?;
         }
@@ -813,25 +847,28 @@ async fn list_traces(
         limit,
     };
     p.finish()?;
-    // The annotations come from the snapshot the listing was read from.
-    let traces = api
-        .run(slot, move |e| {
+    // The annotations come from the snapshot the listing was read from, and
+    // are read and written one trace at a time.
+    let (snapshot, traces) = api
+        .run(slot.clone(), move |e| {
             let snapshot = e.snapshot();
-            snapshot
-                .list_traces(&query)?
-                .into_iter()
-                .map(|t| {
-                    let (a, more) = snapshot.annotations(t.trace_id, LIST_ANNOTATIONS)?;
-                    Ok((t, a, more))
-                })
-                .collect::<nwdb_core::Result<Vec<_>>>()
+            let traces = snapshot.list_traces(&query)?;
+            Ok((snapshot, traces))
         })
         .await?;
-    let traces: Vec<Value> = traces
-        .iter()
-        .map(|(t, a, more)| summary_json(t, a, *more))
-        .collect();
-    Ok(json_response(StatusCode::OK, &json!({ "traces": traces })))
+    Ok(stream(slot, move |out| {
+        out.write_all(b"{\"traces\":[")?;
+        for (i, t) in traces.iter().enumerate() {
+            if i > 0 {
+                out.write_all(b",")?;
+            }
+            let (a, more) = snapshot
+                .annotations(t.trace_id, LIST_ANNOTATIONS)
+                .map_err(io::Error::other)?;
+            write_summary(out, t, &a, more)?;
+        }
+        out.write_all(b"]}")
+    }))
 }
 
 /// `GET /api/v1/search?q=...&from=&to=&limit=`: the newest spans whose text
@@ -892,7 +929,13 @@ async fn search(
     ))
 }
 
-fn summary_json(s: &TraceSummary, annotations: &[Annotation], more: bool) -> Value {
+/// One listed trace: its summary, then its annotations without comments.
+fn write_summary(
+    out: &mut dyn Write,
+    s: &TraceSummary,
+    annotations: &[Annotation],
+    more: bool,
+) -> io::Result<()> {
     let mut m = Map::new();
     m.insert("trace_id".into(), s.trace_id.to_string().into());
     m.insert("start_ns".into(), (s.start_ns as u64).into());
@@ -912,13 +955,17 @@ fn summary_json(s: &TraceSummary, annotations: &[Annotation], more: bool) -> Val
     m.insert("input_tokens".into(), s.input_tokens.into());
     m.insert("output_tokens".into(), s.output_tokens.into());
     m.insert("models".into(), json!(s.models));
+    let mut text = serde_json::to_vec(&Value::Object(m)).map_err(io::Error::from)?;
+    text.pop(); // the closing brace: the annotations follow
+    out.write_all(&text)?;
     if !annotations.is_empty() {
-        m.insert("annotations".into(), annotations_json(annotations));
+        out.write_all(b",\"annotations\":")?;
+        write_annotations(out, annotations, false)?;
         if more {
-            m.insert("annotations_truncated".into(), true.into());
+            out.write_all(b",\"annotations_truncated\":true")?;
         }
     }
-    Value::Object(m)
+    out.write_all(b"}")
 }
 
 async fn tokens(
@@ -1021,43 +1068,41 @@ mod tests {
 
     #[test]
     fn host_check() {
-        let allows = |bound: &str, allowed: &[&str], host: &str| {
+        let allows = |allowed: &[&str], host: &str| {
             let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
-            HostCheck::new(bound.parse().unwrap(), &allowed)
-                .allows(Some(&HeaderValue::from_str(host).unwrap()))
+            HostCheck::new(&allowed).allows(Some(&HeaderValue::from_str(host).unwrap()))
         };
+        // Always allowed: localhost and IP address literals, any port.
         for host in [
             "localhost",
             "LOCALHOST:4320",
             "localhost.",
             "127.0.0.1:1",
             "127.9.9.9",
+            "10.0.0.5",
+            "10.0.0.5:4320",
             "[::1]:4320",
+            "[::1]",
+            "[2001:db8::1]:80",
         ] {
-            assert!(allows("127.0.0.1", &[], host), "{host}");
+            assert!(allows(&[], host), "{host}");
         }
+        // Every other name needs to be listed, whatever the bind address.
         for host in [
             "evil.example",
             "evil.example:4320",
-            "10.0.0.5",
             "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "[::1]evil",
+            "[::1",
             "",
         ] {
-            assert!(!allows("127.0.0.1", &[], host), "{host}");
+            assert!(!allows(&[], host), "{host}");
         }
-        assert!(allows(
-            "127.0.0.1",
-            &["Traces.Internal"],
-            "traces.internal:80"
-        ));
-        // Bound to a LAN address: that literal address is accepted.
-        assert!(allows("10.0.0.5", &["x"], "10.0.0.5:4320"));
-        assert!(!allows("10.0.0.5", &["x"], "10.0.0.6"));
-        // Off when exposed on purpose with nothing configured.
-        assert!(allows("0.0.0.0", &[], "anything.example"));
-        assert!(!allows("0.0.0.0", &["a.example"], "anything.example"));
-        let check = HostCheck::new("127.0.0.1".parse().unwrap(), &[]);
-        assert!(!check.allows(None));
+        assert!(allows(&["Traces.Internal"], "traces.internal:80"));
+        assert!(allows(&["traces.internal."], "TRACES.internal."));
+        assert!(!allows(&["traces.internal"], "other.internal"));
+        assert!(!HostCheck::new(&[]).allows(None));
     }
 
     /// A query that was started keeps its slot until it has finished, even if

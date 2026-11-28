@@ -1,5 +1,7 @@
-//! One `GET /api/v1/traces?limit=1000` holds hundreds of MiB once the listed
-//! traces carry annotations.
+//! One `GET /api/v1/traces?limit=1000` needs a small, bounded heap and has a
+//! bounded size, however many annotations the traces carry and however large
+//! they are: a listed trace shows at most 8 annotations without their
+//! comments, and the reply is written trace by trace.
 
 mod common;
 
@@ -19,10 +21,18 @@ use std::time::Duration;
 static ALLOC: Counting = Counting;
 
 const TRACES: u32 = 1000;
-/// What the list shows per trace.
+/// What is stored per trace: four times what the list shows.
 const PER_TRACE: usize = 32;
-/// The memory bound the README gives for write requests: 64 slots x 1 MiB.
-const BOUND: isize = 64 << 20;
+/// The heap one list request may need: 2 MiB. The reply is written in chunks
+/// of 64 KiB with at most 4 waiting and one being filled (320 KiB), plus the
+/// 1000 summaries and the 8 annotations of the trace being written (the
+/// largest annotation read is 4.6 KB); about 0.45 MiB is measured. Before the
+/// reply was streamed it was 983 MiB.
+const BOUND: isize = 2 << 20;
+/// The largest reply: per trace at most 8 annotations of at most 1.1 KB each
+/// (name, source and label made of characters that JSON writes as two) and a
+/// summary of a few hundred bytes. About 8.9 MB is measured.
+const MAX_REPLY: usize = 1000 * 10 * 1024;
 
 fn trace_id(i: u32) -> [u8; 16] {
     let mut id = [0x5a; 16];
@@ -72,27 +82,11 @@ fn largest(trace: u32, k: usize) -> Annotation {
     }
 }
 
-/// Defect: `list_traces` (src/api.rs) reads up to 1000 summaries and, for
-/// each, up to 32 annotations, then builds the whole answer in memory: the
-/// rows (`traces`, which stays alive because the next `let traces` only
-/// shadows it), a `serde_json::Value` per trace, a second copy of that tree
-/// made by `json!({ "traces": traces })` (the macro serializes its argument
-/// by reference), and the serialized text in `json_response`. An annotation
-/// can carry 4608 bytes of text that become 9 KiB of JSON, so one request
-/// for the largest list holds several hundred MiB, and 64 of them at once (the
-/// API's slots) tens of GiB. The trace view streams its JSON for exactly this
-/// reason ("a trace is never held as JSON"); before this checkpoint a summary
-/// was a few hundred bytes. Anyone who can write annotations can set this up,
-/// and any client can then ask for it.
-///
 /// Trigger: 1000 traces with 32 of the largest annotations each, then
-/// `GET /api/v1/traces?limit=1000`.
-///
-/// Expected: the heap one list request needs stays bounded, here below the
-/// 64 MiB the README gives for all write bodies together (by streaming the
-/// list, or by bounding the annotation text a list may carry).
+/// `GET /api/v1/traces?limit=1000`. The test counts the heap the request
+/// needs (the client only counts bytes) and the size of the reply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_list_request_stays_within_a_bounded_heap() {
+async fn one_list_request_stays_within_a_bounded_heap_and_size() {
     let dir = tempfile::tempdir().unwrap();
     let mut o = common::opts(dir.path());
     o.engine.flush_interval = Duration::from_secs(3600);
@@ -156,6 +150,10 @@ async fn one_list_request_stays_within_a_bounded_heap() {
 
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     eprintln!("list reply {body_len} bytes, heap grew by {grown} bytes during the request");
+    assert!(
+        body_len <= MAX_REPLY,
+        "the reply is {body_len} bytes, more than the {MAX_REPLY} the README states"
+    );
     assert!(
         grown < BOUND,
         "one list request grew the heap by {} MiB (reply {} MiB), bound {} MiB",

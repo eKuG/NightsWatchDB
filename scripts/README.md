@@ -37,18 +37,23 @@ find that trace in `/api/v1/search` once the data is flushed (search covers
 flushed parts only, so this waits up to 150 seconds for a flush). It repeats the
 checks after `kill -9` and after a `docker stop`, which must exit with code 0.
 
-Annotations: after the load it picks three traces from the listing and writes
+Annotations: after the load it picks four traces from the listing and writes
 through `POST /api/v1/annotations`: on trace 1 a `quality` score that it then
 overwrites (0.9 `good`, then 0.2 `bad`), a span-level `thumbs` label with a
 comment and a `checked` label; on trace 2 a `quality` score that it then
-deletes; nothing on trace 3. One request mixes a valid item with one for a
-trace id that does not exist (accepted 1, one rejection with index 1). The same
+deletes; nothing on trace 3; on trace 4 a `quality` score of 0.9 and a `thumbs`
+label `up`. One request mixes a valid item with one for a trace id that does
+not exist (accepted 1, one rejection with index 1). The same
 write with `Content-Type: text/plain` must get 415, and with a foreign `Origin`
 or `Sec-Fetch-Site: cross-site` 403, and must change nothing. The trace views
-and the `annotation`, `annotation_min`, `annotation_max` and
-`annotation_label` filters of the list are checked in the same three states as
+and the filters of the list are checked in the same three states as
 the rest (right after the writes, from the memory buffer; after `kill -9`, from
-the log; after the clean stop, from parts). After the clean stop
+the log; after the clean stop, from parts). Each filter is checked both ways, so
+that a server that ignored it would fail: `annotation_max=0.5` lists trace 1
+(0.2) and not trace 4 (0.9); `annotation_min=0.5` the reverse;
+`annotation_label=down` lists trace 1 and not trace 4 (`up`), and `up` the
+reverse; `annotation=quality` lists trace 1 and not trace 2, whose score was
+deleted (also with `annotation_source=e2e`). After the clean stop
 `/api/v1/stats` must show `annotation_parts` of at least 1 and
 `annotations_buffered` of 0. A failed check prints its name and the response it
 got.
@@ -83,7 +88,7 @@ scripts/bench.sh [--dataset d1|d2|smoke] [--profile small|standard] [--out DIR]
   fails the run.
 - Output: `result.json` and `result.md` in `DIR`
   (default `.data/bench/<date>-<commit>-<dataset>-<profile>/`), plus the
-  generator summaries and the raw `querybench.json`. Only these small files
+  generator summaries and the raw `querybench.json` and `querybench-annotations.json`. Only these small files
   reach the host; data stays in Docker volumes.
 - `BENCH_QUERIES`, `BENCH_WARMUP` and `BENCH_CONCURRENCY` change the query
   phase (defaults 200, 20, 1).
@@ -100,9 +105,18 @@ scripts/bench.sh [--dataset d1|d2|smoke] [--profile small|standard] [--out DIR]
 - It removes its containers, network and data volume on exit. The images and
   the corpus volume stay. It refuses to start while another `nwdb-bench-*`
   container is running.
+- Memory peaks: the annotation phase is a second querybench run
+  (`-annotate-only`; the first run has `-annotate=false`), so that the peak is
+  read between them. `server_peak_memory_after_queries_bytes` (the row "after
+  queries") is the peak before the annotation phase, as in earlier results;
+  `server_peak_memory_after_annotations_bytes` the peak after it. The first
+  run's output is `querybench.json` (`queries` in `result.json`), the
+  second's `querybench-annotations.json` (`annotation_queries`), which has
+  the annotation step and the kinds that use annotations.
 - Annotations: after its normal query kinds, querybench writes annotations
-  (10% of the traces get a `quality` score, 1% a `human` label `down`, in
-  requests of 500), waits until `annotations_buffered` is 0 and times the
+  (10% of the traces get a `quality` score, 1% a `human` label `down`, the
+  two sets disjoint: the human ones are taken from the other end of the
+  permutation of the trace ids, in requests of 500), waits until `annotations_buffered` is 0 and times the
   queries that use them (see below). The script then waits for compaction a
   second time and adds to `result.json` (`annotations`) and `result.md`:
   annotations sent and per second, seconds until they were in parts, seconds
