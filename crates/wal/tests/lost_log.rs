@@ -3,31 +3,15 @@
 //! removed before anything else is checked.
 
 use std::path::Path;
-use std::time::Duration;
 
 use nwdb_core::Error;
-use nwdb_wal::{Recovery, SyncMode, Wal, WalOptions};
+use nwdb_wal::{Recovery, Wal, WalOptions};
 
-/// Two 30-byte records fit in a file.
-fn opts() -> WalOptions {
-    WalOptions {
-        max_file_bytes: 100,
-        sync_interval: Duration::from_millis(1),
-        sync: SyncMode::None,
-        ..WalOptions::default()
-    }
-}
+mod common;
+use common::{fill, opts};
 
 fn file_name(first: u64) -> String {
     format!("wal-{first:020}.log")
-}
-
-fn fill(dir: &Path, n: u8) {
-    let (wal, _) = Wal::open(dir, opts()).unwrap();
-    for i in 0..n {
-        wal.append_blocking(&[i; 30]).unwrap();
-    }
-    wal.shutdown().unwrap();
 }
 
 /// Names and contents of every file, to show a refusal changed nothing.
@@ -63,7 +47,7 @@ fn assert_lost_log(r: nwdb_core::Result<(Wal, Recovery)>) {
 fn with_min(min: u64) -> WalOptions {
     WalOptions {
         min_next_lsn: Some(min),
-        ..opts()
+        ..opts(100)
     }
 }
 
@@ -91,7 +75,7 @@ fn an_empty_log_directory_is_refused_above_position_one_and_left_empty() {
 #[test]
 fn a_log_whose_newest_file_was_deleted_is_refused_and_left_alone() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), 6); // files [1,2] [3,4] [5,6]
+    fill(dir.path(), &opts(100), 6); // files [1,2] [3,4] [5,6]
     let newest = dir.path().join(file_name(5));
     let saved = std::fs::read(&newest).unwrap();
     std::fs::remove_file(&newest).unwrap();
@@ -116,7 +100,7 @@ fn a_log_whose_newest_file_was_deleted_is_refused_and_left_alone() {
 #[test]
 fn a_log_that_ends_exactly_at_the_position_is_not_refused() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), 4);
+    fill(dir.path(), &opts(100), 4);
     let (wal, rec) = Wal::open(dir.path(), with_min(5)).unwrap();
     assert_eq!((rec.last_lsn, rec.reset_to), (4, None));
     wal.shutdown().unwrap();
@@ -125,7 +109,7 @@ fn a_log_that_ends_exactly_at_the_position_is_not_refused() {
 #[test]
 fn the_switch_allows_the_reset() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), 4);
+    fill(dir.path(), &opts(100), 4);
     let o = WalOptions {
         allow_lost_log: true,
         ..with_min(50)
@@ -142,8 +126,8 @@ fn the_switch_allows_the_reset() {
 #[test]
 fn trimming_never_removes_the_newest_file() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), 6);
-    let (wal, _) = Wal::open(dir.path(), opts()).unwrap();
+    fill(dir.path(), &opts(100), 6);
+    let (wal, _) = Wal::open(dir.path(), opts(100)).unwrap();
     wal.truncate_before(u64::MAX).unwrap();
     assert_eq!(wal.stats().files, 1);
     wal.shutdown().unwrap();
@@ -156,7 +140,7 @@ fn trimming_never_removes_the_newest_file() {
 #[test]
 fn files_wholly_below_the_position_are_removed_first_even_if_damaged() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), 6); // [1,2] [3,4] [5,6]
+    fill(dir.path(), &opts(100), 6); // [1,2] [3,4] [5,6]
     // Damage the oldest file and leave a gap after it.
     let oldest = dir.path().join(file_name(1));
     let mut bytes = std::fs::read(&oldest).unwrap();
@@ -166,7 +150,7 @@ fn files_wholly_below_the_position_are_removed_first_even_if_damaged() {
 
     // Without a position the damage is an error.
     assert!(matches!(
-        Wal::open(dir.path(), opts()),
+        Wal::open(dir.path(), opts(100)),
         Err(Error::Corrupt(_))
     ));
     // With position 5, records 1..=4 are in data files and the file goes.
@@ -179,7 +163,7 @@ fn files_wholly_below_the_position_are_removed_first_even_if_damaged() {
 #[test]
 fn damage_in_a_file_that_is_still_needed_is_still_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), 6);
+    fill(dir.path(), &opts(100), 6);
     let middle = dir.path().join(file_name(3));
     let mut bytes = std::fs::read(&middle).unwrap();
     *bytes.last_mut().unwrap() ^= 0xff;

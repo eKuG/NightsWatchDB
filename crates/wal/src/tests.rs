@@ -389,7 +389,8 @@ fn overlapping_files_are_corrupt() {
     // A file claiming to start at 2 overlaps the one holding 1 and 2. Its
     // header must say 2 for the name check to pass, so write one by hand.
     let mut fake = format::encode_header(2).to_vec();
-    format::encode_record(b"x", &mut fake);
+    format::encode_frame(b"x", &mut fake);
+    fake.extend_from_slice(b"x");
     std::fs::write(dir.path().join(format::file_name(2)), fake).unwrap();
     assert_eq!(log_files(dir.path()).len(), files.len() + 1);
     let err = Wal::open(dir.path(), opts(100)).err().unwrap();

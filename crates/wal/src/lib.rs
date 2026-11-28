@@ -46,7 +46,7 @@ mod tests;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -226,11 +226,9 @@ pub(crate) struct Shared {
     pub files: Mutex<Vec<Lsn>>,
 }
 
-/// Locks, ignoring poisoning: no code holding these locks leaves the data in
-/// a half-updated state, and a panic elsewhere must not stop callers.
-pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+// No code holding these locks leaves the data in a half-updated state, and a
+// panic elsewhere must not stop callers.
+pub(crate) use nwdb_core::lock;
 
 pub(crate) fn poison_error(msg: &str) -> Error {
     Error::fatal(format!(

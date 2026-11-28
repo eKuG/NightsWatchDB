@@ -108,13 +108,6 @@ pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&crc.to_le_bytes());
 }
 
-/// Appends one framed record to `out`.
-#[cfg(test)]
-pub(crate) fn encode_record(payload: &[u8], out: &mut Vec<u8>) {
-    encode_frame(payload, out);
-    out.extend_from_slice(payload);
-}
-
 /// What the scanner found in a file.
 pub(crate) struct Scan {
     pub records: u64,

@@ -1,4 +1,4 @@
-//! Reviewer tests: each asserts the behaviour the crate should have; a failure
+//! Each test asserts the behaviour the crate should have; a failure
 //! demonstrates a defect.
 
 use std::path::Path;
@@ -7,16 +7,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use nwdb_core::Error;
-use nwdb_wal::{SyncMode, Wal, WalOptions};
+use nwdb_wal::{SyncMode, Wal};
 
-fn opts() -> WalOptions {
-    WalOptions {
-        max_file_bytes: 1 << 20,
-        sync_interval: Duration::from_millis(1),
-        sync: SyncMode::None,
-        ..WalOptions::default()
-    }
-}
+mod common;
+use common::{fill, opts};
 
 fn header(first: u64) -> Vec<u8> {
     let mut h = Vec::new();
@@ -47,7 +41,7 @@ fn write_file(dir: &Path, first: u64, bytes: &[u8]) {
 fn a_file_starting_at_lsn_zero_is_corrupt_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
     write_file(dir.path(), 0, &header(0));
-    let got = std::panic::catch_unwind(|| Wal::open(dir.path(), opts()).map(|(_, r)| r));
+    let got = std::panic::catch_unwind(|| Wal::open(dir.path(), opts(1 << 20)).map(|(_, r)| r));
     match got {
         Ok(Err(Error::Corrupt(_))) => {}
         Ok(other) => panic!("accepted: {other:?}"),
@@ -62,7 +56,7 @@ fn a_header_number_near_u64_max_is_corrupt_not_a_panic() {
     let mut bytes = header(u64::MAX);
     bytes.extend(record(b"x"));
     write_file(dir.path(), u64::MAX, &bytes);
-    let got = std::panic::catch_unwind(|| Wal::open(dir.path(), opts()).map(|(_, r)| r));
+    let got = std::panic::catch_unwind(|| Wal::open(dir.path(), opts(1 << 20)).map(|(_, r)| r));
     match got {
         Ok(Err(Error::Corrupt(_))) => {}
         Ok(other) => panic!("accepted: {other:?}"),
@@ -77,7 +71,7 @@ fn a_header_number_near_u64_max_is_corrupt_not_a_panic() {
 #[test]
 fn mid_file_damage_destroys_acknowledged_records_and_reuses_their_numbers() {
     let dir = tempfile::tempdir().unwrap();
-    let (wal, _) = Wal::open(dir.path(), opts()).unwrap();
+    let (wal, _) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
     for i in 0..4u8 {
         assert_eq!(wal.append_blocking(&[i; 30]).unwrap(), u64::from(i) + 1);
     }
@@ -90,7 +84,7 @@ fn mid_file_damage_destroys_acknowledged_records_and_reuses_their_numbers() {
 
     // API change: `open` now refuses the damaged file (Corrupt) instead of
     // cutting it and handing back a log that reuses acknowledged numbers.
-    let err = Wal::open(dir.path(), opts())
+    let err = Wal::open(dir.path(), opts(1 << 20))
         .err()
         .expect("open must refuse");
     assert!(matches!(err, Error::Corrupt(_)), "{err}");
@@ -104,7 +98,7 @@ fn mid_file_damage_destroys_acknowledged_records_and_reuses_their_numbers() {
 #[test]
 fn replay_from_a_trimmed_position_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 100; // two 30-byte records per file
     let (wal, _) = Wal::open(dir.path(), o.clone()).unwrap();
     for i in 0..6u8 {
@@ -133,7 +127,7 @@ fn numbering_cannot_be_moved_above_a_flushed_position() {
     // API change: the engine passes the position it already flushed through
     // `min_next_lsn`, which is the new way to move numbering above it.
     let flushed_in_manifest = 100;
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.min_next_lsn = Some(flushed_in_manifest + 1);
     o.allow_lost_log = true;
     let (wal, rec) = Wal::open(dir.path(), o).unwrap();
@@ -158,7 +152,7 @@ fn numbering_cannot_be_moved_above_a_flushed_position() {
 #[test]
 fn a_panic_on_the_log_thread_still_answers_in_flight_records() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.sync_hook = Some(Arc::new(|| panic!("simulated panic during sync")));
     let (wal, _) = Wal::open(dir.path(), o).unwrap();
     let (tx, rx) = mpsc::channel();
@@ -178,7 +172,7 @@ fn a_panic_on_the_log_thread_still_answers_in_flight_records() {
 #[test]
 fn a_zero_filled_header_only_last_file_does_not_block_recovery() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 100;
     let (wal, _) = Wal::open(dir.path(), o.clone()).unwrap();
     for i in 0..2u8 {
@@ -201,19 +195,11 @@ fn list(dir: &Path) -> Vec<String> {
     v
 }
 
-fn fill(dir: &Path, o: &WalOptions, n: u8) {
-    let (wal, _) = Wal::open(dir, o.clone()).unwrap();
-    for i in 0..n {
-        wal.append_blocking(&[i; 30]).unwrap();
-    }
-    wal.shutdown().unwrap();
-}
-
 #[test]
 fn replay_beyond_the_end_of_the_log_is_an_error_but_one_past_is_fine() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), &opts(), 3);
-    let (wal, rec) = Wal::open(dir.path(), opts()).unwrap();
+    fill(dir.path(), &opts(1 << 20), 3);
+    let (wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
     assert_eq!(rec.last_lsn, 3);
     assert_eq!(wal.replay(4, |_, _| Ok(())).unwrap(), 0);
     assert!(matches!(
@@ -226,9 +212,9 @@ fn replay_beyond_the_end_of_the_log_is_an_error_but_one_past_is_fine() {
 #[test]
 fn min_next_lsn_at_or_below_the_next_number_does_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), &opts(), 3);
+    fill(dir.path(), &opts(1 << 20), 3);
     for min in [0, 1, 3, 4] {
-        let mut o = opts();
+        let mut o = opts(1 << 20);
         o.min_next_lsn = Some(min);
         let (wal, rec) = Wal::open(dir.path(), o).unwrap();
         assert_eq!((rec.first_lsn, rec.last_lsn), (1, 3));
@@ -240,7 +226,7 @@ fn min_next_lsn_at_or_below_the_next_number_does_nothing() {
 #[test]
 fn min_next_lsn_above_the_log_discards_every_file_and_restarts_there() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 100;
     fill(dir.path(), &o, 5);
     assert_eq!(list(dir.path()).len(), 3);
@@ -273,8 +259,8 @@ fn min_next_lsn_above_the_log_discards_every_file_and_restarts_there() {
 #[test]
 fn durable_lsn_tracks_acknowledged_records() {
     let dir = tempfile::tempdir().unwrap();
-    fill(dir.path(), &opts(), 2);
-    let (wal, rec) = Wal::open(dir.path(), opts()).unwrap();
+    fill(dir.path(), &opts(1 << 20), 2);
+    let (wal, rec) = Wal::open(dir.path(), opts(1 << 20)).unwrap();
     assert_eq!(wal.durable_lsn(), rec.last_lsn);
     assert_eq!(wal.append_blocking(b"x").unwrap(), 3);
     assert_eq!(wal.durable_lsn(), 3);
@@ -283,7 +269,7 @@ fn durable_lsn_tracks_acknowledged_records() {
 #[test]
 fn real_sync_open_of_an_existing_log_and_nested_new_directory() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.sync = SyncMode::Data;
     let nested = dir.path().join("a").join("b");
     fill(&nested, &o, 3);
@@ -295,7 +281,7 @@ fn real_sync_open_of_an_existing_log_and_nested_new_directory() {
 #[test]
 fn leftover_temporary_files_and_invalid_header_only_files_are_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 100;
     fill(dir.path(), &o, 2);
     let tmp = format!("wal-{:020}.log.tmp", 3);
@@ -322,7 +308,7 @@ fn leftover_temporary_files_and_invalid_header_only_files_are_removed() {
 #[test]
 fn no_temporary_file_is_left_after_rolling() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 100;
     fill(dir.path(), &o, 6);
     assert!(list(dir.path()).iter().all(|n| !n.ends_with(".tmp")));
@@ -331,7 +317,7 @@ fn no_temporary_file_is_left_after_rolling() {
 #[test]
 fn truncate_before_leaves_a_contiguous_suffix() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 100;
     let (wal, _) = Wal::open(dir.path(), o.clone()).unwrap();
     for i in 0..8u8 {
@@ -350,7 +336,7 @@ fn truncate_before_leaves_a_contiguous_suffix() {
 #[test]
 fn big_and_small_records_round_trip_through_the_write_buffer() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.max_file_bytes = 1 << 30;
     let payloads: Vec<Vec<u8>> = vec![
         vec![1; 10],
@@ -383,7 +369,7 @@ fn big_and_small_records_round_trip_through_the_write_buffer() {
 #[test]
 fn a_poisoned_log_answers_fatal_everywhere() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.sync_hook = Some(Arc::new(|| Err(std::io::Error::other("disk gone"))));
     let (wal, _) = Wal::open(dir.path(), o).unwrap();
     assert!(matches!(wal.append_blocking(b"x"), Err(Error::Fatal(_))));
@@ -399,7 +385,7 @@ fn a_poisoned_log_answers_fatal_everywhere() {
 #[test]
 fn a_panic_on_the_log_thread_fails_every_record_with_fatal() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts();
+    let mut o = opts(1 << 20);
     o.sync_hook = Some(Arc::new(|| panic!("simulated panic during sync")));
     let (wal, _) = Wal::open(dir.path(), o).unwrap();
     let (tx, rx) = mpsc::channel();
