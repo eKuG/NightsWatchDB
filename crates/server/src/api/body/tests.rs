@@ -7,56 +7,11 @@
 
 use super::super::MAX_CONCURRENT;
 use crate::{Server, ServerOptions};
+use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static PEAK: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE, PEAK};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    fn grew(by: isize) {
-        let now = LIVE.fetch_add(by, Relaxed) + by;
-        PEAK.fetch_max(now, Relaxed);
-    }
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                grew(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                grew(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                grew(n as isize - l.size() as isize);
-            }
-            q
-        }
-    }
-}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -500,8 +455,8 @@ async fn concurrent_maximum_size_bodies_stay_within_the_limit_times_the_slots() 
     for use_chunks in [false, true] {
         let payload: Arc<Vec<u8>> = Arc::new((0..LIMIT).map(|i| (i % 251) as u8).collect());
         let barrier = Arc::new(Barrier::new(MAX_CONCURRENT));
-        let base = LIVE.load(Ordering::SeqCst);
-        PEAK.store(base, Ordering::SeqCst);
+        let base = live();
+        reset_peak();
         let clients: Vec<_> = (0..MAX_CONCURRENT)
             .map(|_| {
                 let (payload, barrier) = (payload.clone(), barrier.clone());
@@ -545,7 +500,7 @@ async fn concurrent_maximum_size_bodies_stay_within_the_limit_times_the_slots() 
         for c in clients {
             assert_eq!(c.join().unwrap(), (LIMIT as u64, sum(&payload)));
         }
-        let grown = PEAK.load(Ordering::SeqCst) - base;
+        let grown = peak() - base;
         let bound = (MAX_CONCURRENT * LIMIT) as isize;
         eprintln!("chunked={use_chunks}: peak heap growth {grown} bytes, bound {bound}");
         assert!(grown < bound + ALLOWANCE, "grew by {grown}, bound {bound}");

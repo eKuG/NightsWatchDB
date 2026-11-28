@@ -11,59 +11,14 @@ use http::Request;
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{Server, ServerOptions};
+use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as V};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static PEAK: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE, PEAK};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    fn grew(by: isize) {
-        let now = LIVE.fetch_add(by, Relaxed) + by;
-        PEAK.fetch_max(now, Relaxed);
-    }
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                grew(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                grew(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                grew(n as isize - l.size() as isize);
-            }
-            q
-        }
-    }
-}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -134,10 +89,6 @@ fn get(api: SocketAddr) -> TcpStream {
     s
 }
 
-fn live() -> isize {
-    LIVE.load(Ordering::SeqCst)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_trace_is_streamed_and_a_client_that_leaves_frees_its_task() {
     let dir = tempfile::tempdir().unwrap();
@@ -153,15 +104,15 @@ async fn a_large_trace_is_streamed_and_a_client_that_leaves_frees_its_task() {
     // response format can avoid.
     let id: nwdb_core::TraceId = "42".repeat(16).parse().unwrap();
     let base = live();
-    PEAK.store(base, Ordering::SeqCst);
+    reset_peak();
     let rows = server.engine().get_trace(id).unwrap().unwrap();
-    let rows_cost = PEAK.load(Ordering::SeqCst) - base;
+    let rows_cost = peak() - base;
     drop(rows);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // The whole response, read in small pieces and thrown away.
     let base = live();
-    PEAK.store(base, Ordering::SeqCst);
+    reset_peak();
     let total = tokio::task::spawn_blocking(move || {
         let mut s = get(api);
         let (mut buf, mut total) = (vec![0u8; 64 * 1024], 0usize);
@@ -185,7 +136,7 @@ async fn a_large_trace_is_streamed_and_a_client_that_leaves_frees_its_task() {
     })
     .await
     .unwrap();
-    let grown = PEAK.load(Ordering::SeqCst) - base;
+    let grown = peak() - base;
     eprintln!(
         "response {total} bytes; peak heap growth {grown} bytes, of which the engine's rows \
          {rows_cost} (span of {SIZE})"

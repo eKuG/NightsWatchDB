@@ -1,5 +1,6 @@
 //! The binary itself: usage errors and signals.
 
+use nwdb_testkit::proto::ld;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -142,18 +143,6 @@ fn one_signal_exits_cleanly() {
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 const SPANS_PER_EXPORT: usize = 40_000;
 const EXPORTS: usize = 20;
-
-fn ld(field: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![field << 3 | 2];
-    let mut n = payload.len();
-    while n >= 0x80 {
-        out.push((n as u8 & 0x7f) | 0x80);
-        n >>= 7;
-    }
-    out.push(n as u8);
-    out.extend_from_slice(payload);
-    out
-}
 
 /// A gRPC message of `SPANS_PER_EXPORT` spans that carry only their ids.
 fn big_message(trace: u8) -> Vec<u8> {

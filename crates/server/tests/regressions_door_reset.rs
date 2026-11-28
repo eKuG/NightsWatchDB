@@ -13,13 +13,13 @@
 //! process.
 
 use nwdb_server::{DECODE_FACTOR, DECODE_FIXED, Server, ServerOptions};
+use nwdb_testkit::alloc::{live, peak, reset_peak};
+use nwdb_testkit::proto::ld;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static PEAK: AtomicIsize = AtomicIsize::new(0);
 /// Allocations of at least [`BIG`] bytes: live now, the most live at once,
 /// and how many were ever made. Only the door's buffer of an expanded
 /// message reaches that size in this test.
@@ -27,13 +27,6 @@ static BIG_LIVE: AtomicIsize = AtomicIsize::new(0);
 static BIG_MAX: AtomicIsize = AtomicIsize::new(0);
 static BIG_MADE: AtomicUsize = AtomicUsize::new(0);
 const BIG: usize = 1 << 20;
-
-struct Counting;
-
-fn grew(by: isize) {
-    let now = LIVE.fetch_add(by, Ordering::Relaxed) + by;
-    PEAK.fetch_max(now, Ordering::Relaxed);
-}
 
 fn big(old: usize, new: usize) {
     if old < BIG && new >= BIG {
@@ -45,38 +38,37 @@ fn big(old: usize, new: usize) {
     }
 }
 
+/// The shared counting allocator, which also counts the big allocations.
+struct Counting;
+
 #[allow(unsafe_code)]
 mod alloc_impl {
-    use super::{Counting, LIVE, big, grew};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
+    use super::{Counting, big};
+    use nwdb_testkit::alloc::Counting as Inner;
+    use std::alloc::{GlobalAlloc, Layout};
 
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
+            let p = unsafe { Inner::<{ usize::MAX }>.alloc(l) };
             if !p.is_null() {
-                grew(l.size() as isize);
                 big(0, l.size());
             }
             p
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
+            let p = unsafe { Inner::<{ usize::MAX }>.alloc_zeroed(l) };
             if !p.is_null() {
-                grew(l.size() as isize);
                 big(0, l.size());
             }
             p
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
+            unsafe { Inner::<{ usize::MAX }>.dealloc(p, l) };
             big(l.size(), 0);
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
+            let q = unsafe { Inner::<{ usize::MAX }>.realloc(p, l, n) };
             if !q.is_null() {
-                grew(n as isize - l.size() as isize);
                 big(l.size(), n);
             }
             q
@@ -94,18 +86,6 @@ const BUDGET: usize = 16 << 20;
 /// it, so that two messages are never decoded at once.
 const SPANS: usize = 23_000;
 const MESSAGES: usize = 6;
-
-fn ld(field: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![field << 3 | 2];
-    let mut n = payload.len();
-    while n >= 0x80 {
-        out.push((n as u8 & 0x7f) | 0x80);
-        n >>= 7;
-    }
-    out.push(n as u8);
-    out.extend_from_slice(payload);
-    out
-}
 
 /// A request of `SPANS` spans that carry only their two ids.
 fn request() -> Vec<u8> {
@@ -224,8 +204,8 @@ async fn a_reset_stream_keeps_its_budget_until_its_decoding_ends() {
     drop(raw);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let base = LIVE.load(Ordering::SeqCst);
-    PEAK.store(base, Ordering::SeqCst);
+    let base = live();
+    reset_peak();
     BIG_MAX.store(BIG_LIVE.load(Ordering::SeqCst), Ordering::SeqCst);
 
     let admitted = tokio::task::spawn_blocking(move || reset_each_once_it_expands(addr, &message))
@@ -236,7 +216,7 @@ async fn a_reset_stream_keeps_its_budget_until_its_decoding_ends() {
     while BIG_LIVE.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let grown = PEAK.load(Ordering::SeqCst) - base;
+    let grown = peak() - base;
     let at_once = BIG_MAX.load(Ordering::SeqCst);
     eprintln!(
         "{admitted} messages reset while expanding; at most {at_once} expanded at once; \

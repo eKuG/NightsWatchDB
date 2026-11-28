@@ -739,6 +739,7 @@ dependencies = [
  "nwdb-core",
  "nwdb-engine",
  "nwdb-otlp",
+ "nwdb-testkit",
  "nwdb-wal",
  "opentelemetry-proto",
  "prost",

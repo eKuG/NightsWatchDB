@@ -4,6 +4,7 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use nwdb_server::{MAX_MESSAGE, Server, ServerOptions};
+use nwdb_testkit::proto::{ld, varint};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -205,23 +206,6 @@ fn request(spans: Vec<Span>) -> Vec<u8> {
 }
 
 // ---- hand-built wire bytes ----
-
-fn varint(mut v: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-    out
-}
-
-fn ld(field: u32, payload: &[u8]) -> Vec<u8> {
-    let mut out = varint(u64::from(field) << 3 | 2);
-    out.extend(varint(payload.len() as u64));
-    out.extend_from_slice(payload);
-    out
-}
 
 fn fixed64(field: u32, v: u64) -> Vec<u8> {
     let mut out = varint(u64::from(field) << 3 | 1);

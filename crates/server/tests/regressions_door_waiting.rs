@@ -17,52 +17,13 @@ use hyper::body::{Body, Frame};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{Server, ServerOptions};
+use nwdb_testkit::alloc::{Counting, live};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                LIVE.fetch_add(l.size() as isize, Relaxed);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                LIVE.fetch_add(l.size() as isize, Relaxed);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                LIVE.fetch_add(n as isize - l.size() as isize, Relaxed);
-            }
-            q
-        }
-    }
-}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -122,7 +83,7 @@ async fn held_by_streams(addr: SocketAddr, first: &Bytes) -> isize {
         conns.push(connect(addr).await);
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let base = LIVE.load(Ordering::SeqCst);
+    let base = live();
     let mut open_streams = Vec::new();
     for c in &mut conns {
         for _ in 0..STREAMS {
@@ -132,7 +93,7 @@ async fn held_by_streams(addr: SocketAddr, first: &Bytes) -> isize {
     let mut grown = 0;
     for _ in 0..30 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        grown = grown.max(LIVE.load(Ordering::SeqCst) - base);
+        grown = grown.max(live() - base);
     }
     drop(open_streams);
     drop(conns);

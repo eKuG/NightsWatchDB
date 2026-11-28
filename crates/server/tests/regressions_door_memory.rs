@@ -11,60 +11,17 @@
 //! process.
 
 use nwdb_server::{Server, ServerOptions};
+use nwdb_testkit::alloc::{Counting, live};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as V};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                LIVE.fetch_add(l.size() as isize, Relaxed);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                LIVE.fetch_add(l.size() as isize, Relaxed);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                LIVE.fetch_add(n as isize - l.size() as isize, Relaxed);
-            }
-            q
-        }
-    }
-}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
-
-fn live() -> isize {
-    LIVE.load(Ordering::SeqCst)
-}
 
 const PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 

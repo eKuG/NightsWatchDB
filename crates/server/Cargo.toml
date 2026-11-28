@@ -37,6 +37,7 @@ hyper = { workspace = true, features = ["client", "http2"] }
 # A real gRPC client for the tests.
 tonic = { workspace = true, features = ["channel", "codegen", "gzip", "zstd"] }
 tempfile.workspace = true
+nwdb-testkit = { path = "../testkit" }
 prost.workspace = true
 opentelemetry-proto = { workspace = true, features = ["gen-tonic-messages", "trace"] }
 

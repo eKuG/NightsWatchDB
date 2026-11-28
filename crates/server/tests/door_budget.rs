@@ -13,69 +13,16 @@ use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{Server, ServerOptions};
+use nwdb_testkit::alloc::{Counting, live};
+use nwdb_testkit::proto::ld;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    fn grew(by: isize) {
-        LIVE.fetch_add(by, Relaxed);
-    }
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                grew(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                grew(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                grew(n as isize - l.size() as isize);
-            }
-            q
-        }
-    }
-}
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
-
-fn ld(field: u8, payload: &[u8]) -> Vec<u8> {
-    let mut v = vec![field << 3 | 2];
-    let mut len = payload.len();
-    while len >= 0x80 {
-        v.push((len as u8 & 0x7f) | 0x80);
-        len >>= 7;
-    }
-    v.push(len as u8);
-    v.extend_from_slice(payload);
-    v
-}
 
 /// A span with only its two ids; `n` makes the span id unique.
 fn minimal_span(n: u32) -> Vec<u8> {
@@ -168,7 +115,7 @@ async fn concurrent_large_compressed_exports_stay_inside_the_budget() {
     for c in &mut conns {
         assert_eq!(export(c, "gzip", &gz).await, "0");
     }
-    let base = LIVE.load(Ordering::SeqCst);
+    let base = live();
     // What the engine keeps of the requests it has accepted is not the
     // door's: it is counted by the engine and left out here. So the heap is
     // sampled, less the engine's buffered bytes at that moment.
@@ -179,7 +126,7 @@ async fn concurrent_large_compressed_exports_stay_inside_the_budget() {
             let mut worst = 0isize;
             while !done.load(Ordering::SeqCst) {
                 let kept = engine.stats().buffered_bytes as isize;
-                worst = worst.max(LIVE.load(Ordering::SeqCst) - base - kept);
+                worst = worst.max(live() - base - kept);
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
             worst

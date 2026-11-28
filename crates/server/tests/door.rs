@@ -9,6 +9,7 @@ use hyper::body::{Body, Frame};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{MAX_MESSAGE, Server, ServerOptions};
+use nwdb_testkit::proto::varint;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
@@ -159,20 +160,10 @@ fn message(compressed: bool, payload: &[u8]) -> Bytes {
 
 // ---- payloads ----
 
-fn varint(mut v: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-    out
-}
-
 /// A valid request with no spans: one unknown field of `n` zero bytes.
 fn padding(n: usize) -> Vec<u8> {
     let mut v = vec![0x7a];
-    v.extend(varint(n));
+    v.extend(varint(n as u64));
     v.resize(v.len() + n, 0);
     v
 }

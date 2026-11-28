@@ -12,67 +12,11 @@
 use nwdb_core::BatchLimits;
 use nwdb_otlp::TraceDecoder;
 use nwdb_server::{DECODE_FACTOR, DECODE_FIXED};
-use std::sync::atomic::{AtomicIsize, Ordering};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static PEAK: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-fn grow(n: isize) {
-    let now = LIVE.fetch_add(n, Ordering::Relaxed) + n;
-    PEAK.fetch_max(now, Ordering::Relaxed);
-}
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE, grow};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                grow(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                grow(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                grow(n as isize - l.size() as isize);
-            }
-            q
-        }
-    }
-}
+use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
+use nwdb_testkit::proto::ld;
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
-
-fn ld(field: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![field << 3 | 2];
-    let mut n = payload.len();
-    while n >= 0x80 {
-        out.push((n as u8 & 0x7f) | 0x80);
-        n >>= 7;
-    }
-    out.push(n as u8);
-    out.extend_from_slice(payload);
-    out
-}
 
 fn concat(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
@@ -128,10 +72,10 @@ fn many_resources(n: u32) -> Vec<u8> {
 /// Peak heap growth while decoding `req`, with the result still held.
 fn peak_of(req: &[u8]) -> isize {
     let decoder = TraceDecoder::new(BatchLimits::DEFAULT);
-    let base = LIVE.load(Ordering::SeqCst);
-    PEAK.store(base, Ordering::SeqCst);
+    let base = live();
+    reset_peak();
     let (batches, stats) = decoder.decode_with_stats(req).unwrap();
-    let peak = PEAK.load(Ordering::SeqCst) - base;
+    let peak = peak() - base;
     assert!(stats.spans > 0 && stats.rejected_spans == 0);
     drop(batches);
     peak
