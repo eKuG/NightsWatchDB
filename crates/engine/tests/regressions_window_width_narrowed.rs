@@ -1,5 +1,8 @@
-//! Retention after a change of `window_ns` brings back an overwritten value
-//! and a deleted annotation.
+//! After `window_ns` is narrowed at a restart, retention never brings back an
+//! overwritten value or a deleted annotation: the newer records go to the
+//! window that expires last, written with the exact `(window_start_ns,
+//! window_ns)` of the span part whose window was chosen (not with the
+//! engine's current width).
 
 mod common;
 
@@ -21,23 +24,20 @@ fn with(dir: &Path, window_ns: i64, now: &Arc<AtomicI64>) -> EngineOptions {
     o
 }
 
-/// Defect: a flush writes an annotation into the largest window, by
-/// `(window_start_ns, window_ns)`, that holds its trace, on the assumption
-/// that a larger window never expires before a smaller one. Retention expires
-/// a window by its end (`window_start_ns + window_ns`). `window_ns` is an open
-/// option that nothing records or checks, so a restart with a narrower window
-/// makes windows whose order by start is not their order of expiry: the newer
-/// record lands in a window that expires first and the older record comes back.
+/// A flush writes an annotation into the window that ends last
+/// (`window_start_ns + window_ns`, the quantity retention expires by) among
+/// those that hold its trace, whatever the order of the windows by start.
+/// `window_ns` is an open option that nothing records or checks, so after a
+/// restart with a narrower window a window with a larger start can end first.
 ///
 /// Sequence: window 1000; trace 1 in window (0, 1000); "q" = 1 and "d" = 1
 /// flushed into it. Restart with window 100; a late span of the trace at 550
-/// goes to window (500, 100); "q" = 2 and a delete of "d" are flushed into
-/// (500, 100), the larger by start. The clock reaches 700 with a retention of
-/// 100: (500, 100) ends at 600 and expires, (0, 1000) ends at 1000 and stays.
+/// goes to window (500, 100); "q" = 2 and a delete of "d" are flushed with it
+/// and go to (0, 1000), which ends at 1000, not to (500, 100), which ends at
+/// 600. The clock reaches 700 with a retention of 100: (500, 100) expires,
+/// (0, 1000) stays.
 ///
-/// Expected: the trace never shows "q" = 1 again and never shows "d" (the
-/// newest record of each is 2 and a delete; losing them with their window is
-/// the documented price, an older record coming back is not).
+/// Guaranteed: the trace shows "q" = 2, never "q" = 1, and never "d".
 #[test]
 fn retention_after_a_narrower_window_brings_back_overwritten_and_deleted_values() {
     let dir = tempfile::tempdir().unwrap();
@@ -67,7 +67,10 @@ fn retention_after_a_narrower_window_brings_back_overwritten_and_deleted_values(
         .iter()
         .map(|x| (x.1, x.2))
         .collect();
-    assert_eq!(windows, vec![(0, 1_000), (500, 100)], "setup");
+    // Both flushes put their annotations in (0, 1000), which ends at 1000: the
+    // window of the span part, with its own width, not the engine's current
+    // 100.
+    assert_eq!(windows, vec![(0, 1_000), (0, 1_000)], "setup");
     assert_eq!(
         brief(&shown(&e, 1)),
         vec![(None, "q".into(), "s".into(), Some(2.0))]

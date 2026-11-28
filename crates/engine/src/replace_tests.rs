@@ -886,7 +886,11 @@ fn both_kinds_are_replaced_in_one_step_and_old_snapshots_keep_reading() {
                         .max()
                         .expect("an annotation part of window 3");
                     if spans_of_3 >= first_new_id || anns_of_3 >= first_new_id {
-                        assert_eq!(anns_of_3, spans_of_3 + 1, "the two kinds changed in two steps");
+                        assert_eq!(
+                            anns_of_3,
+                            spans_of_3 + 1,
+                            "the two kinds changed in two steps"
+                        );
                     }
                     for t in [3u128, 13, 23] {
                         assert!(s.get_trace(tid(t)).unwrap().is_some(), "spans of {t}");

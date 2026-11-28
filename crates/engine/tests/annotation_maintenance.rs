@@ -128,10 +128,11 @@ fn retention_removes_both_kinds_of_an_expired_window_in_one_manifest_version() {
 }
 
 /// A flush decides the window of an annotation, then retention removes the
-/// trace's span part before the flush commits: the annotation part is alone in
-/// its window, and goes when that window expires.
+/// trace's span part before the flush commits: the annotation part is not
+/// committed into the window that has no span part any more, its directory is
+/// removed and its record counts as dropped.
 #[test]
-fn an_annotation_part_alone_in_an_expired_window_is_removed() {
+fn an_annotation_part_for_a_window_retention_removed_meanwhile_is_not_committed() {
     let dir = tempfile::tempdir().unwrap();
     let now = Arc::new(AtomicI64::new(0));
     let slot: Arc<Mutex<Option<Engine>>> = Arc::default();
@@ -142,8 +143,7 @@ fn an_annotation_part_alone_in_an_expired_window_is_removed() {
         Arc::new(move |s| {
             if s == Stage::AllPartsWritten && armed.swap(false, Ordering::SeqCst) {
                 let e = slot.lock().unwrap().clone().unwrap();
-                // Retention takes the span part, then the clock goes back so
-                // that no later pass takes the annotation part yet.
+                // Retention takes the span part, then the clock goes back.
                 now.store(5 * W, Ordering::SeqCst);
                 e.run_maintenance().unwrap();
                 now.store(0, Ordering::SeqCst);
@@ -158,18 +158,20 @@ fn an_annotation_part_alone_in_an_expired_window_is_removed() {
     annotate(&e, vec![score(1, None, "q", "s", 1.0)]);
     armed.store(true, Ordering::SeqCst);
     e.flush().unwrap();
-    // The span part of window 0 is gone, its annotation part is not.
-    let info = ann_info(&e);
-    assert_eq!(info.len(), 1, "{info:?}");
-    assert_eq!(info[0].1, 0);
+    // The span part of window 0 is gone and no annotation part was committed
+    // into its window.
+    assert!(ann_info(&e).is_empty(), "{:?}", ann_info(&e));
     assert_eq!(e.stats().parts, 1, "only window 4 is left");
-    assert_eq!(e.stats().annotations_dropped, 0);
+    assert_eq!(e.stats().annotations_dropped, 1);
+    assert_eq!(e.stats().annotations_written, 0);
+    assert_eq!(e.stats().annotations_buffered, 0);
+    assert_eq!(e.stats().retention_parts_removed, 1);
+    assert_dirs_are_live(dir.path(), &e, "after the flush");
 
     now.store(5 * W, Ordering::SeqCst);
     e.run_maintenance().unwrap();
     assert_eq!(e.stats().annotation_parts, 0);
-    assert_eq!(e.stats().parts, 1);
-    assert_eq!(e.stats().retention_parts_removed, 2);
+    assert_eq!(e.stats().parts, 1, "window 4 is not expired yet");
     assert_dirs_are_live(dir.path(), &e, "after the second pass");
     slot.lock().unwrap().take();
     e.shutdown().unwrap();
@@ -505,7 +507,10 @@ fn a_failing_annotation_window_backs_off_without_holding_back_span_merges() {
         .collect();
     assert_eq!(kinds.iter().filter(|k| **k == PartKind::Spans).count(), 1);
     assert_eq!(
-        kinds.iter().filter(|k| **k == PartKind::Annotations).count(),
+        kinds
+            .iter()
+            .filter(|k| **k == PartKind::Annotations)
+            .count(),
         1
     );
     e.shutdown().unwrap();
@@ -840,7 +845,11 @@ fn retention_removes_a_window_of_thousands_of_annotation_parts_in_one_replacemen
     e.run_maintenance().unwrap();
     let took = started.elapsed();
     assert_eq!(e.stats().annotation_parts, 750);
-    assert_eq!(disk_state(dir.path()).0.version, version + 1, "one replacement");
+    assert_eq!(
+        disk_state(dir.path()).0.version,
+        version + 1,
+        "one replacement"
+    );
     assert!(took < Duration::from_secs(30), "{took:?}");
     assert!(shown(&e, 1).is_empty());
     assert_eq!(shown(&e, 2).len(), 750);

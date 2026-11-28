@@ -191,7 +191,7 @@ impl Inner {
             let c = lock(&self.core);
             (c.vis.parts.clone(), c.vis.split.clone())
         };
-        let (built, built_split) = change_parts(&seen, &seen_split, remove, add.clone());
+        let (built, built_split) = change_parts(&seen, &seen_split, &remove, add.clone());
         self.hook_before_commit(Stage::ReplaceMapBuilt)?;
 
         {
@@ -239,7 +239,8 @@ impl Inner {
             // Parts published since the cut-off was decided that are in an
             // expired window go with it; they are in `later` and in no map
             // yet, so they are only left out of what is patched in.
-            let (swept, later): (Vec<_>, Vec<_>) = later.into_iter().partition(|p| expired(&p.meta));
+            let (swept, later): (Vec<_>, Vec<_>) =
+                later.into_iter().partition(|p| expired(&p.meta));
             let swept_ann: Vec<u64> = old_ann
                 .iter()
                 .filter(|p| expired(&p.meta) && !removing.contains(&p.meta.part_id))

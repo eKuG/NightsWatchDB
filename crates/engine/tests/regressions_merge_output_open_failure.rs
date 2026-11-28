@@ -1,5 +1,6 @@
-//! A merge whose output cannot be opened marks its window as damaged until a
-//! restart, although no input is damaged.
+//! A merge whose output cannot be opened is an ordinary failed merge: the
+//! output directory is removed, the window backs off and is retried; only
+//! damage found in an input leaves a window alone until a restart.
 
 mod common;
 mod support;
@@ -48,14 +49,12 @@ fn unlink_output_once(parts: PathBuf) -> JoinHandle<bool> {
     })
 }
 
-/// Defect: `merge_one` opens the merge output with `AnnotationReader::open`
-/// before the replacement (which is right: a part that cannot be opened must
-/// not replace its inputs), but a failure there comes back as `Corrupt`
-/// ("file is missing from the part") and `note_merge_failure` treats every
-/// `Corrupt` as damage in an input: the (window, kind) goes into `damaged` and
-/// is left alone until a restart. The README keeps "until the next start" for
-/// damage found in an input; any other error before the commit backs off for
-/// `retry_backoff`.
+/// `merge_one` opens the merge output before the replacement, so a part that
+/// cannot be opened never replaces its inputs. A failure there is not damage of
+/// an input: only an error from the merge of the inputs (their verification or
+/// reading) is. The error of the output is reported without saying an input is
+/// damaged, the window backs off for `retry_backoff` and is merged by a later
+/// pass.
 ///
 /// Sequence: one window, one span part, two annotation parts of 1000 records
 /// with long comments; compaction with `retry_backoff` zero. While the merge
@@ -63,10 +62,8 @@ fn unlink_output_once(parts: PathBuf) -> JoinHandle<bool> {
 /// to the open file and renames the directory into place); the open of the
 /// output fails and the merge is abandoned.
 ///
-/// Expected: the inputs stay live and the manifest never lists the output
-/// (this part holds on this tree and is the check that the output is opened
-/// before the replacement); the next pass, the backoff being zero, merges the
-/// window. On this tree it does not: the window is "damaged" until a restart.
+/// Guaranteed: the inputs stay live, the manifest never lists the output, the
+/// output directory is gone, and the next pass merges the window.
 #[test]
 fn a_merge_output_that_cannot_be_opened_is_retried_after_the_backoff() {
     let dir = tempfile::tempdir().unwrap();

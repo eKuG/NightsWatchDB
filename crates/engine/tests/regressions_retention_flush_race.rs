@@ -1,5 +1,6 @@
 //! A flush that publishes into an expiring window while retention prepares
-//! its replacement leaves the window's spans visible without its annotations.
+//! its replacement does not leave the window's spans visible without its
+//! annotations: the replacement removes what the flush published meanwhile.
 
 mod common;
 
@@ -10,24 +11,22 @@ use std::time::{Duration, Instant};
 use common::*;
 use nwdb_engine::{Engine, Stage};
 
-/// Defect: `apply_retention` decides which parts are expired from the lists
-/// it reads before `replace_parts` takes the publish gate. A flush that
-/// publishes a part into an expired window in between (late spans of a trace
-/// whose window is expiring) is not in that decision, so the replacement takes
-/// the window's annotation parts and leaves that span part. The README
-/// (Retention) says a snapshot sees the expired parts or not, "never some of
-/// them, and never a window's spans without its annotations or the other way
-/// round".
+/// `apply_retention` decides which parts are expired before `replace_parts`
+/// takes the publish gate. A flush that publishes a part into an expired window
+/// in between (late spans of a trace whose window is expiring) is not in that
+/// decision; under the gate the replacement removes the parts, of either kind,
+/// that were published meanwhile into a window expired by the same cut-off, in
+/// the same commit. A snapshot sees the expired parts or not, never a window's
+/// spans without its annotations.
 ///
 /// Sequence: window 0 holds trace 1 (span part) and its annotation "q" = 1
 /// (annotation part); the clock makes window 0 expired; a pass starts; while
 /// its replacement waits at `ReplaceMapBuilt`, a late span of trace 1 that
 /// starts in window 0 is ingested and flushed; the replacement publishes.
 ///
-/// Expected: a snapshot taken right after that publish (at
+/// Guaranteed: a snapshot taken right after that publish (at
 /// `ReplacePublished`, the pass still holding the maintenance gate) shows the
-/// trace's spans and its annotation together, or neither. On this tree it
-/// shows the late span and no annotation (until the next pass).
+/// trace's spans and its annotation together, or neither.
 #[test]
 fn retention_never_leaves_a_window_s_spans_without_its_annotations() {
     let dir = tempfile::tempdir().unwrap();

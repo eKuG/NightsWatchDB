@@ -1,19 +1,15 @@
-//! Defect: `AnnotationReader::open` allocates and reads the whole block table
-//! that the footer declares, bounded only by the length of the file on disk,
-//! before it compares that length with the one the part's metadata records
-//! (`meta.files["annotations.nwa"]`). A damaged or planted file that is long
-//! (a sparse file costs no disk) and ends in a footer of the right part makes
-//! the open allocate as much memory as the file is long, and only then is it
-//! refused, for a length the manifest already said was wrong.
+//! `AnnotationReader::open` compares the length of the file on disk with the
+//! one the part's metadata records (`meta.files["annotations.nwa"]`) before it
+//! allocates anything sized by the file's content, so a damaged or planted file
+//! that is long (a sparse file costs no disk) and ends in a footer of the right
+//! part is refused without reading a block table as large as the file.
 //!
 //! Sequence: a part of one record (its metadata records a file of a few
 //! hundred bytes). Its file is replaced by a sparse file of
 //! 36 x 4,000,000 + 80 bytes whose last 80 bytes are the part's footer with
 //! `blocks` = 4,000,000 and the footer checksum recomputed. Open.
 //!
-//! Expected: `Corrupt`, without allocating more than a few MiB (the length
-//! check against the metadata comes first). Observed: `Corrupt` after a
-//! 144 MB allocation.
+//! Guaranteed: `Corrupt`, without allocating more than a few MiB.
 
 mod support;
 
