@@ -21,6 +21,7 @@ nwdb-engine = { path = "../engine" }
 nwdb-otlp = { path = "../otlp" }
 nwdb-wal = { path = "../wal" }
 arrow-array.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 hyper = { workspace = true, features = ["http1", "http2", "server"] }

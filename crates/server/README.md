@@ -24,9 +24,14 @@ model output. For that reason both listeners default to the loopback address
   configured, the check is **off**: whoever exposed it did so on purpose, and
   the server cannot know which names reach it. Set `--api-allowed-hosts`
   whenever the API is reachable by a name other than an IP address.
-- **Cross-site requests to write endpoints.** The API is read-only today; its
-  write endpoints (the first arrives with checkpoint 7) take a POST with a JSON
-  body. A web page can make a browser send a POST to `127.0.0.1` with the
+- **The write endpoint.** `POST /api/v1/annotations` is the only way to write
+  through the API. With no authentication, any local client that passes the
+  rules below can attach annotations (scores, labels, comments) to traces that
+  exist, overwrite or delete annotations, and so change what the trace view and
+  the list show. It cannot create, change or delete traces or spans, and it
+  cannot annotate a trace the server does not hold.
+- **Cross-site requests to write endpoints.** Write endpoints take a POST with
+  a JSON body. A web page can make a browser send a POST to `127.0.0.1` with the
   right `Host`, so the host check does not stop it. The defence is to refuse
   every request a page can send across sites without a CORS preflight, and to
   never answer a preflight with permission: no response of the API carries an
@@ -310,8 +315,8 @@ default, a field of `ServerOptions`) is aborted. The connection is closed, the
 task that renders the response ends, and its rows and its slot are freed. A
 client that reads slowly but steadily is not cut off.
 
-**Write requests.** Every route is a GET today. A path that takes a POST (the
-first arrives with checkpoint 7) answers 405 to a GET, and every other path
+**Write requests.** `/api/v1/annotations` takes a POST and every other route a
+GET. A path that takes a POST answers 405 to a GET, and every other path
 answers 405 to a POST. A handler of a write path receives the body through
 `JsonBody` (in `src/api/body.rs`), which applies these rules after the `Host`
 check and after the request has its concurrency slot, so the bodies held in
@@ -366,8 +371,9 @@ curl http://127.0.0.1:4320/healthz
 `retention_parts_removed`, `last_maintenance_error` and the compaction
 counters `merges_done`, `parts_merged_away`, `duplicate_spans_dropped`,
 `merge_input_bytes`, `merge_output_bytes`, `windows_with_many_parts` (windows
-that now have more than one part), `merging` (a merge is running) and
-`last_compaction_error`. The three `payload_*`
+that now have more than one part), `merging` (a merge is running),
+`last_compaction_error` and `annotations_buffered` (annotations in the memory
+buffers, not yet in parts). The three `payload_*`
 fields are for the flushed parts: the large text (prompts, completions, tool definitions and
 results, and other long values) their spans hold, counting every use; the same
 text with each distinct piece counted once per part; and what that takes on
@@ -383,12 +389,21 @@ curl http://127.0.0.1:4320/api/v1/stats
 ```
 
 **`GET /api/v1/traces/{trace_id}`** (32 hex digits) returns all spans of the
-trace in the engine's order (by start time).
+trace in the engine's order (by start time), then its annotations.
 
 ```sh
 curl http://127.0.0.1:4320/api/v1/traces/0af7651916cd43dd8448eb211c80319c
-# {"trace_id":"0af7...","spans":[{"span_id":"b7ad...","name":"chat gpt", ...}]}
+# {"trace_id":"0af7...","spans":[{"span_id":"b7ad...","name":"chat gpt", ...}],
+#  "annotations":[{"name":"quality","source":"judge","time_ns":1700000000000000000,"value":0.9}]}
 ```
+
+`annotations` follows `spans` and is left out when the trace has none. It
+holds at most 1000 annotations, ordered by span id (trace-level ones first),
+name, then source; when more exist the answer has `"annotations_truncated":
+true`. An annotation has `name`, `time_ns` and, when present, `span_id`,
+`source` (left out when empty), `value`, `label` and `comment`. The spans and
+the annotations are read from one snapshot. The protobuf form (below) has no
+annotations and is the same bytes with or without them.
 
 A span has `span_id`, `parent_span_id`, `name`, `kind`, `start_ns`, `end_ns`,
 `status_code`, `status_message`, `trace_state`, `service_name`, `scope_name`,
@@ -423,6 +438,17 @@ curl -H 'Accept: application/x-protobuf' -o trace.pb http://127.0.0.1:4320/api/v
 **`GET /api/v1/traces?from=&to=&service=&model=&error=&limit=`** lists trace
 summaries. `service` is the root span's service, `model` matches any span's
 request model, `error` is `true` or `false`, `limit` is 1 to 1000 (default 20).
+Five more parameters keep the traces that have an annotation (as the trace
+view shows it, after overwrites and deletes) that passes all of them:
+`annotation` (its name), `annotation_source`, `annotation_min` and
+`annotation_max` (the annotation has a value at least or at most this; one
+without a value passes neither), and `annotation_label`. The last four are
+refused with 400 without `annotation`, and `annotation_min` and
+`annotation_max` must be finite numbers (`inf`, `NaN` and `1e400` are 400).
+Every listed trace shows its annotations (all of them, not only the one that
+matched) as `annotations`, at most 32, with `"annotations_truncated": true`
+when there are more; both are left out when it has none. They are read from the
+snapshot the list was read from.
 
 ```sh
 curl 'http://127.0.0.1:4320/api/v1/traces?service=agent&error=true&limit=5'
@@ -430,6 +456,69 @@ curl 'http://127.0.0.1:4320/api/v1/traces?service=agent&error=true&limit=5'
 #   "root_name":"invoke_agent","span_count":12,"error":true,"input_tokens":900,
 #   "output_tokens":120,"models":["gpt-4o"],"session_id":"...","user_id":"..."}]}
 ```
+
+**`POST /api/v1/annotations`** attaches scores, labels and comments to traces
+and to spans.
+
+```sh
+curl -X POST http://127.0.0.1:4320/api/v1/annotations \
+  -H 'Content-Type: application/json' \
+  -d '{"annotations":[
+        {"trace_id":"0af7651916cd43dd8448eb211c80319c","name":"quality",
+         "source":"judge","value":0.9,"label":"good"},
+        {"trace_id":"0af7651916cd43dd8448eb211c80319c","span_id":"b7ad6b7169203331",
+         "name":"relevance","value":3,"comment":"off topic"},
+        {"trace_id":"0af7651916cd43dd8448eb211c80319c","name":"quality",
+         "source":"human","delete":true}]}'
+# {"accepted":3,"rejected":[]}
+```
+
+An item has `trace_id` (32 hex digits) and `name`, which are required, and
+optionally `span_id` (16 hex digits; without it the annotation is on the trace),
+`source` (default empty), `time_ns` (an integer; default the time the server
+received the request, filled in before the record is stored), `value` (a finite
+number), `label`, `comment` and `delete`. It needs a `value` or a `label`, or
+`"delete": true` and then none of `value`, `label` and `comment`. The `name` is
+1 to 128 bytes, `source` up to 128, `label` 1 to 256, `comment` 1 to 4096 (of
+the control characters only newline and tab), and none but the comment may hold
+a control character. The reply is `{"accepted": n, "rejected": [{"index": i,
+"error": "..."}]}`; `rejected` is always there. `accepted` counts the items
+written, including one that a later item of the same request with the same
+identity replaced.
+
+**What is a 400 and what is a rejected item.** The whole request is a 400 and
+nothing is written for: a body that is not JSON of this shape (an empty body, a
+wrong type, a missing `trace_id` or `name`, a field twice, a field that is not
+listed, text after the JSON, a number that is not a finite 64-bit float such as
+`1e400`, a `time_ns` that is not a 64-bit integer, a string with an unpaired
+surrogate), no items, and more than 1000 items (the list is read one item at a
+time and refused at the 1001st, which is not parsed, so a body of many small
+items is never built up). A problem in one item's own content is a **rejected
+item**: the other items are still written. That is an id that is not hex of the
+right length or is all zeros, a name, label or comment that is too long or
+holds characters not allowed, a `value` with `delete`, no `value` or `label`,
+and `unknown trace`. The `index` is the position in the request. The limits of
+the write requests (1 MiB body, content type, `Origin`) apply as above.
+
+**Durability and visibility.** A 200 is sent after the log sync that covers
+the written items, so a 200 survives `kill -9`; the same holds for an answer of
+which every item was rejected, as nothing was written. An annotation is visible
+to the trace view and the list from the moment the answer is sent. A client
+that goes away while it waits does not undo the write: it is logged or not
+whatever the client does. The request keeps its concurrency slot until it has
+answered or the client has gone. When the engine is unavailable, closing or
+fatal the answer is 503 (a request with nothing to write is answered 200 with
+its rejections instead).
+
+**Identity.** An annotation is identified by (trace, span or none, name,
+source). Writing one with an identity that exists replaces it as a whole, and
+the latest write wins; with `"delete": true` it removes it. A delete of an
+annotation that does not exist is accepted and does nothing. A trace must exist
+for an annotation to be written: one that is sent before the trace's spans
+arrived (or after they expired) is rejected with `unknown trace`; retry it once
+the spans are in. An annotation is stored with the time window of its trace, so
+it is removed together with the trace's data when retention removes it. Spans
+that arrive later do not change annotations already written.
 
 **`GET /api/v1/tokens?from=&to=&operation=&limit=`** sums token counts per
 request model over spans that start in the range. Rows are ordered by `count`
@@ -527,6 +616,9 @@ acknowledged, and their senders retry.
 
 - OTLP over HTTP, and logs and metrics (only trace export over gRPC).
 - Authentication and TLS.
+- Writing spans or traces through the API (it takes annotations only), and
+  annotating a trace before its spans have arrived.
+- Searching or aggregating by annotation beyond the list filter.
 - Streaming from storage: the rows of a trace are held in memory while it is
   rendered, though its JSON is not.
 - Counts and token sums may include a span twice if a sender retried it across

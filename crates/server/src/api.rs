@@ -12,7 +12,9 @@ use axum::routing::get;
 use bytes::Bytes;
 use hyper::body::{Body as HttpBody, Frame};
 use nwdb_core::{Error, SpanColumns, SpanRecord, TraceId, TraceSummary};
-use nwdb_engine::{AggQuery, Engine, ListQuery, SearchQuery};
+use nwdb_engine::{
+    AggQuery, Annotation, AnnotationFilter, Engine, ListQuery, SearchQuery, Snapshot,
+};
 use nwdb_otlp::{
     encode_spans, resource_dropped_attributes, scope_dropped_attributes, write_attrs, write_events,
     write_links, write_resource, write_scope_attrs,
@@ -39,11 +41,17 @@ const CHUNK: usize = 64 * 1024;
 const CHUNKS_IN_FLIGHT: usize = 4;
 const PROTOBUF: &str = "application/x-protobuf";
 const TRACE_PREFIX: &str = "/api/v1/traces/";
+/// Annotations a trace view shows; one more means `annotations_truncated`.
+const TRACE_ANNOTATIONS: usize = 1000;
+/// Annotations each trace of a list shows.
+const LIST_ANNOTATIONS: usize = 32;
 
+mod annotate;
 mod body;
 pub(crate) use body::BodyLimits;
-#[allow(unused_imports)] // used by the first write endpoint
 pub(crate) use body::JsonBody;
+
+use annotate::annotations_json;
 
 #[derive(Clone)]
 struct Api {
@@ -224,7 +232,10 @@ fn write_routes(routes: Router<Api>) -> Router<Api> {
             json_response(StatusCode::OK, &json!({ "len": b.len(), "sum": sum }))
         }),
     );
-    routes
+    routes.route(
+        "/api/v1/annotations",
+        axum::routing::post(annotate::annotate),
+    )
 }
 
 // ---- errors ----
@@ -335,6 +346,18 @@ impl Params {
             .map(|v| {
                 v.parse()
                     .map_err(|_| ApiError::bad(format!("`{name}` must be an integer")))
+            })
+            .transpose()
+    }
+
+    /// A finite number.
+    fn float(&mut self, name: &str) -> Result<Option<f64>, ApiError> {
+        self.take(name)
+            .map(|v| {
+                v.parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .ok_or_else(|| ApiError::bad(format!("`{name}` must be a finite number")))
             })
             .transpose()
     }
@@ -461,6 +484,7 @@ async fn stats(State(api): State<Api>) -> Response {
             "windows_with_many_parts": s.windows_with_many_parts,
             "merging": s.merging,
             "last_compaction_error": s.last_compaction_error,
+            "annotations_buffered": s.annotations_buffered,
         }),
     )
 }
@@ -480,19 +504,23 @@ async fn get_trace(
         .ok_or_else(|| ApiError::bad("the trace id is not valid percent-encoding"))?;
     let trace_id: TraceId = id.parse().map_err(|e| api.error(&e))?;
     let protobuf = wants_protobuf(&headers);
-    let found = move |engine: Engine| {
-        engine
-            .get_trace(trace_id)?
-            .filter(|b| b.iter().any(|b| b.num_rows() > 0))
-            .ok_or_else(|| Error::not_found(format!("trace {trace_id}")))
-    };
     if protobuf {
         let body = api
-            .run(slot, move |engine| encode_spans(&found(engine)?))
+            .run(slot, move |engine| {
+                encode_spans(&spans_of(&engine.snapshot(), trace_id)?)
+            })
             .await?;
         return Ok((StatusCode::OK, [(CONTENT_TYPE, PROTOBUF)], body).into_response());
     }
-    let batches = api.run(slot.clone(), found).await?;
+    // Spans and annotations come from one snapshot.
+    let (batches, annotations, more) = api
+        .run(slot.clone(), move |engine| {
+            let snapshot = engine.snapshot();
+            let batches = spans_of(&snapshot, trace_id)?;
+            let (annotations, more) = snapshot.annotations(trace_id, TRACE_ANNOTATIONS)?;
+            Ok((batches, annotations, more))
+        })
+        .await?;
     // The JSON is written by a blocking task and sent in chunks through a
     // small channel, so a trace is never held as JSON. A client that is slow
     // holds the task back; one that is gone, or that makes no progress for
@@ -505,7 +533,8 @@ async fn get_trace(
             tx,
             buf: Vec::with_capacity(CHUNK),
         };
-        let result = render_trace(trace_id, &batches, &mut out).and_then(|()| out.flush());
+        let result = render_trace(trace_id, &batches, &annotations, more, &mut out)
+            .and_then(|()| out.flush());
         if let Err(e) = result {
             // A failure other than the client leaving ends the body with an
             // error, so that the client sees a cut-off response and not a
@@ -521,6 +550,14 @@ async fn get_trace(
         axum::body::Body::new(Chunks(rx)),
     )
         .into_response())
+}
+
+/// The spans of a trace in `snapshot`; not found when it has none.
+fn spans_of(snapshot: &Snapshot, id: TraceId) -> nwdb_core::Result<Vec<arrow_array::RecordBatch>> {
+    snapshot
+        .get_trace(id)?
+        .filter(|b| b.iter().any(|b| b.num_rows() > 0))
+        .ok_or_else(|| Error::not_found(format!("trace {id}")))
 }
 
 /// The body of a streamed response.
@@ -580,10 +617,12 @@ impl Write for ChunkWriter {
     }
 }
 
-/// Writes the trace one span at a time.
+/// Writes the trace one span at a time, then its annotations.
 fn render_trace(
     id: TraceId,
     batches: &[arrow_array::RecordBatch],
+    annotations: &[Annotation],
+    more: bool,
     out: &mut dyn Write,
 ) -> io::Result<()> {
     write!(out, "{{\"trace_id\":\"{id}\",\"spans\":[")?;
@@ -598,7 +637,16 @@ fn render_trace(
             write_span(out, &cols.record(row))?;
         }
     }
-    out.write_all(b"]}")
+    out.write_all(b"]")?;
+    if !annotations.is_empty() {
+        out.write_all(b",\"annotations\":")?;
+        serde_json::to_writer(&mut *out, &annotations_json(annotations))
+            .map_err(io::Error::from)?;
+        if more {
+            out.write_all(b",\"annotations_truncated\":true")?;
+        }
+    }
+    out.write_all(b"}")
 }
 
 /// A writer that stops as soon as it is given more than an empty object.
@@ -731,18 +779,54 @@ async fn list_traces(
             .filter(|n| (1..=MAX_LIMIT).contains(n))
             .ok_or_else(|| ApiError::bad(format!("`limit` must be 1 to {MAX_LIMIT}")))?,
     };
+    let name = p.take("annotation");
+    let source = p.take("annotation_source");
+    let min = p.float("annotation_min")?;
+    let max = p.float("annotation_max")?;
+    let label = p.take("annotation_label");
+    let annotation = match name {
+        Some(name) => Some(AnnotationFilter {
+            name,
+            source,
+            min,
+            max,
+            label,
+        }),
+        None if source.is_some() || min.is_some() || max.is_some() || label.is_some() => {
+            return Err(ApiError::bad(
+                "`annotation_source`, `annotation_min`, `annotation_max` and `annotation_label` need `annotation`",
+            ));
+        }
+        None => None,
+    };
     let query = ListQuery {
         from_ns,
         to_ns,
         service: p.take("service"),
         model: p.take("model"),
         error,
-        annotation: None,
+        annotation,
         limit,
     };
     p.finish()?;
-    let traces = api.run(slot, move |e| e.list_traces(&query)).await?;
-    let traces: Vec<Value> = traces.iter().map(summary_json).collect();
+    // The annotations come from the snapshot the listing was read from.
+    let traces = api
+        .run(slot, move |e| {
+            let snapshot = e.snapshot();
+            snapshot
+                .list_traces(&query)?
+                .into_iter()
+                .map(|t| {
+                    let (a, more) = snapshot.annotations(t.trace_id, LIST_ANNOTATIONS)?;
+                    Ok((t, a, more))
+                })
+                .collect::<nwdb_core::Result<Vec<_>>>()
+        })
+        .await?;
+    let traces: Vec<Value> = traces
+        .iter()
+        .map(|(t, a, more)| summary_json(t, a, *more))
+        .collect();
     Ok(json_response(StatusCode::OK, &json!({ "traces": traces })))
 }
 
@@ -804,7 +888,7 @@ async fn search(
     ))
 }
 
-fn summary_json(s: &TraceSummary) -> Value {
+fn summary_json(s: &TraceSummary, annotations: &[Annotation], more: bool) -> Value {
     let mut m = Map::new();
     m.insert("trace_id".into(), s.trace_id.to_string().into());
     m.insert("start_ns".into(), (s.start_ns as u64).into());
@@ -824,6 +908,12 @@ fn summary_json(s: &TraceSummary) -> Value {
     m.insert("input_tokens".into(), s.input_tokens.into());
     m.insert("output_tokens".into(), s.output_tokens.into());
     m.insert("models".into(), json!(s.models));
+    if !annotations.is_empty() {
+        m.insert("annotations".into(), annotations_json(annotations));
+        if more {
+            m.insert("annotations_truncated".into(), true.into());
+        }
+    }
     Value::Object(m)
 }
 

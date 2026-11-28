@@ -8,9 +8,6 @@
 //! after the `Host` check and after the request has its concurrency slot, so
 //! the memory held for bodies is at most the limit times the slots.
 
-// Nothing but the tests takes a body until the first write endpoint exists.
-#![allow(dead_code)]
-
 use super::{Api, ApiError};
 use axum::body::Body;
 use axum::extract::{FromRequest, Request};
