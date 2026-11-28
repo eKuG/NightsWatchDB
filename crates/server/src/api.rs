@@ -49,7 +49,6 @@ const LIST_ANNOTATIONS: usize = 32;
 mod annotate;
 mod body;
 pub(crate) use body::BodyLimits;
-pub(crate) use body::JsonBody;
 
 use annotate::annotations_json;
 
@@ -218,14 +217,14 @@ pub(crate) fn router(
         .layer(from_fn_with_state(guard_state, guard))
 }
 
-/// The routes that take a POST. A handler of one takes [`JsonBody`] as its
+/// The routes that take a POST. A handler of one takes [`body::JsonBody`] as its
 /// last argument, which applies every rule for write requests. A path listed
 /// here answers 405 to GET; every path not listed answers 405 to a POST.
 fn write_routes(routes: Router<Api>) -> Router<Api> {
     #[cfg(test)]
     let routes = routes.route(
         "/api/v1/test/body",
-        axum::routing::post(|JsonBody(b): JsonBody| async move {
+        axum::routing::post(|body::JsonBody(b): body::JsonBody| async move {
             let sum = b
                 .iter()
                 .fold(0u64, |s, &x| s.wrapping_mul(31).wrapping_add(x.into()));

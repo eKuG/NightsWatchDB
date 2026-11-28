@@ -743,6 +743,7 @@ dependencies = [
  "nwdb-wal",
  "opentelemetry-proto",
  "prost",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
