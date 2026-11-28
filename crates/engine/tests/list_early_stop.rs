@@ -129,6 +129,7 @@ impl World {
                 .random_bool(0.25)
                 .then(|| ["m1", "m2", "m3"][r.random_range(0..3)].to_owned()),
             error: r.random_bool(0.25).then(|| r.random_bool(0.5)),
+            annotation: None,
             limit: [1, 2, 3, 5, 17, 100_000][r.random_range(0..6)],
         }
     }

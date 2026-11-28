@@ -143,6 +143,7 @@ fn random_list(rng: &mut StdRng) -> ListQuery {
             .random_bool(0.3)
             .then(|| ["m1", "m2", "m3"][rng.random_range(0..3)].to_owned()),
         error: rng.random_bool(0.3).then(|| rng.random_bool(0.5)),
+        annotation: None,
         limit: rng.random_range(1..12),
     }
 }

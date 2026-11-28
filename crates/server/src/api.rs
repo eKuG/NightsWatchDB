@@ -737,6 +737,7 @@ async fn list_traces(
         service: p.take("service"),
         model: p.take("model"),
         error,
+        annotation: None,
         limit,
     };
     p.finish()?;

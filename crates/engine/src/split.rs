@@ -186,7 +186,7 @@ fn push_next(entries: &[TraceEntry], p: usize, i: usize, heap: &mut Heap) {
 
 /// The position of the first entry at or after `from` whose trace id is not
 /// below `id`, found by doubling the step from `from`.
-fn gallop(entries: &[TraceEntry], from: usize, id: TraceId) -> usize {
+pub(crate) fn gallop(entries: &[TraceEntry], from: usize, id: TraceId) -> usize {
     let mut bound = 1;
     while from + bound <= entries.len() && entries[from + bound - 1].trace_id < id {
         bound *= 2;

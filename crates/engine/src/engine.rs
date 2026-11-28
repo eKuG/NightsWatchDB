@@ -19,7 +19,7 @@ use nwdb_manifest::{
     Edit, Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id,
     unreferenced_part_dirs,
 };
-use nwdb_segment::PartReader;
+use nwdb_segment::{Annotation, MAX_BATCH_ITEMS, PartReader, decode_batch, encode_batch};
 use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
 
 use crate::compaction::CompactionOptions;
@@ -35,6 +35,35 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// How long the maintenance thread sleeps between passes when nothing wakes
 /// it earlier.
 const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The tag of a log record that holds annotations: `[0xA1]` followed by
+/// `nwdb_segment::encode_batch`. [`Engine::open`] refuses a door decoder
+/// registered under it.
+pub const ANNOTATION_RECORD_TAG: u8 = 0xA1;
+
+/// What an annotation counts for in the buffer, the in-flight total and the
+/// admission check, besides the bytes of its text: the struct, the ids and the
+/// allocations.
+const ANNOTATION_OVERHEAD_BYTES: usize = 160;
+
+/// The bytes one annotation counts for, everywhere.
+fn annotation_bytes(a: &Annotation) -> usize {
+    ANNOTATION_OVERHEAD_BYTES
+        + a.name.len()
+        + a.source.len()
+        + a.label.as_ref().map_or(0, String::len)
+        + a.comment.as_ref().map_or(0, String::len)
+}
+
+/// The result of [`Engine::annotate`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Annotated {
+    /// Items that were accepted: logged, or superseded by a later item of the
+    /// same request with the same identity (those are not logged).
+    pub accepted: usize,
+    /// Items that were refused: the index in the request and the reason.
+    pub rejected: Vec<(usize, String)>,
+}
 
 /// Settings for [`Engine::open`].
 #[derive(Clone)]
@@ -258,10 +287,12 @@ impl EngineOptions {
 /// Counters and positions, from [`Engine::stats`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EngineStats {
-    /// Requests accepted by [`Engine::ingest`] since the engine was opened.
+    /// Requests accepted by [`Engine::ingest`] and [`Engine::annotate`] since the engine was opened.
     pub records_ingested: u64,
     /// Bytes of those requests' log records, not counting the tag byte.
     pub bytes_ingested: u64,
+    /// Annotations in the active buffer and the buffer being flushed.
+    pub annotations_buffered: usize,
     /// Highest log position whose data is in the buffer or in a part, and
     /// whose sender has been (or is being) acknowledged.
     pub acked_lsn: u64,
@@ -347,7 +378,15 @@ pub(crate) struct Visible {
     /// The buffer being written out, until its parts are live.
     pub frozen: Option<Arc<Vec<Arc<RecordBatch>>>>,
     pub active: Arc<Vec<Arc<RecordBatch>>>,
+    /// The annotations of the buffer being written out, one entry per log
+    /// record, oldest first.
+    pub ann_frozen: Option<AnnBuf>,
+    pub ann_active: AnnBuf,
 }
+
+/// Buffered annotations: one entry per log record, so a snapshot copies a
+/// list of pointers, as for the span batches.
+pub(crate) type AnnBuf = Arc<Vec<Arc<Vec<Annotation>>>>;
 
 /// Everything the threads share under one lock. Held only to move pointers
 /// and counters, never across I/O.
@@ -382,9 +421,15 @@ pub(crate) struct Core {
     pub compaction: crate::maintenance::CompactionState,
 }
 
+/// What one log record holds.
+enum Payload {
+    Spans(Vec<RecordBatch>),
+    Annotations(Vec<Annotation>),
+}
+
 struct Pending {
     result: Result<Lsn>,
-    batches: Vec<RecordBatch>,
+    payload: Payload,
     bytes: usize,
     done: Box<dyn FnOnce(Result<()>) + Send>,
 }
@@ -481,17 +526,24 @@ impl Drop for Handle {
     }
 }
 
-/// Decodes one log record (`[tag] + bytes`) into span batches, refusing with
-/// `Corrupt` what start-up cannot replay. Returns the batches and their
-/// memory size.
+/// Decodes one log record (`[tag] + bytes`), refusing with `Corrupt` what
+/// start-up cannot replay. Returns what it holds and its memory size.
 fn decode_record(
     decoders: &HashMap<u8, Arc<dyn RecordDecoder>>,
     lsn: Lsn,
     payload: &[u8],
-) -> Result<(Vec<RecordBatch>, usize)> {
+) -> Result<(Payload, usize)> {
     let Some((&tag, body)) = payload.split_first() else {
         return Err(Error::corrupt(format!("log record {lsn} is empty")));
     };
+    if tag == ANNOTATION_RECORD_TAG {
+        let items = decode_batch(body, lsn).map_err(|e| match e {
+            Error::Corrupt(m) => Error::corrupt(format!("log record {lsn}: {m}")),
+            other => Error::corrupt(format!("log record {lsn} does not decode: {other}")),
+        })?;
+        let bytes = items.iter().map(annotation_bytes).sum();
+        return Ok((Payload::Annotations(items), bytes));
+    }
     let decoder = decoders
         .get(&tag)
         .ok_or_else(|| Error::corrupt(format!("log record {lsn} has unknown format tag {tag}")))?;
@@ -506,7 +558,7 @@ fn decode_record(
         })?;
         bytes += b.get_array_memory_size();
     }
-    Ok((batches, bytes))
+    Ok((Payload::Spans(batches), bytes))
 }
 
 /// `batch` with its `arrival` column replaced by `lsn` in every row; the other
@@ -576,6 +628,11 @@ impl Engine {
         options.compaction.validate()?;
         let mut decoder_map = HashMap::new();
         for (tag, d) in decoders {
+            if tag == ANNOTATION_RECORD_TAG {
+                return Err(Error::invalid_argument(format!(
+                    "tag {tag} is reserved for annotation records"
+                )));
+            }
             if decoder_map.insert(tag, d).is_some() {
                 return Err(Error::invalid_argument(format!(
                     "two decoders registered for tag {tag}"
@@ -741,6 +798,8 @@ impl Engine {
                     parts: Arc::new(parts),
                     frozen: None,
                     active: Arc::default(),
+                    ann_frozen: None,
+                    ann_active: Arc::default(),
                 },
                 active_bytes: 0,
                 active_oldest: None,
@@ -872,33 +931,7 @@ impl Engine {
         let Some(wal) = wal_guard.as_ref() else {
             return Err(Error::unavailable("the engine is shut down"));
         };
-        let wal_pending = wal.stats().pending_bytes;
-        {
-            let mut c = lock(&inner.core);
-            if let Some(f) = &c.fatal {
-                return Err(Error::fatal(f.clone()));
-            }
-            if c.closing {
-                return Err(Error::unavailable("the engine is shutting down"));
-            }
-            let used = c.active_bytes + c.frozen_bytes + c.inflight_bytes;
-            if used > 0 && used + bytes > inner.opts.max_buffered_bytes {
-                return Err(Error::unavailable(format!(
-                    "{used} bytes are buffered, the limit is {}",
-                    inner.opts.max_buffered_bytes
-                )));
-            }
-            if wal_pending > inner.opts.max_wal_pending_bytes {
-                return Err(Error::unavailable(format!(
-                    "{wal_pending} bytes wait in the log, the limit is {}",
-                    inner.opts.max_wal_pending_bytes
-                )));
-            }
-            c.inflight_bytes += bytes;
-            c.outstanding += 1;
-            c.records += 1;
-            c.bytes += record.len() as u64;
-        }
+        inner.admit(wal, bytes, record.len())?;
 
         record.insert(0, tag);
         let queue = inner.queue.clone();
@@ -909,13 +942,120 @@ impl Engine {
         wal.append_owned(record, move |result| {
             lock(&queue.state).items.push_back(Pending {
                 result,
-                batches,
+                payload: Payload::Spans(batches),
                 bytes,
                 done,
             });
             queue.cv.notify_one();
         });
         Ok(())
+    }
+
+    /// Logs annotations (scores, labels, comments, deletes) of traces that are
+    /// already known, makes them visible once they are durable, and then calls
+    /// `on_durable`.
+    ///
+    /// Fails as a whole, changing nothing, with [`Error::InvalidArgument`] for
+    /// no items or more than [`nwdb_segment::MAX_BATCH_ITEMS`], and with the
+    /// errors of [`ingest`](Self::ingest) when the buffer or the log has too
+    /// much waiting, the engine is shutting down or it is fatal.
+    ///
+    /// Each item is checked in turn: `validate` (the message is the reason),
+    /// then that its trace is known (rows in the buffers or in a live part;
+    /// the span id is not checked, spans may arrive later): "unknown trace".
+    /// Rejected items are listed with their index in `items`; the others are
+    /// written. If two accepted items of the request have the same identity
+    /// the later one wins and the earlier is counted as accepted but not
+    /// logged. The log record takes its number when it is applied to the
+    /// buffer, and that number is the `arrival` of its items, whatever the
+    /// caller set.
+    ///
+    /// `on_durable` is called exactly once, on an engine thread, after the log
+    /// sync that covers the record and after the items became visible to
+    /// queries (as for `ingest`; they are not visible earlier), if and only if
+    /// at least one item was logged. When every item was rejected nothing is
+    /// logged, nothing is admitted (so the admission errors above are not
+    /// returned either) and `on_durable` is dropped uncalled.
+    pub fn annotate(
+        &self,
+        items: Vec<Annotation>,
+        on_durable: impl FnOnce(Result<()>) + Send + 'static,
+    ) -> Result<Annotated> {
+        let inner = self.inner();
+        if items.is_empty() || items.len() > MAX_BATCH_ITEMS {
+            return Err(Error::invalid_argument(format!(
+                "a request holds 1 to {MAX_BATCH_ITEMS} annotations, got {}",
+                items.len()
+            )));
+        }
+        let mut rejected: Vec<(usize, String)> = Vec::new();
+        let mut valid: Vec<usize> = Vec::new();
+        for (i, a) in items.iter().enumerate() {
+            match a.validate() {
+                Ok(()) => valid.push(i),
+                Err(why) => rejected.push((i, why)),
+            }
+        }
+        let ids: Vec<TraceId> = valid.iter().map(|&i| items[i].trace_id).collect();
+        let known = self.snapshot().known_traces(&ids)?;
+        let mut survivors: Vec<usize> = Vec::new();
+        for (&i, known) in valid.iter().zip(known) {
+            if known {
+                survivors.push(i);
+            } else {
+                rejected.push((i, "unknown trace".into()));
+            }
+        }
+        rejected.sort_by_key(|(i, _)| *i);
+        let accepted = survivors.len();
+        // Of equal identities only the last of the request is logged.
+        survivors.sort_by(|&a, &b| items[a].identity_cmp(&items[b]).then(a.cmp(&b)));
+        let mut keep: Vec<usize> = Vec::with_capacity(survivors.len());
+        for (k, &i) in survivors.iter().enumerate() {
+            let last = survivors
+                .get(k + 1)
+                .is_none_or(|&n| items[i].identity_cmp(&items[n]).is_ne());
+            if last {
+                keep.push(i);
+            }
+        }
+        keep.sort_unstable();
+        let result = Annotated { accepted, rejected };
+        if keep.is_empty() {
+            return Ok(result);
+        }
+        let mut slots: Vec<Option<Annotation>> = items.into_iter().map(Some).collect();
+        let logged: Vec<Annotation> = keep
+            .iter()
+            .map(|&i| slots[i].take().expect("each index is kept once"))
+            .collect();
+        let bytes: usize = logged.iter().map(annotation_bytes).sum();
+        let mut record = vec![ANNOTATION_RECORD_TAG];
+        encode_batch(&logged, &mut record)?;
+        if record.len() >= MAX_RECORD_BYTES {
+            return Err(Error::invalid_argument(format!(
+                "record of {} bytes is too large",
+                record.len()
+            )));
+        }
+
+        let wal_guard = inner.wal.read().unwrap_or_else(|e| e.into_inner());
+        let Some(wal) = wal_guard.as_ref() else {
+            return Err(Error::unavailable("the engine is shut down"));
+        };
+        inner.admit(wal, bytes, record.len() - 1)?;
+        let queue = inner.queue.clone();
+        let done: Box<dyn FnOnce(Result<()>) + Send> = Box::new(on_durable);
+        wal.append_owned(record, move |r| {
+            lock(&queue.state).items.push_back(Pending {
+                result: r,
+                payload: Payload::Annotations(logged),
+                bytes,
+                done,
+            });
+            queue.cv.notify_one();
+        });
+        Ok(result)
     }
 
     /// Writes everything acknowledged so far into parts, publishes them in
@@ -991,6 +1131,13 @@ impl Engine {
         EngineStats {
             records_ingested: c.records,
             bytes_ingested: c.bytes,
+            annotations_buffered: c
+                .vis
+                .ann_active
+                .iter()
+                .chain(c.vis.ann_frozen.iter().flat_map(|f| f.iter()))
+                .map(|b| b.len())
+                .sum(),
             acked_lsn: c.applied_lsn,
             flushed_lsn: c.flushed_lsn,
             buffered_bytes: c.active_bytes + c.frozen_bytes,
@@ -1060,28 +1207,78 @@ impl Inner {
         self.flusher_cv.notify_all();
     }
 
-    /// Adds batches to the active buffer. `lsn` is the log position of the
-    /// record they came from.
+    /// The admission check of every request that is logged: refuses with
+    /// `Fatal` or `Unavailable` and changes nothing, or counts the request as
+    /// in flight. `bytes` is the request's memory size as the buffer will
+    /// count it and `record_len` the bytes of its log record, not counting the
+    /// tag. `wal` is the log, read-locked by the caller.
+    fn admit(&self, wal: &Wal, bytes: usize, record_len: usize) -> Result<()> {
+        let wal_pending = wal.stats().pending_bytes;
+        let mut c = lock(&self.core);
+        if let Some(f) = &c.fatal {
+            return Err(Error::fatal(f.clone()));
+        }
+        if c.closing {
+            return Err(Error::unavailable("the engine is shutting down"));
+        }
+        let used = c.active_bytes + c.frozen_bytes + c.inflight_bytes;
+        if used > 0 && used + bytes > self.opts.max_buffered_bytes {
+            return Err(Error::unavailable(format!(
+                "{used} bytes are buffered, the limit is {}",
+                self.opts.max_buffered_bytes
+            )));
+        }
+        if wal_pending > self.opts.max_wal_pending_bytes {
+            return Err(Error::unavailable(format!(
+                "{wal_pending} bytes wait in the log, the limit is {}",
+                self.opts.max_wal_pending_bytes
+            )));
+        }
+        c.inflight_bytes += bytes;
+        c.outstanding += 1;
+        c.records += 1;
+        c.bytes += record_len as u64;
+        Ok(())
+    }
+
+    /// Adds a record's content to the active buffer. `lsn` is the log
+    /// position of the record.
     ///
-    /// The `arrival` column of every row is set to `lsn` here, for live
-    /// ingest and log replay alike, so a replay gives the values the first
-    /// run gave. The column has the width the decoder's had, so `bytes` is
-    /// still right.
-    fn push_active(&self, c: &mut Core, batches: Vec<RecordBatch>, bytes: usize, lsn: Lsn) {
-        let batches: Vec<Arc<RecordBatch>> = batches
-            .into_iter()
-            .filter(|b| b.num_rows() > 0)
-            .map(|b| Arc::new(stamp_arrival(b, lsn)))
-            .collect();
-        if !batches.is_empty() {
-            if c.vis.active.is_empty() {
+    /// The `arrival` of every span row and every annotation is set to `lsn`
+    /// here, for live requests and log replay alike, so a replay gives the
+    /// values the first run gave. The span column has the width the decoder's
+    /// had, so `bytes` is still right.
+    fn push_active(&self, c: &mut Core, payload: Payload, bytes: usize, lsn: Lsn) {
+        let was_empty = c.vis.active.is_empty() && c.vis.ann_active.is_empty();
+        let added = match payload {
+            Payload::Spans(batches) => {
+                let batches: Vec<Arc<RecordBatch>> = batches
+                    .into_iter()
+                    .filter(|b| b.num_rows() > 0)
+                    .map(|b| Arc::new(stamp_arrival(b, lsn)))
+                    .collect();
+                let added = !batches.is_empty();
+                if added {
+                    // Copies the list only if a snapshot still holds the old one.
+                    Arc::make_mut(&mut c.vis.active).extend(batches);
+                }
+                added
+            }
+            Payload::Annotations(mut items) => {
+                for a in &mut items {
+                    a.arrival = lsn;
+                }
+                Arc::make_mut(&mut c.vis.ann_active).push(Arc::new(items));
+                true
+            }
+        };
+        if added {
+            if was_empty {
                 c.active_oldest = Some(Instant::now());
                 // The flusher sleeps without a deadline while the buffer is
                 // empty; this starts the age clock.
                 self.flusher_cv.notify_all();
             }
-            // Copies the list only if a snapshot still holds the old one.
-            Arc::make_mut(&mut c.vis.active).extend(batches);
             c.active_bytes += bytes;
         }
         c.applied_lsn = lsn;
@@ -1093,7 +1290,7 @@ impl Inner {
     /// Start-up: decodes one log record into the buffer, flushing when the
     /// buffer is full.
     fn replay_record(&self, lsn: Lsn, payload: &[u8]) -> Result<()> {
-        let (batches, bytes) = decode_record(&self.decoders, lsn, payload)?;
+        let (content, bytes) = decode_record(&self.decoders, lsn, payload)?;
         let full = {
             let mut c = lock(&self.core);
             if lsn != c.applied_lsn + 1 {
@@ -1102,7 +1299,7 @@ impl Inner {
                     c.applied_lsn
                 )));
             }
-            self.push_active(&mut c, batches, bytes, lsn);
+            self.push_active(&mut c, content, bytes, lsn);
             c.active_bytes >= self.opts.buffer_bytes
         };
         if full {
@@ -1153,7 +1350,7 @@ impl Inner {
     fn apply(&self, p: Pending) {
         let Pending {
             result,
-            batches,
+            payload,
             bytes,
             done,
         } = p;
@@ -1172,7 +1369,7 @@ impl Inner {
                         self.set_fatal_locked(&mut c, msg.clone());
                         Err(Error::fatal(msg))
                     } else {
-                        self.push_active(&mut c, batches, bytes, lsn);
+                        self.push_active(&mut c, payload, bytes, lsn);
                         Ok(())
                     }
                 }

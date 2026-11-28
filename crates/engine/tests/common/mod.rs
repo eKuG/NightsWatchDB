@@ -28,6 +28,7 @@ pub fn list_all() -> ListQuery {
         service: None,
         model: None,
         error: None,
+        annotation: None,
         limit: usize::MAX,
     }
 }

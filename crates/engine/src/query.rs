@@ -9,13 +9,14 @@ use nwdb_core::{
     BatchLimits, Error, Result, SpanBatchBuilder, SpanColumns, SpanId, SummaryBuilder,
     SummaryColumns, TraceId, TraceSummary, col,
 };
-use nwdb_segment::{PartReader, ScanOptions, SummaryScanRev};
+use nwdb_segment::{Annotation, PartReader, ScanOptions, SummaryScanRev};
 
 use crate::engine::Visible;
 use crate::rows::group_traces;
+use crate::split::gallop;
 
 /// Parameters of [`Snapshot::list_traces`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ListQuery {
     /// Inclusive lower bound of the trace's start (its earliest span start).
     pub from_ns: i64,
@@ -28,9 +29,48 @@ pub struct ListQuery {
     pub model: Option<String>,
     /// Keep only traces whose error flag equals this.
     pub error: Option<bool>,
+    /// Keep only traces with a matching annotation (see [`AnnotationFilter`]).
+    pub annotation: Option<AnnotationFilter>,
     /// Return at most this many traces.
     pub limit: usize,
 }
+
+/// A test on the winning, not deleted annotations of a trace and of its
+/// spans. A trace matches if some such annotation has this `name`, and the
+/// `source` if one is given, and a value of at least `min` if given, and a
+/// value of at most `max` if given (an annotation without a value matches
+/// neither bound), and the `label` if given.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnotationFilter {
+    /// The annotation's name; required.
+    pub name: String,
+    /// Its source, if given.
+    pub source: Option<String>,
+    /// Its value must be at least this, if given.
+    pub min: Option<f64>,
+    /// Its value must be at most this, if given.
+    pub max: Option<f64>,
+    /// Its label, if given.
+    pub label: Option<String>,
+}
+
+impl AnnotationFilter {
+    /// Whether one annotation passes; the caller has applied winners and
+    /// deletes.
+    pub(crate) fn matches(&self, a: &Annotation) -> bool {
+        a.name == self.name
+            && self.source.as_ref().is_none_or(|s| *s == a.source)
+            && self.min.is_none_or(|m| a.value.is_some_and(|v| v >= m))
+            && self.max.is_none_or(|m| a.value.is_some_and(|v| v <= m))
+            && self
+                .label
+                .as_ref()
+                .is_none_or(|l| a.label.as_ref() == Some(l))
+    }
+}
+
+/// The identity of an annotation within its trace, in identity order.
+type AnnotationKey = (Option<SpanId>, String, String);
 
 /// Parameters of [`Snapshot::aggregate_tokens`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,6 +404,110 @@ impl Snapshot {
         Ok(Some(out))
     }
 
+    /// For each of `ids`, in the order given, whether the trace has rows in
+    /// a live part or in the buffers (the active one and the one being
+    /// flushed). Duplicate ids are fine.
+    ///
+    /// Cost: the ids are sorted once (`n log n`); then each live part's
+    /// in-memory trace index is walked forward once with the galloping search
+    /// the split map uses, for the ids still unknown: at most `n` steps of
+    /// the logarithm of the index over `n` per part, and no I/O. Only if some
+    /// ids are still unknown after the parts, one pass over the buffered
+    /// batches' trace id columns, which costs time proportional to the
+    /// buffered rows, whatever `n`.
+    pub fn known_traces(&self, ids: &[TraceId]) -> Result<Vec<bool>> {
+        let mut known = vec![false; ids.len()];
+        if ids.is_empty() {
+            return Ok(known);
+        }
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_unstable_by_key(|&i| ids[i]);
+        for p in self.vis.parts.iter() {
+            let entries = p.reader.trace_entries();
+            let mut at = 0;
+            for &i in &order {
+                if known[i] {
+                    continue;
+                }
+                at = gallop(entries, at, ids[i]);
+                if at == entries.len() {
+                    break;
+                }
+                known[i] = entries[at].trace_id == ids[i];
+            }
+        }
+        let mut unknown: HashSet<TraceId> = order
+            .iter()
+            .filter(|&&i| !known[i])
+            .map(|&i| ids[i])
+            .collect();
+        let mut found: HashSet<TraceId> = HashSet::new();
+        for b in self.buffer() {
+            if unknown.is_empty() {
+                break;
+            }
+            let col: &FixedSizeBinaryArray = column(b, col::TRACE_ID)?;
+            for r in 0..col.len() {
+                let id = TraceId(
+                    col.value(r)
+                        .try_into()
+                        .map_err(|_| Error::corrupt("a trace id column is not 16 bytes wide"))?,
+                );
+                if unknown.remove(&id) {
+                    found.insert(id);
+                }
+            }
+        }
+        for (k, id) in known.iter_mut().zip(ids) {
+            *k = *k || found.contains(id);
+        }
+        Ok(known)
+    }
+
+    /// Every record of the buffers for one trace, the newest per identity
+    /// (deletes included, so that older records elsewhere can be shadowed).
+    /// Time proportional to the buffered annotations.
+    fn buffer_annotation_winners(&self, trace: TraceId) -> BTreeMap<AnnotationKey, Annotation> {
+        let mut winners: BTreeMap<AnnotationKey, Annotation> = BTreeMap::new();
+        let batches = self
+            .vis
+            .ann_frozen
+            .iter()
+            .flat_map(|f| f.iter())
+            .chain(self.vis.ann_active.iter());
+        for a in batches
+            .flat_map(|b| b.iter())
+            .filter(|a| a.trace_id == trace)
+        {
+            let key = (a.span_id, a.name.clone(), a.source.clone());
+            match winners.get(&key) {
+                Some(w) if w.arrival >= a.arrival => {}
+                _ => {
+                    winners.insert(key, a.clone());
+                }
+            }
+        }
+        winners
+    }
+
+    /// The winning annotations of a trace, on the trace and on its spans,
+    /// with deletes applied (a deleted identity is absent), in identity order
+    /// (span id with none first, name, source), at most `limit`; the flag says
+    /// more exist. Of the records with one identity the one with the largest
+    /// `arrival` wins.
+    ///
+    /// Cost: one pass over the annotations in the buffers.
+    pub fn annotations(&self, trace: TraceId, limit: usize) -> Result<(Vec<Annotation>, bool)> {
+        let mut out: Vec<Annotation> = self
+            .buffer_annotation_winners(trace)
+            .into_values()
+            .filter(|a| !a.delete)
+            .collect();
+        let more = out.len() > limit;
+        out.truncate(limit);
+        Ok((out, more))
+    }
+
     /// Partial summaries of the traces in the buffers, one per trace.
     fn buffer_summaries(&self) -> Result<HashMap<TraceId, TraceSummary>> {
         let batches: Vec<&Arc<RecordBatch>> = self.buffer().collect();
@@ -628,6 +772,15 @@ impl Snapshot {
                 continue;
             }
             if query.error.is_some_and(|e| e != merged.error) {
+                continue;
+            }
+            if let Some(f) = &query.annotation
+                && !self
+                    .annotations(id, usize::MAX)?
+                    .0
+                    .iter()
+                    .any(|a| f.matches(a))
+            {
                 continue;
             }
             best.push(Ranked(merged));

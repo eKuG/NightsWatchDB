@@ -36,8 +36,11 @@ mod replace_tests;
 mod search_tests;
 
 pub use compaction::CompactionOptions;
-pub use engine::{Clock, Engine, EngineOptions, EngineStats, Stage, StageHook};
-pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
+pub use engine::{
+    ANNOTATION_RECORD_TAG, Annotated, Clock, Engine, EngineOptions, EngineStats, Stage, StageHook,
+};
+pub use nwdb_segment::Annotation;
+pub use query::{AggQuery, AnnotationFilter, ListQuery, ListStats, Snapshot, TokenAgg};
 pub use search::{SearchHit, SearchQuery, SearchResults, SearchStats};
 
 /// Limits of a search. `max_confirm_bytes` is one budget for all the parts of
