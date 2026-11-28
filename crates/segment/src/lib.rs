@@ -21,6 +21,7 @@
 //! one part from several without rebuilding their text. The file formats are
 //! described in the crate's `README.md`.
 
+mod annotation;
 mod index;
 mod merge;
 mod reader;
@@ -28,6 +29,11 @@ mod search;
 mod text;
 mod writer;
 
+pub use annotation::{
+    ANNOTATION_FILE, ANNOTATION_FORMAT_VERSION, Annotation, MAX_BATCH_ITEMS, MAX_COMMENT_BYTES,
+    MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_SOURCE_BYTES, check_annotation_format_version,
+    decode_batch, encode_batch,
+};
 pub use index::{FileChecksum, INDEX_FILE, TraceEntry};
 pub use merge::{DEFAULT_MERGE_CHUNK_BYTES, MergeOptions, MergeStats, merge_parts};
 pub use nwdb_payload::{PieceObserver, PieceReader};

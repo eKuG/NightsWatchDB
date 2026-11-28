@@ -723,3 +723,58 @@ records their lengths and checksums in the index header (the header grows from
 `text.rows` (the id-list format version becomes 2), and records the footer
 checksums of `text.idx` and `text.rows` in the index header (the header grows
 from 88 to 96 bytes).
+
+## Annotations: the record
+
+An annotation is a score, a label or a comment attached to a trace, or to one
+span of it, after the spans were written. This crate defines the record and its
+encoding (`Annotation`, `encode_batch`, `decode_batch`); the annotation part
+file (`annotations.nwa`, format version `ANNOTATION_FORMAT_VERSION` = 1) arrives
+with the next package.
+
+**Identity.** `(trace_id, span_id, name, source)`. `Annotation::identity_cmp`
+orders by trace id, then span id (no span id first), then the bytes of the name,
+then the bytes of the source. Of all records with one identity the one with the
+largest `arrival` (the number of the log record that brought it) is the one
+shown; if it has the delete flag there is no annotation. Time is not part of the
+identity.
+
+**Limits.**
+
+| Field | Rule |
+| --- | --- |
+| `trace_id` | not all zeros |
+| `span_id` | if present, not all zeros |
+| `name` | 1 to 128 bytes (`MAX_NAME_BYTES`), UTF-8, no control characters |
+| `source` | 0 to 128 bytes (`MAX_SOURCE_BYTES`), same rule |
+| `label` | if present, 1 to 256 bytes (`MAX_LABEL_BYTES`), same rule |
+| `comment` | if present, 1 to 4096 bytes (`MAX_COMMENT_BYTES`), UTF-8; control characters other than `\n` and `\t` refused |
+| `value` | if present, finite (no NaN, no infinity) |
+| not a delete | at least one of `value` and `label` (a comment alone is not an annotation) |
+| a delete | none of `value`, `label`, `comment` |
+| items per log record | 1 to 1000 (`MAX_BATCH_ITEMS`) |
+
+Control characters are those for which `char::is_control` is true. Lengths are
+in bytes.
+
+**Record.** All integers little-endian.
+
+```
+trace_id[16] | flags u8 | span_id[8] if flag 1 | arrival u64 (part blocks only)
+| time_ns i64 | name_len u8, name | source_len u8, source
+| value f64 bits if flag 4 | label_len u16, label if flag 8
+| comment_len u16, comment if flag 16
+```
+
+Flags: 1 has a span id, 2 delete, 4 has a value, 8 has a label, 16 has a
+comment. Bits 5 to 7 are reserved and must be zero. The encoding of a valid
+record is unique, so decoding and encoding again gives the same bytes.
+
+**Log record body.** `count u16` (1 to 1000), then that many records without
+`arrival`. The log record's own number is the `arrival` of every item in it;
+`decode_batch(body, arrival)` stamps it. The decoder is strict and returns
+`Corrupt` for a count of 0 or over 1000, a truncated or over-long body, a flag
+bit that is reserved, text that is not UTF-8, a record `validate` refuses, or an
+identity that occurs twice in one body. It reserves memory only for as many
+records as the body's bytes can hold. `encode_batch` returns `InvalidArgument`,
+and writes nothing, for the same faults.
