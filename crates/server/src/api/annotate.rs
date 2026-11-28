@@ -8,7 +8,9 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use nwdb_core::{SpanId, TraceId};
 use nwdb_engine::Annotation;
-use serde::de::value::MapAccessDeserializer;
+use serde::de::value::{
+    BoolDeserializer, F64Deserializer, I64Deserializer, MapAccessDeserializer, U64Deserializer,
+};
 use serde::de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -26,7 +28,8 @@ const ERROR_DETAIL: usize = 160;
 /// A `T` that is read from a JSON object only. serde builds a derived struct
 /// from a JSON array as well, field by field, and `deny_unknown_fields` does
 /// not apply to that form; this wrapper asks for a map, so an array is an
-/// error, and then lets `T` read the map as usual.
+/// error, and then lets `T` read the map as usual. A string gets a fixed
+/// message: the one serde builds when a map is asked for quotes the string.
 struct Object<T>(T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
@@ -42,8 +45,15 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
                 T::deserialize(MapAccessDeserializer::new(map))
             }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<T, E> {
+                Err(E::custom("invalid type: string, expected a JSON object"))
+            }
         }
-        d.deserialize_map(V(PhantomData)).map(Object)
+        // `deserialize_map` would let serde_json build the error for a string
+        // itself, quoting it; `deserialize_any` hands the string to the
+        // visitor above.
+        d.deserialize_any(V(PhantomData)).map(Object)
     }
 }
 
@@ -63,11 +73,71 @@ struct Item {
     span_id: Option<String>,
     name: String,
     source: Option<String>,
+    #[serde(default, deserialize_with = "int")]
     time_ns: Option<i64>,
+    #[serde(default, deserialize_with = "float")]
     value: Option<f64>,
     label: Option<String>,
     comment: Option<String>,
+    #[serde(default, deserialize_with = "flag")]
     delete: Option<bool>,
+}
+
+/// An optional number or bool, read so that a string in its place is refused
+/// with a fixed message: serde's own message quotes the string, and a string
+/// can be a megabyte.
+fn scalar<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+    what: &'static str,
+) -> Result<Option<T>, D::Error> {
+    struct V<T>(&'static str, PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+        type Value = Option<T>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            T::deserialize(I64Deserializer::<E>::new(v)).map(Some)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            T::deserialize(U64Deserializer::<E>::new(v)).map(Some)
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            T::deserialize(F64Deserializer::<E>::new(v)).map(Some)
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            T::deserialize(BoolDeserializer::<E>::new(v)).map(Some)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Err(E::custom(format!(
+                "invalid type: string, expected {}",
+                self.0
+            )))
+        }
+    }
+    d.deserialize_any(V(what, PhantomData))
+}
+
+fn int<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    scalar(d, "an integer")
+}
+
+fn float<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    scalar(d, "a number")
+}
+
+fn flag<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    scalar(d, "a boolean")
 }
 
 /// Reads the list one item at a time and stops at the first one past the
@@ -101,13 +171,49 @@ fn items<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Item>, D::Error> {
     d.deserialize_seq(V)
 }
 
-/// serde_json's message without the " at line L column C" it ends with.
-fn without_position(e: &serde_json::Error) -> String {
-    let text = e.to_string();
+/// Collects the start of what is written to it and refuses the rest, so that
+/// formatting a long message stops as soon as there is enough of it.
+struct Head {
+    text: String,
+    room: usize,
+    cut: bool,
+}
+
+impl fmt::Write for Head {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let mut end = s.len().min(self.room);
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&s[..end]);
+        self.room -= end;
+        if end < s.len() {
+            self.cut = true;
+            return Err(fmt::Error);
+        }
+        Ok(())
+    }
+}
+
+/// At most [`ERROR_DETAIL`] bytes of serde_json's message, without the
+/// " at line L column C" it ends with, and `...` when the message is longer.
+/// The message is not copied whole: serde has built it once, and the copy
+/// stops at the cap.
+fn detail(e: &serde_json::Error) -> String {
+    use fmt::Write as _;
     let suffix = format!(" at line {} column {}", e.line(), e.column());
-    match text.strip_suffix(&suffix) {
+    let mut head = Head {
+        text: String::new(),
+        room: ERROR_DETAIL + suffix.len(),
+        cut: false,
+    };
+    let _ = write!(head, "{e}");
+    if head.cut {
+        return short(&head.text, ERROR_DETAIL);
+    }
+    match head.text.strip_suffix(&suffix) {
         Some(m) => m.to_owned(),
-        None => text,
+        None => head.text,
     }
 }
 
@@ -120,7 +226,7 @@ fn parse(body: &[u8]) -> Result<Vec<Item>, ApiError> {
         // grow with the request.
         ApiError::bad(format!(
             "not a valid annotation request: {} (line {}, column {})",
-            short(&without_position(&e), ERROR_DETAIL),
+            detail(&e),
             e.line(),
             e.column()
         ))

@@ -89,7 +89,13 @@ async fn the_connection_of_a_413_by_length_or_a_408_is_closed() {
     assert_eq!(statuses(&by_length), ["413"], "{by_length}");
     assert!(by_length.to_lowercase().contains("connection: close"));
     assert_eq!(statuses(&timed_out), ["408"], "{timed_out}");
-    assert!(timed_out.to_lowercase().contains("connection: close"));
+    // The HTTP library closes the connection of a 408 on its own whatever the
+    // response says, so ending the read is no proof; the only thing here that
+    // fails without the fix is this header assertion.
+    assert!(
+        timed_out.to_lowercase().contains("connection: close"),
+        "{timed_out}"
+    );
 }
 
 /// What the README says of 403 and 415: the connection is not closed by the

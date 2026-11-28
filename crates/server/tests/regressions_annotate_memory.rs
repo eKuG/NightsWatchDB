@@ -1,6 +1,7 @@
 //! The memory of 64 concurrent `POST /api/v1/annotations` of the largest size
-//! (the API's 64 slots), against the real endpoint: the body, the items parsed
-//! from it, and the record the engine encodes and keeps.
+//! (the API's 64 slots), against the real endpoint: well-formed requests (the
+//! body, the items parsed from it, and the record the engine encodes and
+//! keeps) and malformed ones whose error message could quote what was sent.
 
 mod common;
 
@@ -10,24 +11,42 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// The allocator counts the whole process, so the tests of this file run one
+/// at a time.
+static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const SLOTS: usize = 64;
 const LIMIT: usize = 1 << 20;
 const ITEMS: usize = 1000;
 const TRACE: &str = "07070707070707070707070707070707";
-/// What a request may hold: its body, the items parsed from it (about the
-/// size of the body, and the log's record is built from them), and the
-/// annotations the engine keeps in its buffers until they are flushed (the
-/// same text again, as the body is freed once it is parsed). Three times the
-/// limit per request: 192 MiB for 64. Measured: a peak of about 112 MiB, of
-/// which about 67 MiB stays held by the engine's buffers.
-const BOUND: isize = (SLOTS * 3 * LIMIT) as isize;
+/// What a well-formed request may hold: 2.5 times the limit. Its body, the
+/// items parsed from it (about the size of the body; the log's record is built
+/// from them) and the annotations the engine keeps in its buffers until they
+/// are flushed are three copies of the text, which is where the earlier
+/// statement of 3 times came from; they are not all there at once. Measured:
+/// a peak of about 1.8 times the limit per request (119 MB for 64), of which
+/// 70 MB stays held by the engine's buffers. Freeing the body as soon as it
+/// is parsed (which the handler does) lowers the peak by about 0.3 times
+/// (137 MB without it); that difference is smaller than the variation between
+/// runs, so the bound does not test it.
+const BOUND: isize = (SLOTS * LIMIT * 5 / 2) as isize;
+/// What 64 malformed requests may hold: 2 times the limit each. The body is
+/// held (about 1.5 times the limit is measured for any body of that size: the
+/// HTTP layer holds it in pieces while it is received). The parse of a request
+/// runs on a thread of the runtime without waiting, so only as many parses
+/// are in flight as there are threads, and with 64 bodies in memory they do
+/// not show in the peak (measured at most 1.5 times); each case is therefore
+/// also run alone, where its own peak shows: 2 times the limit for a string,
+/// 4 times for a field name of a megabyte (measured 3.5), which serde copies
+/// into its own message.
+const MALFORMED_BOUND: isize = (SLOTS * 2 * LIMIT) as isize;
 
 fn one_trace() -> Vec<u8> {
     let start = common::now_ns() - 600_000_000_000;
@@ -75,21 +94,22 @@ fn largest(request: usize) -> Vec<u8> {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_largest_annotate_requests_stay_within_the_stated_memory() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut o = common::opts(dir.path());
-    // Nothing is flushed: the engine keeps every record in its buffers.
-    o.engine.flush_interval = Duration::from_secs(3600);
-    o.engine.compaction.enabled = false;
-    let server = Server::start(o).await.unwrap();
-    common::ingest(server.otlp_grpc_addr(), one_trace(), false).await;
-    let api = server.api_addr();
+/// A body of `LIMIT - 1024` bytes whose giant part is `filler` characters
+/// between `before` and `after`.
+fn giant(before: &str, filler: char, after: &str) -> Vec<u8> {
+    let n = (LIMIT - 1024 - before.len() - after.len()) / filler.len_utf8();
+    let mut s = String::with_capacity(LIMIT);
+    s.push_str(before);
+    s.extend(std::iter::repeat_n(filler, n));
+    s.push_str(after);
+    s.into_bytes()
+}
 
-    let bodies: Vec<Arc<Vec<u8>>> = (0..SLOTS).map(|r| Arc::new(largest(r))).collect();
-    let sent = bodies[0].len();
-    assert!(sent > LIMIT - 8192, "the request is only {sent} bytes");
-    let barrier = Arc::new(Barrier::new(SLOTS));
+/// Sends one body per slot, each held one byte short until all 64 are in
+/// memory, then completes them all. Returns the replies, the heap growth at
+/// the peak and the heap still held after.
+fn run(api: SocketAddr, bodies: &[Arc<Vec<u8>>]) -> (Vec<String>, isize, isize) {
+    let barrier = Arc::new(Barrier::new(bodies.len()));
     let base = live();
     reset_peak();
     let clients: Vec<_> = bodies
@@ -109,7 +129,7 @@ async fn concurrent_largest_annotate_requests_stay_within_the_stated_memory() {
                 .unwrap();
                 let (first, last) = body.split_at(body.len() - 1);
                 s.write_all(first).unwrap();
-                // All 64 bodies are in memory, one byte short, at this moment.
+                // All the bodies are in memory, one byte short, at this moment.
                 barrier.wait();
                 s.write_all(last).unwrap();
                 let mut reply = String::new();
@@ -118,24 +138,161 @@ async fn concurrent_largest_annotate_requests_stay_within_the_stated_memory() {
             })
         })
         .collect();
-    for c in clients {
-        let reply = c.join().unwrap();
+    let replies = clients.into_iter().map(|c| c.join().unwrap()).collect();
+    (replies, peak() - base, live() - base)
+}
+
+async fn server(dir: &std::path::Path) -> Server {
+    let mut o = common::opts(dir);
+    // Nothing is flushed: the engine keeps every record in its buffers.
+    o.engine.flush_interval = Duration::from_secs(3600);
+    o.engine.compaction.enabled = false;
+    let server = Server::start(o).await.unwrap();
+    common::ingest(server.otlp_grpc_addr(), one_trace(), false).await;
+    server
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_largest_annotate_requests_stay_within_the_stated_memory() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path()).await;
+    let bodies: Vec<Arc<Vec<u8>>> = (0..SLOTS).map(|r| Arc::new(largest(r))).collect();
+    let sent = bodies[0].len();
+    assert!(sent > LIMIT - 8192, "the request is only {sent} bytes");
+    let (replies, grown, kept) = run(server.api_addr(), &bodies);
+    for reply in replies {
         assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
         assert!(reply.contains(r#""accepted":1000"#), "{reply}");
     }
-    let grown = peak() - base;
-    let kept = live() - base;
-    let bound = BOUND;
     eprintln!(
-        "{SLOTS} requests of {sent} bytes: peak heap growth {grown} bytes, still held {kept}, bound {bound}"
+        "{SLOTS} requests of {sent} bytes: peak heap growth {grown} bytes, still held {kept}, bound {BOUND}"
     );
     server.shutdown().await.unwrap();
     assert!(
-        grown < bound,
+        grown < BOUND,
         "grew by {} MiB, bound {} MiB",
         grown >> 20,
-        bound >> 20
+        BOUND >> 20
     );
     // The test did hold the bodies at the same time.
     assert!(grown > (SLOTS * LIMIT) as isize, "grew by only {grown}");
+}
+
+/// Malformed requests of the largest size whose parse error serde builds by
+/// quoting the text it found: a string where an object is expected (as the
+/// body and as an item), a string where a number is expected, and a field name
+/// of a megabyte. The reply is a short 400 and the memory stays within the
+/// stated bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_malformed_giant_requests_stay_within_the_stated_memory() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let server = server(dir.path()).await;
+    let item = format!(r#"{{"trace_id":"{TRACE}","name":"n","#);
+    let cases: Vec<(&str, Vec<u8>, &str, isize)> = vec![
+        (
+            "string as the body",
+            giant("\"", 'x', "\""),
+            "a JSON object",
+            2,
+        ),
+        (
+            "string as an item",
+            giant(r#"{"annotations":[""#, 'x', r#""]}"#),
+            "a JSON object",
+            2,
+        ),
+        (
+            "string as a number",
+            giant(
+                &format!(r#"{{"annotations":[{item}"time_ns":""#),
+                'x',
+                r#""}]}"#,
+            ),
+            "an integer",
+            2,
+        ),
+        (
+            "string as a bool",
+            giant(
+                &format!(r#"{{"annotations":[{item}"delete":""#),
+                'x',
+                r#""}]}"#,
+            ),
+            "a boolean",
+            2,
+        ),
+        (
+            "characters that debug formatting writes as escapes",
+            giant(
+                &format!(r#"{{"annotations":[{item}"value":""#),
+                '\u{85}',
+                r#""}]}"#,
+            ),
+            "a number",
+            2,
+        ),
+        (
+            "a field name of a megabyte",
+            giant(&format!(r#"{{"annotations":[{item}""#), 'k', r#"":1}]}"#),
+            "unknown field",
+            4,
+        ),
+        (
+            "a top-level field name of a megabyte",
+            giant(r#"{""#, 'k', r#"":1}"#),
+            "unknown field",
+            4,
+        ),
+    ];
+    let mut worst = 0;
+    for (what, body, says, times) in cases {
+        // One request alone: its own peak, parse included. With 64 at once
+        // the parses are spread over the few threads of the runtime and are
+        // hidden by the 64 bodies, so this is where a long message would show.
+        let alone = vec![Arc::new(body.clone())];
+        let (replies, single, _) = run(server.api_addr(), &alone);
+        eprintln!(
+            "{what}: one request of {} bytes, peak heap growth {single} bytes ({:.2} x limit)",
+            body.len(),
+            single as f64 / LIMIT as f64
+        );
+        assert!(
+            replies[0].starts_with("HTTP/1.1 400"),
+            "{what}: {}",
+            replies[0]
+        );
+        assert!(
+            single < times * LIMIT as isize,
+            "{what}: one request grew the heap by {} KiB, bound {} KiB",
+            single >> 10,
+            (times * LIMIT as isize) >> 10
+        );
+        let bodies: Vec<Arc<Vec<u8>>> = (0..SLOTS).map(|_| Arc::new(body.clone())).collect();
+        let (replies, grown, kept) = run(server.api_addr(), &bodies);
+        eprintln!(
+            "{what}: {SLOTS} x {} bytes, peak heap growth {grown} bytes ({:.2} x limit x {SLOTS}), still held {kept}, bound {MALFORMED_BOUND}",
+            body.len(),
+            grown as f64 / (LIMIT * SLOTS) as f64
+        );
+        for reply in &replies {
+            assert!(reply.starts_with("HTTP/1.1 400"), "{what}: {reply}");
+            assert!(reply.contains(says), "{what}: {reply}");
+            assert!(
+                reply.len() < 1024,
+                "{what}: a reply of {} bytes",
+                reply.len()
+            );
+        }
+        assert!(
+            grown < MALFORMED_BOUND,
+            "{what}: grew by {} MiB, bound {} MiB",
+            grown >> 20,
+            MALFORMED_BOUND >> 20
+        );
+        worst = worst.max(grown);
+    }
+    server.shutdown().await.unwrap();
+    eprintln!("worst malformed peak: {worst} bytes");
 }

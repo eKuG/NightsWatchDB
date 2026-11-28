@@ -89,14 +89,14 @@ async fn a_rebound_page_cannot_read_when_the_api_listens_on_all_interfaces() {
     let (server, api, _dir) = start(&[]).await;
     let host = format!("rebind.example:{}", api.port());
 
-    // Every route, the two that answer without a slot included.
+    // Every route, the one that answers without a slot included. (`/healthz`
+    // answers for any `Host`; see `regressions_healthz_host.rs`.)
     for target in [
         "/api/v1/traces".to_string(),
         format!("/api/v1/traces/{TRACE}"),
         "/api/v1/tokens".to_string(),
         "/api/v1/search?q=op".to_string(),
         "/api/v1/stats".to_string(),
-        "/healthz".to_string(),
     ] {
         let r = get(api, &target, &host).await;
         assert_eq!(r.status, 421, "{target}");

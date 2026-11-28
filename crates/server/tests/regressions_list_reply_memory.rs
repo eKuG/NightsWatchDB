@@ -1,7 +1,8 @@
 //! One `GET /api/v1/traces?limit=1000` needs a small, bounded heap and has a
 //! bounded size, however many annotations the traces carry and however large
 //! they are: a listed trace shows at most 8 annotations without their
-//! comments, and the reply is written trace by trace.
+//! comments, the rows are read before the reply starts, and the reply is
+//! written trace by trace.
 
 mod common;
 
@@ -23,12 +24,16 @@ static ALLOC: Counting = Counting;
 const TRACES: u32 = 1000;
 /// What is stored per trace: four times what the list shows.
 const PER_TRACE: usize = 32;
-/// The heap one list request may need: 2 MiB. The reply is written in chunks
-/// of 64 KiB with at most 4 waiting and one being filled (320 KiB), plus the
-/// 1000 summaries and the 8 annotations of the trace being written (the
-/// largest annotation read is 4.6 KB); about 0.45 MiB is measured. Before the
-/// reply was streamed it was 983 MiB.
-const BOUND: isize = 2 << 20;
+/// The heap one list request may need: 12 MiB. Everything the reply shows is
+/// read before the first byte is sent, so what is held is 1000 summaries
+/// (about 0.3 MB for these traces) and 8 annotations per trace without
+/// comments: at most 8000 x 768 bytes (the record, 128 + 128 + 256 bytes of
+/// name, source and label, and the allocator's rounding) = 6.1 MB. While the
+/// last batch of 100 traces is read, its 800 annotations are still whole: up
+/// to 3.9 MB with their 4 KiB comments. The chunks in flight add 320 KiB. That
+/// is 10.7 MB; the bound is 12 MiB. Before the reply was streamed it was
+/// 983 MiB; when it streamed from the snapshot it was 2 MiB.
+const BOUND: isize = 12 << 20;
 /// The largest reply: per trace at most 8 annotations of at most 1.1 KB each
 /// (name, source and label made of characters that JSON writes as two) and a
 /// summary of a few hundred bytes. About 8.9 MB is measured.

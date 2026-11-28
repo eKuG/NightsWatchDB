@@ -46,6 +46,10 @@ const TRACE_ANNOTATIONS: usize = 1000;
 /// Annotations each trace of a list shows, without their comments; one more
 /// means `annotations_truncated`.
 const LIST_ANNOTATIONS: usize = 8;
+/// Listed traces whose annotations are read in one call: 10 passes over the
+/// buffered annotations for 1000 traces, and at most 100 x 8 annotations with
+/// their comments in hand at once.
+const LIST_BATCH: usize = 100;
 
 mod annotate;
 mod body;
@@ -90,7 +94,9 @@ impl HostCheck {
 }
 
 fn normalize(name: &str) -> String {
-    name.trim_end_matches('.').to_ascii_lowercase()
+    // One trailing dot makes a name absolute (`localhost.`); a second is not
+    // a name any resolver gives out.
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
 }
 
 /// The host of a `Host` header value without its port.
@@ -153,6 +159,12 @@ impl HttpBody for Held {
 }
 
 async fn guard(State(g): State<Arc<Guard>>, mut req: Request, next: Next) -> Response {
+    // Answers `ok` or the fatal error text and nothing else, so a request for
+    // any `Host`, or none, may have it: a health check that sends the name of
+    // its upstream, or none at all, must not get a 421.
+    if req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
     if !g.hosts.allows(req.headers().get(HOST)) {
         return ApiError::new(
             StatusCode::MISDIRECTED_REQUEST,
@@ -160,9 +172,9 @@ async fn guard(State(g): State<Arc<Guard>>, mut req: Request, next: Next) -> Res
         )
         .into_response();
     }
-    // These two answer from memory. They are what an operator looks at when
-    // every slot is taken, so they never wait for one.
-    if matches!(req.uri().path(), "/healthz" | "/api/v1/stats") {
+    // This answers from memory. It is what an operator looks at when every
+    // slot is taken, so it never waits for one.
+    if req.uri().path() == "/api/v1/stats" {
         return next.run(req).await;
     }
     // The semaphore is never closed.
@@ -573,7 +585,12 @@ fn stream(
             tx,
             buf: Vec::with_capacity(CHUNK),
         };
-        let result = render(&mut out).and_then(|()| out.flush());
+        // A panic is a failure like any other: without this the channel
+        // would just close and the body would end as if it were complete.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            render(&mut out).and_then(|()| out.flush())
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("the reply could not be rendered")));
         if let Err(e) = result {
             // A failure other than the client leaving ends the body with an
             // error, so that the client sees a cut-off response and not a
@@ -847,25 +864,44 @@ async fn list_traces(
         limit,
     };
     p.finish()?;
-    // The annotations come from the snapshot the listing was read from, and
-    // are read and written one trace at a time.
-    let (snapshot, traces) = api
+    // Everything the reply shows is read from one snapshot before the first
+    // byte is sent, and the snapshot is dropped: a client that reads slowly
+    // must not keep the files of parts that merges and retention have removed.
+    // What is held while the reply is written is at most 1000 summaries and
+    // 8 annotations each, without comments. An engine error is a proper error
+    // response here, not a cut-off 200.
+    let rows = api
         .run(slot.clone(), move |e| {
             let snapshot = e.snapshot();
             let traces = snapshot.list_traces(&query)?;
-            Ok((snapshot, traces))
+            let ids: Vec<TraceId> = traces.iter().map(|t| t.trace_id).collect();
+            let mut found = Vec::with_capacity(ids.len());
+            // One pass over the buffered annotations per batch, not per
+            // trace. The batch bounds what is read with comments (up to 4 KiB
+            // each) before they are dropped.
+            for batch in ids.chunks(LIST_BATCH) {
+                let mut got = snapshot.annotations_many(batch, LIST_ANNOTATIONS)?;
+                for (list, _) in &mut got {
+                    // The list shows no comments.
+                    list.iter_mut().for_each(|a| a.comment = None);
+                }
+                found.extend(got);
+            }
+            drop(snapshot);
+            Ok(traces
+                .into_iter()
+                .zip(found)
+                .map(|(t, (a, more))| (t, a, more))
+                .collect::<Vec<_>>())
         })
         .await?;
     Ok(stream(slot, move |out| {
         out.write_all(b"{\"traces\":[")?;
-        for (i, t) in traces.iter().enumerate() {
+        for (i, (t, a, more)) in rows.iter().enumerate() {
             if i > 0 {
                 out.write_all(b",")?;
             }
-            let (a, more) = snapshot
-                .annotations(t.trace_id, LIST_ANNOTATIONS)
-                .map_err(io::Error::other)?;
-            write_summary(out, t, &a, more)?;
+            write_summary(out, t, a, *more)?;
         }
         out.write_all(b"]}")
     }))
@@ -1101,8 +1137,73 @@ mod tests {
         }
         assert!(allows(&["Traces.Internal"], "traces.internal:80"));
         assert!(allows(&["traces.internal."], "TRACES.internal."));
+        // One trailing dot only.
+        assert!(!allows(&[], "localhost.."));
+        assert!(!allows(&["traces.internal"], "traces.internal.."));
+        assert!(!allows(&["traces.internal.."], "traces.internal"));
         assert!(!allows(&["traces.internal"], "other.internal"));
         assert!(!HostCheck::new(&[]).allows(None));
+    }
+
+    /// What a client sees when the task that renders a streamed reply fails
+    /// after the headers: the connection ends without the terminating chunk,
+    /// so the reply is broken, not a complete 200 with cut-off JSON. The trace
+    /// view and the list both go through `stream`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_render_that_panics_leaves_a_broken_reply() {
+        use std::io::{Read, Write as _};
+
+        let slots = Arc::new(Semaphore::new(2));
+        let render = |panics: bool| {
+            let slots = slots.clone();
+            move || async move {
+                let slot: Slot = Arc::new(slots.acquire_owned().await.unwrap());
+                stream(slot, move |out| {
+                    out.write_all(b"{\"spans\":[")?;
+                    // The first chunk is on its way before the failure.
+                    out.flush()?;
+                    if panics {
+                        panic!("the render failed");
+                    }
+                    out.write_all(b"]}")
+                })
+            }
+        };
+        let app = Router::new()
+            .route("/panics", get(render(true)))
+            .route("/fine", get(render(false)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let fetch = move |path: &'static str| {
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            write!(
+                s,
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut raw = Vec::new();
+            // The connection is reset or closed; what came before is kept.
+            let _ = s.read_to_end(&mut raw);
+            String::from_utf8_lossy(&raw).into_owned()
+        };
+        let (fine, broken) =
+            tokio::task::spawn_blocking(move || (fetch("/fine"), fetch("/panics")))
+                .await
+                .unwrap();
+        assert!(fine.starts_with("HTTP/1.1 200"), "{fine}");
+        assert!(
+            fine.ends_with("0\r\n\r\n"),
+            "a good reply ends with the last chunk: {fine:?}"
+        );
+        assert!(broken.starts_with("HTTP/1.1 200"), "{broken}");
+        assert!(
+            !broken.ends_with("0\r\n\r\n"),
+            "the failed reply ended like a complete one: {broken:?}"
+        );
     }
 
     /// A query that was started keeps its slot until it has finished, even if

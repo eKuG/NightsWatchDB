@@ -905,7 +905,7 @@ async fn the_host_header_is_checked_on_a_loopback_api() {
         format!("traces.internal:{port}"),
         "TRACES.INTERNAL".to_string(),
     ] {
-        let r = http_host(api, &host, "/healthz").await;
+        let r = http_host(api, &host, "/api/v1/stats").await;
         assert_eq!(r.status, 200, "{host}");
     }
     for host in [
@@ -914,7 +914,7 @@ async fn the_host_header_is_checked_on_a_loopback_api() {
         "localhost.evil.example".to_string(),
         String::new(),
     ] {
-        let r = http_host(api, &host, "/healthz").await;
+        let r = http_host(api, &host, "/api/v1/stats").await;
         assert_eq!(r.status, 421, "{host:?}");
         assert!(r.headers.contains("content-type: application/json"));
         assert!(r.json()["error"].is_string());
@@ -932,10 +932,15 @@ async fn the_host_check_is_on_for_a_non_loopback_bind_without_names() {
     let server = Server::start(o).await.unwrap();
     let api = SocketAddr::from(([127, 0, 0, 1], server.api_addr().port()));
     assert_eq!(
-        http_host(api, "anything.example", "/healthz").await.status,
+        http_host(api, "anything.example", "/api/v1/stats")
+            .await
+            .status,
         421
     );
-    assert_eq!(http_host(api, "10.9.8.7", "/healthz").await.status, 200);
+    assert_eq!(
+        http_host(api, "10.9.8.7", "/api/v1/stats").await.status,
+        200
+    );
     server.shutdown().await.unwrap();
     // With names configured, those are answered too.
     let dir = tempfile::tempdir().unwrap();
@@ -944,9 +949,14 @@ async fn the_host_check_is_on_for_a_non_loopback_bind_without_names() {
     o.api_allowed_hosts = vec!["ok.example".into()];
     let server = Server::start(o).await.unwrap();
     let api = SocketAddr::from(([127, 0, 0, 1], server.api_addr().port()));
-    assert_eq!(http_host(api, "ok.example", "/healthz").await.status, 200);
     assert_eq!(
-        http_host(api, "anything.example", "/healthz").await.status,
+        http_host(api, "ok.example", "/api/v1/stats").await.status,
+        200
+    );
+    assert_eq!(
+        http_host(api, "anything.example", "/api/v1/stats")
+            .await
+            .status,
         421
     );
     server.shutdown().await.unwrap();
