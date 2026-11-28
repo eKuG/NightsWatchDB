@@ -163,7 +163,10 @@ fn replace_swaps_parts_in_one_step_and_old_snapshots_keep_reading() {
     let old = e.snapshot();
     let new_part = merged(&e, &remove);
     let new_id = new_part.meta.part_id;
-    let replaced = e.inner().replace_parts(&remove, vec![new_part]).unwrap();
+    let replaced = e
+        .inner()
+        .replace_parts(&remove, vec![new_part], Vec::new())
+        .unwrap();
     assert!(replaced.deletion_errors.is_empty());
 
     // A new snapshot sees the new part and none of the removed ones, a map
@@ -214,7 +217,9 @@ fn removing_without_adding_and_adding_without_removing_work() {
         .filter(|(_, w)| *w >= 8_000)
         .map(|(id, _)| *id)
         .collect();
-    e.inner().replace_parts(&gone, Vec::new()).unwrap();
+    e.inner()
+        .replace_parts(&gone, Vec::new(), Vec::new())
+        .unwrap();
     m.spans.retain(|s| s.start < 8_000);
     m.check(&e, "removed only");
     check_split(&e.snapshot(), "removed only");
@@ -225,12 +230,16 @@ fn removing_without_adding_and_adding_without_removing_work() {
     // original is removed in the same step.
     let one = all[0].0;
     let copy = merged(&e, &[one]);
-    e.inner().replace_parts(&[one], vec![copy]).unwrap();
+    e.inner()
+        .replace_parts(&[one], vec![copy], Vec::new())
+        .unwrap();
     m.check(&e, "one part replaced by its copy");
     check_split(&e.snapshot(), "one part replaced by its copy");
     // Nothing at all is a no-op, not a manifest version.
     let v = e.inner().manifest.current().version;
-    e.inner().replace_parts(&[], Vec::new()).unwrap();
+    e.inner()
+        .replace_parts(&[], Vec::new(), Vec::new())
+        .unwrap();
     assert_eq!(e.inner().manifest.current().version, v);
     e.shutdown().unwrap();
 }
@@ -253,7 +262,9 @@ fn a_part_that_a_flush_published_in_between_keeps_the_list_in_id_order() {
     ingest(&e, &late).unwrap();
     m.add(&late);
     e.flush().unwrap();
-    e.inner().replace_parts(&remove, vec![new_part]).unwrap();
+    e.inner()
+        .replace_parts(&remove, vec![new_part], Vec::new())
+        .unwrap();
 
     let ids = part_ids(&e);
     assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
@@ -282,12 +293,15 @@ fn an_error_before_the_commit_changes_nothing() {
     };
 
     // A part that is not live, and one listed twice.
-    let err = e.inner().replace_parts(&[9_999], Vec::new()).unwrap_err();
+    let err = e
+        .inner()
+        .replace_parts(&[9_999], Vec::new(), Vec::new())
+        .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     unchanged("unknown id");
     let err = e
         .inner()
-        .replace_parts(&[ids[0], ids[0]], Vec::new())
+        .replace_parts(&[ids[0], ids[0]], Vec::new(), Vec::new())
         .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     unchanged("id twice");
@@ -299,7 +313,10 @@ fn an_error_before_the_commit_changes_nothing() {
         .join("parts")
         .join(part_dir_name(dup.meta.part_id));
     dup.meta.part_id = ids[2];
-    let err = e.inner().replace_parts(&[ids[1]], vec![dup]).unwrap_err();
+    let err = e
+        .inner()
+        .replace_parts(&[ids[1]], vec![dup], Vec::new())
+        .unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     // Only the caller's own directory is extra, and it is the caller's to
     // delete.
@@ -334,7 +351,9 @@ fn hooks_after_the_commit_cannot_undo_it() {
             .map(|(id, _)| id)
             .collect();
         let new_part = merged(&e, &remove);
-        e.inner().replace_parts(&remove, vec![new_part]).unwrap();
+        e.inner()
+            .replace_parts(&remove, vec![new_part], Vec::new())
+            .unwrap();
         assert!(!e.stats().fatal);
         m.check(&e, "hooks failed");
         assert_eq!(manifest_ids(dir.path()), part_ids(&e));
@@ -365,7 +384,10 @@ fn a_directory_that_cannot_be_deleted_is_recorded_and_retried() {
     std::fs::rename(&path, &aside).unwrap();
     std::fs::write(&path, b"in the way").unwrap();
 
-    let replaced = e.inner().replace_parts(&[victim], Vec::new()).unwrap();
+    let replaced = e
+        .inner()
+        .replace_parts(&[victim], Vec::new(), Vec::new())
+        .unwrap();
     assert_eq!(replaced.deletion_errors.len(), 1, "{replaced:?}");
     assert_eq!(lock(&e.inner().undeleted).len(), 1);
     assert!(!part_ids(&e).contains(&victim));
@@ -480,7 +502,9 @@ fn a_flush_and_a_replacement_never_interleave_their_commit_and_publish() {
             replacer = {
                 let (e, d) = (e.clone(), replace_done.clone());
                 std::thread::spawn(move || {
-                    e.inner().replace_parts(&remove, vec![new_part]).unwrap();
+                    e.inner()
+                        .replace_parts(&remove, vec![new_part], Vec::new())
+                        .unwrap();
                     d.store(true, Ordering::SeqCst);
                 })
             };
@@ -488,7 +512,9 @@ fn a_flush_and_a_replacement_never_interleave_their_commit_and_publish() {
             replacer = {
                 let (e, d) = (e.clone(), replace_done.clone());
                 std::thread::spawn(move || {
-                    e.inner().replace_parts(&remove, vec![new_part]).unwrap();
+                    e.inner()
+                        .replace_parts(&remove, vec![new_part], Vec::new())
+                        .unwrap();
                     d.store(true, Ordering::SeqCst);
                 })
             };
@@ -555,7 +581,7 @@ fn an_error_returned_before_the_commit_is_honoured_and_a_fatal_one_stops_the_eng
 
         let err = e
             .inner()
-            .replace_parts(&remove, vec![new_part])
+            .replace_parts(&remove, vec![new_part], Vec::new())
             .unwrap_err();
         // Nothing changed: the list, the manifest, the old directories and the
         // data. The new directory is the caller's to delete.
@@ -570,7 +596,7 @@ fn an_error_returned_before_the_commit_is_honoured_and_a_fatal_one_stops_the_eng
             // The engine is stopped: another replacement is refused, reads
             // work, and a restart recovers everything and deletes the new
             // directory.
-            let again = e.inner().replace_parts(&[], Vec::new());
+            let again = e.inner().replace_parts(&[], Vec::new(), Vec::new());
             assert!(matches!(again, Err(Error::Fatal(_))));
             let _ = e.shutdown();
             drop(e);
@@ -609,7 +635,11 @@ fn a_flush_that_publishes_while_the_map_is_built_is_accounted_for() {
     let replacer = {
         let e = e.clone();
         let remove = remove.clone();
-        std::thread::spawn(move || e.inner().replace_parts(&remove, vec![new_part]).unwrap())
+        std::thread::spawn(move || {
+            e.inner()
+                .replace_parts(&remove, vec![new_part], Vec::new())
+                .unwrap()
+        })
     };
     pause.wait_reached();
 
@@ -682,7 +712,7 @@ fn a_part_published_while_the_map_is_built_cannot_be_removed_by_that_replacement
     let replacer = {
         let e = e.clone();
         let remove = remove.clone();
-        std::thread::spawn(move || e.inner().replace_parts(&remove, vec![new_part]))
+        std::thread::spawn(move || e.inner().replace_parts(&remove, vec![new_part], Vec::new()))
     };
     pause.wait_reached();
     let late: Vec<TSpan> = (1..=30u128).map(|t| span(t, 7)).collect();
@@ -854,7 +884,10 @@ fn both_kinds_are_replaced_in_one_step_and_old_snapshots_keep_reading() {
         remove.extend(&anns);
         let sp = merged(&e, &spans);
         let an = merged_annotations(&e, &anns);
-        let r = e.inner().replace_any(&remove, vec![sp], vec![an]).unwrap();
+        let r = e
+            .inner()
+            .replace_parts(&remove, vec![sp], vec![an])
+            .unwrap();
         assert!(r.deletion_errors.is_empty());
     }
     // Window 4: removed, both kinds, no replacement.
@@ -862,7 +895,7 @@ fn both_kinds_are_replaced_in_one_step_and_old_snapshots_keep_reading() {
     let remove: Vec<u64> = spans.iter().chain(&anns).copied().collect();
     let version = e.inner().manifest.current().version;
     e.inner()
-        .replace_any(&remove, Vec::new(), Vec::new())
+        .replace_parts(&remove, Vec::new(), Vec::new())
         .unwrap();
     assert_eq!(e.inner().manifest.current().version, version + 1);
     stop.store(true, Ordering::SeqCst);
@@ -914,7 +947,7 @@ fn a_removed_id_must_be_live_in_one_of_the_two_lists() {
     for remove in [vec![a, a], vec![s, s], vec![a, 99_999]] {
         let err = e
             .inner()
-            .replace_any(&remove, Vec::new(), Vec::new())
+            .replace_parts(&remove, Vec::new(), Vec::new())
             .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
     }
@@ -922,7 +955,7 @@ fn a_removed_id_must_be_live_in_one_of_the_two_lists() {
     assert_eq!(ann_ids(&e).len(), 20);
     // One of each kind in one call is fine.
     e.inner()
-        .replace_any(&[a, s], Vec::new(), Vec::new())
+        .replace_parts(&[a, s], Vec::new(), Vec::new())
         .unwrap();
     assert_eq!(e.inner().manifest.current().version, version + 1);
     e.shutdown().unwrap();
@@ -958,7 +991,11 @@ fn a_flush_publishing_annotation_parts_during_a_replacement_loses_nothing() {
     let an = merged_annotations(&e, &anns);
     let replacer = {
         let e = e.clone();
-        std::thread::spawn(move || e.inner().replace_any(&remove, vec![sp], vec![an]).unwrap())
+        std::thread::spawn(move || {
+            e.inner()
+                .replace_parts(&remove, vec![sp], vec![an])
+                .unwrap()
+        })
     };
     pause.wait_reached();
     // Between the stages: annotations of window 2 and of window 5 are

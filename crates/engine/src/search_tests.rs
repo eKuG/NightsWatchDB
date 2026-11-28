@@ -129,7 +129,7 @@ fn merge_oldest_two(e: &Engine) -> bool {
     let reader = PartReader::open(inner.parts_dir.join(part_dir_name(id))).unwrap();
     let remove: Vec<u64> = srcs.iter().map(|p| p.meta.part_id).collect();
     inner
-        .replace_parts(&remove, vec![LivePart::new(meta, reader)])
+        .replace_parts(&remove, vec![LivePart::new(meta, reader)], Vec::new())
         .unwrap();
     true
 }

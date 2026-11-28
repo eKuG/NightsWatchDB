@@ -84,18 +84,43 @@ impl Replaced {
     }
 }
 
+/// The error of an annotation merge that found damage, with the damaged input
+/// named (the merge itself reports the file, not the part). Other errors pass
+/// through. Looks only on this error path, so a healthy merge verifies each
+/// input once.
+fn name_damaged_input(inputs: &[&Arc<LiveAnnotationPart>], e: Error) -> Error {
+    if !matches!(e, Error::Corrupt(_)) {
+        return e;
+    }
+    for p in inputs {
+        if let Err(why) = p.reader.verify() {
+            return Error::corrupt(format!(
+                "merge input {} ({}): {why}",
+                p.meta.part_id,
+                part_dir_name(p.meta.part_id)
+            ));
+        }
+    }
+    e
+}
+
 impl Inner {
-    /// Replaces the live parts `remove` by the parts `add`, which are already
-    /// written to `parts/` (each with its metadata and an open reader, ids
-    /// reserved from the manifest). In this order:
+    /// Replaces the live parts `remove`, of either kind, by the span parts
+    /// `add` and the annotation parts `add_ann`, which are already written to
+    /// `parts/` (each with its metadata and an open reader, ids reserved from
+    /// the manifest). Every id in `remove` is live in exactly one of the two
+    /// lists. In this order:
     ///
     /// 1. one manifest commit that removes and adds them;
-    /// 2. the new part list and a split map that matches it are published in
-    ///    one step under the core lock, so a snapshot never sees a list and a
-    ///    map that disagree, nor a removed part and its replacement both
-    ///    present or both absent. The list and the map are built before the
-    ///    gate is taken, from the list seen then; under the gate only the
-    ///    parts a flush published since are added to them;
+    /// 2. the new span list, a split map that matches it, the new annotation
+    ///    list and its window index are published in one step under the core
+    ///    lock, so a snapshot never sees a list and a map that disagree, nor a
+    ///    removed part and its replacement both present or both absent, nor
+    ///    one kind changed without the other. The span list and the map are
+    ///    built before the gate is taken, from the list seen then; under the
+    ///    gate only the parts a flush published since are added to them. The
+    ///    annotation list is small and is rebuilt under the gate from the list
+    ///    as it is then, so annotation parts a flush published since stay;
     /// 3. the directories of the removed parts are deleted and `parts/` is
     ///    synced.
     ///
@@ -116,16 +141,7 @@ impl Inner {
     ///
     /// Queries on snapshots taken before the replacement keep reading the
     /// removed parts from their open files.
-    pub(crate) fn replace_parts(&self, remove: &[u64], add: Vec<LivePart>) -> Result<Replaced> {
-        self.replace_any(remove, add, Vec::new())
-    }
-
-    /// [`replace_parts`](Self::replace_parts) for both kinds of part: `remove`
-    /// names live parts of either kind (each in exactly one of the two
-    /// lists), `add` span parts and `add_ann` annotation parts. One manifest
-    /// edit, one commit, and one publish in which the span list, the split
-    /// map, the annotation list and its window index change together.
-    pub(crate) fn replace_any(
+    pub(crate) fn replace_parts(
         &self,
         remove: &[u64],
         add: Vec<LivePart>,
@@ -433,7 +449,7 @@ impl Inner {
         if expired.is_empty() {
             return Ok(());
         }
-        let replaced = self.replace_any(&expired, Vec::new(), Vec::new())?;
+        let replaced = self.replace_parts(&expired, Vec::new(), Vec::new())?;
         lock(&self.core).retention_removed += expired.len() as u64;
         replaced.into_result()
     }
@@ -642,7 +658,8 @@ impl Inner {
                     plan.window_ns,
                     level,
                     Some(&self.merge_stop),
-                )?;
+                )
+                .map_err(|e| name_damaged_input(&ann_inputs, e))?;
                 (meta, 0, stats.superseded)
             }
         };
@@ -689,7 +706,7 @@ impl Inner {
         };
         run_hook(&self.opts.stage_hook, Stage::MergeWritten).map_err(abandon)?;
         let remove: Vec<u64> = metas.iter().map(|m| m.part_id).collect();
-        let replaced = self.replace_any(&remove, add, add_ann).map_err(abandon)?;
+        let replaced = self.replace_parts(&remove, add, add_ann).map_err(abandon)?;
 
         let input_bytes: u64 = metas.iter().map(|m| m.size_bytes()).sum();
         let mut c = lock(&self.core);
