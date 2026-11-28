@@ -29,6 +29,22 @@ pub struct PieceSession {
     block: Option<(u32, Vec<u8>)>,
 }
 
+/// What decompressing a block needs besides its output: a zstd context and
+/// the buffer the compressed bytes are read into.
+struct Buffers {
+    zstd: zstd::bulk::Decompressor<'static>,
+    packed: Vec<u8>,
+}
+
+impl Buffers {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            zstd: zstd::bulk::Decompressor::new().map_err(Error::other)?,
+            packed: Vec::new(),
+        })
+    }
+}
+
 /// Read access to a piece store. Holds both files open and the tables in
 /// memory; reads are positioned, so one reader serves many threads at once.
 pub struct PieceReader {
@@ -163,23 +179,35 @@ impl PieceReader {
 
     /// Reads, checks and decompresses one block.
     fn load(&self, block: u32) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.load_into(block, &mut Buffers::new()?, &mut data)?;
+        Ok(data)
+    }
+
+    /// [`load`](Self::load) into `data`, with the context and the read
+    /// buffer of `bufs`, so that a caller reading many blocks reuses them.
+    fn load_into(&self, block: u32, bufs: &mut Buffers, data: &mut Vec<u8>) -> Result<()> {
         let loc = self
             .index
             .blocks
             .get(block as usize)
             .ok_or_else(|| blk_corrupt(format!("block {block} does not exist")))?;
-        let mut packed = vec![0u8; loc.clen as usize];
-        self.blk
-            .read_exact_at(&mut packed, loc.offset)
-            .map_err(|e| {
-                eof_or_io(e, || {
-                    blk_corrupt(format!("block {block} ends past the end of the file"))
-                })
-            })?;
-        if crc32c::crc32c(&packed) != loc.crc {
+        let packed = &mut bufs.packed;
+        packed.clear();
+        packed.resize(loc.clen as usize, 0);
+        self.blk.read_exact_at(packed, loc.offset).map_err(|e| {
+            eof_or_io(e, || {
+                blk_corrupt(format!("block {block} ends past the end of the file"))
+            })
+        })?;
+        if crc32c::crc32c(packed) != loc.crc {
             return Err(blk_corrupt(format!("block {block}: checksum mismatch")));
         }
-        let data = zstd::bulk::decompress(&packed, loc.ulen as usize)
+        data.clear();
+        data.try_reserve_exact(loc.ulen as usize)
+            .map_err(|_| Error::other(format!("{} bytes for block {block}", loc.ulen)))?;
+        bufs.zstd
+            .decompress_to_buffer(packed, data)
             .map_err(|e| blk_corrupt(format!("block {block} does not decompress ({e})")))?;
         if data.len() != loc.ulen as usize {
             return Err(blk_corrupt(format!(
@@ -189,7 +217,7 @@ impl PieceReader {
             )));
         }
         self.loads.fetch_add(1, Ordering::Relaxed);
-        Ok(data)
+        Ok(())
     }
 
     /// Appends the bytes of piece `id` to `out`.
@@ -228,7 +256,12 @@ impl PieceReader {
         ids: impl IntoIterator<Item = u32>,
         mut f: impl FnMut(usize, &[u8]),
     ) -> Result<()> {
-        let mut current: Option<(u32, Vec<u8>)> = None;
+        // One zstd context and one pair of buffers serve every block of the
+        // call: with a new context and buffers per block the decompression
+        // itself ran measurably slower, not only the allocations.
+        let mut bufs: Option<Buffers> = None;
+        let mut data = Vec::new();
+        let mut current: Option<u32> = None;
         let mut last = 0u32;
         for (n, id) in ids.into_iter().enumerate() {
             if id < last {
@@ -238,14 +271,15 @@ impl PieceReader {
             }
             last = id;
             let p = self.locate(id)?;
-            if current.as_ref().is_none_or(|(block, _)| *block != p.block) {
-                // Free the old block before the next one is read.
-                drop(current.take());
-                current = Some((p.block, self.load(p.block)?));
+            if current != Some(p.block) {
+                if bufs.is_none() {
+                    bufs = Some(Buffers::new()?);
+                }
+                let b = bufs.as_mut().expect("created above");
+                self.load_into(p.block, b, &mut data)?;
+                current = Some(p.block);
             }
-            if let Some((_, data)) = &current {
-                f(n, &data[p.offset as usize..(p.offset + p.len) as usize]);
-            }
+            f(n, &data[p.offset as usize..(p.offset + p.len) as usize]);
         }
         Ok(())
     }
@@ -267,8 +301,9 @@ impl PieceReader {
     /// Reads every block and checks its checksum and length. A sequential
     /// read of the whole store.
     pub fn verify(&self) -> Result<()> {
+        let (mut bufs, mut data) = (Buffers::new()?, Vec::new());
         for block in 0..self.index.blocks.len() {
-            self.load(block as u32)?;
+            self.load_into(block as u32, &mut bufs, &mut data)?;
         }
         Ok(())
     }

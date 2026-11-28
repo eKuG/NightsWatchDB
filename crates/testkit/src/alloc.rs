@@ -1,6 +1,7 @@
 //! A counting allocator for tests that bound memory. A test binary declares
 //! its own `#[global_allocator] static ALLOC: Counting = Counting;` and reads
-//! the counters with [`live`], [`peak`], [`max_single`] and [`reset_peak`].
+//! the counters with [`live`], [`peak`], [`max_single`], [`reset_peak`] and
+//! [`allocations`].
 //!
 //! The ceiling is off (`usize::MAX`) unless the binary names a value:
 //! `Counting<{ 64 << 20 }>` refuses any single request above it, which makes
@@ -14,11 +15,13 @@ use std::sync::atomic::{AtomicIsize, AtomicUsize};
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicIsize = AtomicIsize::new(0);
 static MAX_SINGLE: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// The counting allocator; see the module docs for `CEILING`.
 pub struct Counting<const CEILING: usize = { usize::MAX }>;
 
 fn grew(by: isize) {
+    ALLOCATIONS.fetch_add(usize::from(by > 0), Relaxed);
     let now = LIVE.fetch_add(by, Relaxed) + by;
     PEAK.fetch_max(now, Relaxed);
 }
@@ -79,6 +82,11 @@ pub fn peak() -> isize {
 /// The largest single request made so far.
 pub fn max_single() -> usize {
     MAX_SINGLE.load(SeqCst)
+}
+
+/// Allocations and growing reallocations made so far.
+pub fn allocations() -> usize {
+    ALLOCATIONS.load(SeqCst)
 }
 
 /// Starts a new peak measurement from the bytes live now.
