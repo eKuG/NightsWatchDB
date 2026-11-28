@@ -19,16 +19,21 @@ model output. For that reason both listeners default to the loopback address
   `127.0.0.1` under the page's own host name (DNS rebinding) and read the
   answers, and write, because such a request is same-origin and needs no
   preflight. The check is **always on**, whatever address the API listens on:
-  every request (`/healthz` and `/api/v1/stats` included) whose `Host` header
-  is not allowed is refused with 421 and a JSON error that names
-  `--api-allowed-hosts`. Allowed without any configuration: `localhost` and an
+  every request whose `Host` header is not allowed is refused with 421 and a
+  JSON error that names `--api-allowed-hosts`. The one exception is
+  `/healthz`, which answers for any `Host` and for none (a health check that
+  sends the name of its upstream, or, like HAProxy's default one, HTTP/1.0
+  without a `Host`, must not get a 421; it returns `ok` or the fatal error
+  text and nothing a rebinding page could use). `/api/v1/stats` is behind the
+  check like the rest. Allowed without any configuration: `localhost` and an
   IP address literal (IPv4, or IPv6 in brackets), each with or without a
   port. A rebinding attack needs a DNS name in `Host`, and a literal or
   `localhost` cannot be pointed somewhere else. Every other name is allowed
   only if it is listed in `--api-allowed-hosts`. The port is ignored; case is
   ignored; one trailing dot is ignored (`Traces.Internal.:80` is
-  `traces.internal`); there are no wildcards, and a subdomain of a listed name
-  is not listed. A missing or empty `Host` is refused. Anything that reaches the
+  `traces.internal`; a second one is not, and `localhost..` is refused); there
+  are no wildcards, and a subdomain of a listed name
+  is not listed. A missing or empty `Host` is refused (except on `/healthz`). Anything that reaches the
   API by a name has to list it: a container reached by its name on a Docker
   network (`http://nwdb:4320`) needs `--api-allowed-hosts nwdb`.
 - **The write endpoint.** `POST /api/v1/annotations` is the only way to write
@@ -316,8 +321,9 @@ What remains **outside** the budget, and its bound:
 The API speaks HTTP/1.1 only. It serves at most 256 connections at once (more
 wait in the accept queue), gives a client 10 s to send the request headers,
 and runs at most 64 requests at once (more wait), except `/healthz` and
-`/api/v1/stats`, which answer from memory and never wait for a slot (they
-pass the `Host` check like every other request). A request
+`/api/v1/stats`, which answer from memory and never wait for a slot (`/healthz`
+answers for any `Host`; `/api/v1/stats` passes the `Host` check like every
+other request). A request
 holds its slot until its response has been sent, and also as long as work for it
 is running: a query that was started keeps the slot until it has finished even
 if the client has gone, and the task that renders a trace keeps it for as long
@@ -352,7 +358,8 @@ the body has not arrived, the connection ends after the response.
 | Limit | Default |
 |---|---|
 | Request body (`api_max_body_bytes`) | 1 MiB; worst-case memory for bodies is limit x 64 slots, 64 MiB by default |
-| 64 concurrent annotate requests, each the largest (1000 items filling the 1 MiB body) | at most 3 x limit x 64 slots, 192 MiB by default: the body, the items parsed from it (the body is freed once it is parsed) and the annotations the engine keeps in its buffers until they are flushed. Measured: a peak of 112 MiB, 67 MiB of it kept by the engine's buffers afterwards (`tests/regressions_annotate_memory.rs`) |
+| 64 concurrent annotate requests, each the largest well-formed one (1000 items filling the 1 MiB body) | at most 2.5 x limit x 64 slots, 160 MiB by default. The text exists as the body, as the items parsed from it, and as the annotations the engine keeps in its buffers until they are flushed (that is where the earlier "3 x" came from), but the body is freed once it is parsed and the three are not all there at once. Measured: a peak of 119 MB (1.8 x limit per request), 70 MB of it kept by the engine's buffers afterwards |
+| 64 concurrent malformed requests of the largest size | a string where an object, a number or a bool is expected gets a fixed message that does not quote it, so the request holds its body and nothing more: 1.5 x limit measured (the HTTP layer holds a body in pieces while it is received), 96 MiB for 64. A field name of a megabyte is the worst case: serde copies it into its error message once (with the growth of the string, twice its size at the moment of the copy), so that one request peaks at 3.5 x limit; the reply is cut to 160 bytes and the message is freed at once. The parse of a request runs on a runtime thread without waiting, so no more parses are in flight than the runtime has threads; 64 such requests measured 1.5 x limit x 64 = 100 MB. Absolute ceiling if every one of the 64 were parsing at the same moment: 3.5 x limit x 64 = 224 MiB. (`tests/regressions_annotate_memory.rs` asserts the bound of each of these rows: 2.5 x limit x 64 for the first, 2 x limit x 64 for 64 malformed ones, and alone 2 x limit for a string and 4 x limit for a field name) |
 | Time to receive a whole request body (`api_body_timeout`) | 30 s from the moment the request has its slot, then 408 and the slot is freed |
 
 Neither has a command-line flag. The body timeout is a total, not a time
@@ -433,8 +440,12 @@ true`. An annotation has `name`, `time_ns` and, when present, `span_id`,
 the annotations are read from one snapshot. At most 1000 annotations of at
 most about 9.4 KB of JSON each (a comment of 4096 characters that JSON writes
 as two bytes each) make at most about 9.4 MB of JSON; they are written one at
-a time into the stream, never held as JSON, and their rows (at most about
-4.6 KB each) are held like the spans' rows. The protobuf form (below) has no
+a time into the stream, never held as JSON, and what is held while
+they are written is the rows of the annotations read with the trace: up to
+1000 of them with their comments, each at most about 4.9 KB (the comment's
+4096 bytes, name, source and label of 128, 128 and 256 bytes, the record of
+about 160 bytes and the allocator's rounding), so at most about 4.9 MB per trace
+view and, for 64 at once, 311 MB, on top of the rows of the spans. The protobuf form (below) has no
 annotations and is the same bytes with or without them.
 
 A span has `span_id`, `parent_span_id`, `name`, `kind`, `start_ns`, `end_ns`,
@@ -481,19 +492,37 @@ Every listed trace shows its annotations (all of them, not only the one that
 matched) as `annotations`, **at most 8 and without their `comment`** (the trace
 view has the comments and up to 1000 annotations), with
 `"annotations_truncated": true` when there are more than 8; both are left out
-when it has none. They are read from the snapshot the list was read from. The
-reply is written trace by trace into the response (`Transfer-Encoding:
-chunked`) and never held as JSON; if the server fails in the middle, the
-connection is cut. **Worst case of one list reply:** an annotation of a list is
+when it has none. Everything the reply shows is read from one snapshot before
+the first byte is sent, with one pass over the buffered annotations for each
+batch of 100 listed traces (10 passes for 1000 traces, not one per trace), and
+the snapshot is dropped then: a client that reads slowly keeps no part files
+open, so merges and retention free their disk space whatever the clients do.
+An engine error found while reading is an ordinary error response (503 or 500
+and JSON), not a cut-off 200. The reply is written trace by trace into the
+response (`Transfer-Encoding: chunked`) from the rows held, and never held as
+JSON; if the server fails after the first byte, or the task that writes it
+panics, the connection is cut without the final chunk, so the client sees a
+broken reply and not a short one that looks complete. **Worst case of one list reply:** an annotation of a list is
 at most about 1.1 KB of JSON (name, source and label of the longest length,
 made of characters JSON writes as two bytes), so the annotations of a trace are
 at most about 9 KB and the 1000 traces of the largest list about 9 MB; the
 summaries come on top (a few hundred bytes of ids and numbers, and the
 service, root name, session, user and model strings of the stored spans, which
-this server does not shorten). The heap one list request needs is the
-summaries, the 64 KiB chunks in flight (at most 5) and the 8 annotations rows
-of one trace: measured 0.45 MiB for that largest list, asserted below 2 MiB
-(`tests/regressions_list_reply_memory.rs`).
+this server does not shorten). **Heap of one list request:** what is held while the reply is written
+is the 1000 summaries (about 0.3 MB for traces with short strings; the strings
+of the stored spans are not shortened) and the annotations of the page without
+their comments: at most 8000 of them, each at most 768 bytes (the record of
+about 160 bytes, a name of 128, a source of 128 and a label of 256 bytes, and
+the allocator's rounding), so at most 6.1 MB; the chunks in flight add 320 KiB
+(5 of 64 KiB). While the last batch of 100 traces is read its 800 annotations
+are still whole, with comments of up to 4 KiB: up to 3.9 MB more. That makes at
+most about 10.7 MB per list request, 685 MB for 64 at once; 9.0 MB is measured
+for the largest list, asserted below 12 MiB
+(`tests/regressions_list_reply_memory.rs`). Inside the engine every batch
+also builds an index of references to the buffered annotations, 24 bytes per
+buffered annotation, for the length of its read; a list with an `annotation`
+filter costs more for the length of the query: see the list memory of the
+reads in `crates/engine/README.md` for what, and its current figures.
 
 ```sh
 curl 'http://127.0.0.1:4320/api/v1/traces?service=agent&error=true&limit=5'
