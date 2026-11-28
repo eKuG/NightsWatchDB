@@ -19,6 +19,9 @@ use nwdb_segment::{
     DEFAULT_MIN_PIECE_BYTES, MergeOptions, PartReader, PartWriter, SearchLimits, TEXT_INDEX_FILE,
     TEXT_ROWS_FILE, WriterOptions, merge_parts,
 };
+use nwdb_testkit::fs::copy_dir;
+#[cfg(target_os = "linux")]
+use nwdb_testkit::mem::status_bytes;
 use nwdb_textindex::{Query, contains_token, parse, phrase_matches, tokens};
 use rand::rngs::StdRng;
 use rand::seq::IndexedRandom;
@@ -703,18 +706,6 @@ fn each_limit_refuses_a_query_that_exceeds_it_and_says_which() {
     assert!(r.search(&parse("secret").unwrap(), &tight_rows).is_ok());
 }
 
-#[cfg(target_os = "linux")]
-fn status_kb(key: &str) -> usize {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with(key)).unwrap();
-    line.split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse::<usize>()
-        .unwrap()
-        * 1024
-}
-
 const ROWS: u32 = 300_000;
 const LIMIT: usize = 100_000;
 
@@ -726,7 +717,7 @@ const LIMIT: usize = 100_000;
 fn memory_child(mode: &str, dir: &str) {
     let r = PartReader::open(dir).unwrap();
     let q = parse("common").unwrap();
-    let before = status_kb("VmRSS:");
+    let before = status_bytes("VmRSS:");
     let limits = if mode == "refused" {
         SearchLimits {
             max_leaf_rows: LIMIT,
@@ -741,7 +732,7 @@ fn memory_child(mode: &str, dir: &str) {
         ("allowed", Ok(rows)) => assert_eq!(rows.len(), ROWS as usize),
         other => panic!("unexpected {other:?}"),
     }
-    println!("SEARCHMEM {before} {}", status_kb("VmHWM:"));
+    println!("SEARCHMEM {before} {}", status_bytes("VmHWM:"));
 }
 
 /// A broad query that the limit refuses, and one that it allows, stay within a
@@ -813,14 +804,6 @@ fn a_broad_query_stays_within_its_memory_budget() {
 }
 
 // --------------------------------------------------------------- damage ---
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
-    }
-}
 
 fn name_of(e: &Error) -> bool {
     matches!(e, Error::Corrupt(_))

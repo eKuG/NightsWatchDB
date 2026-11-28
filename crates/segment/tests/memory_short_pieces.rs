@@ -19,6 +19,7 @@ use nwdb_core::{
     TraceId, part_dir_name,
 };
 use nwdb_segment::{PartReader, PartWriter, WriterOptions};
+use nwdb_testkit::mem::memory;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::ops::Range;
@@ -44,17 +45,6 @@ impl PayloadSplitter for Chunks {
             at = end;
         }
     }
-}
-
-/// Peak and current resident memory of this process, in bytes.
-fn memory() -> (usize, usize) {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let kb = |key: &str| -> usize {
-        let line = status.lines().find(|l| l.starts_with(key)).unwrap();
-        let n: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-        n * 1024
-    };
-    (kb("VmHWM:"), kb("VmRSS:"))
 }
 
 /// Writes a part of `unique_mib` MiB of incompressible, never repeated text

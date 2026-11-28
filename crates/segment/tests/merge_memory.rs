@@ -17,6 +17,7 @@ use nwdb_core::{
     part_dir_name,
 };
 use nwdb_segment::{MergeOptions, PartReader, PartWriter, WriterOptions, merge_parts};
+use nwdb_testkit::mem::memory as resident;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::ops::Range;
@@ -69,20 +70,6 @@ fn writer_options() -> WriterOptions {
         row_list_budget_bytes: 1 << 20,
         ..WriterOptions::default()
     }
-}
-
-fn resident() -> (usize, usize) {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let kb = |key: &str| -> usize {
-        let line = status.lines().find(|l| l.starts_with(key)).unwrap();
-        line.split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse::<usize>()
-            .unwrap()
-            * 1024
-    };
-    (kb("VmHWM:"), kb("VmRSS:"))
 }
 
 /// Writes the inputs: every part holds rows of every trace, so every trace is

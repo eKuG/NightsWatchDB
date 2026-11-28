@@ -15,6 +15,7 @@ use nwdb_core::{
     BatchLimits, PayloadSplitter, RawColumn, SpanBatchBuilder, SpanId, SpanRecord, TraceId,
 };
 use nwdb_segment::{PartWriter, WriterOptions};
+use nwdb_testkit::mem::peak;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -27,17 +28,6 @@ impl PayloadSplitter for Whole {
     fn cuts(&self, _: RawColumn, value: &[u8], cuts: &mut Vec<Range<usize>>) {
         cuts.push(0..value.len());
     }
-}
-
-fn peak() -> usize {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
-    line.split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse::<usize>()
-        .unwrap()
-        * 1024
 }
 
 /// Writes a part of one span whose `attrs` is `value`, one piece.

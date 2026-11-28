@@ -864,6 +864,7 @@ dependencies = [
  "crc32c",
  "nwdb-core",
  "nwdb-payload",
+ "nwdb-testkit",
  "nwdb-textindex",
  "parquet",
  "rand",

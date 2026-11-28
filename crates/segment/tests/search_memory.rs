@@ -14,55 +14,10 @@ use nwdb_core::{
 };
 use nwdb_segment::textindex::parse;
 use nwdb_segment::{PartReader, PartWriter, SearchLimits, WriterOptions};
+use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, Ordering};
-
-static LIVE: AtomicIsize = AtomicIsize::new(0);
-static PEAK: AtomicIsize = AtomicIsize::new(0);
-
-struct Counting;
-
-fn grow(n: isize) {
-    let now = LIVE.fetch_add(n, Ordering::Relaxed) + n;
-    PEAK.fetch_max(now, Ordering::Relaxed);
-}
-
-#[allow(unsafe_code)]
-mod alloc_impl {
-    use super::{Counting, LIVE, grow};
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc(l) };
-            if !p.is_null() {
-                grow(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            let p = unsafe { System.alloc_zeroed(l) };
-            if !p.is_null() {
-                grow(l.size() as isize);
-            }
-            p
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            unsafe { System.dealloc(p, l) };
-            LIVE.fetch_sub(l.size() as isize, Relaxed);
-        }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            let q = unsafe { System.realloc(p, l, n) };
-            if !q.is_null() {
-                grow(n as isize - l.size() as isize);
-            }
-            q
-        }
-    }
-}
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
@@ -112,10 +67,10 @@ fn write_part(parts: &Path, id: u64, rows: u64, text: &str) -> PathBuf {
 /// Runs `search` and returns its result and the peak heap it held above what
 /// was live when it began.
 fn measure<T>(search: impl FnOnce() -> T) -> (T, isize) {
-    let base = LIVE.load(Ordering::SeqCst);
-    PEAK.store(base, Ordering::SeqCst);
+    let base = live();
+    reset_peak();
     let out = search();
-    (out, PEAK.load(Ordering::SeqCst) - base)
+    (out, peak() - base)
 }
 
 #[test]

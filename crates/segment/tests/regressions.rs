@@ -6,6 +6,7 @@ use nwdb_core::{BatchLimits, SpanBatchBuilder, SpanId, SpanRecord, TraceId, part
 use nwdb_segment::{
     INDEX_FILE, PartReader, PartWriter, SPANS_FILE, SUMMARY_FILE, ScanOptions, WriterOptions,
 };
+use nwdb_testkit::fs::copy_dir;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -185,21 +186,6 @@ fn write_simple(
     w.write(&batch(&rows)).unwrap();
     w.finish().unwrap();
     parts.join(part_dir_name(id))
-}
-
-fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for f in [
-        SPANS_FILE,
-        SUMMARY_FILE,
-        INDEX_FILE,
-        "pieces.blk",
-        "pieces.idx",
-        "text.idx",
-        "text.rows",
-    ] {
-        std::fs::copy(src.join(f), dst.join(f)).unwrap();
-    }
 }
 
 fn expect_corrupt_naming(err: Error, file: &str) {
