@@ -484,6 +484,10 @@ async fn stats(State(api): State<Api>) -> Response {
             "merging": s.merging,
             "last_compaction_error": s.last_compaction_error,
             "annotations_buffered": s.annotations_buffered,
+            "annotation_parts": s.annotation_parts,
+            "annotation_bytes": s.annotation_bytes,
+            "annotations_written": s.annotations_written,
+            "annotations_dropped": s.annotations_dropped,
         }),
     )
 }
