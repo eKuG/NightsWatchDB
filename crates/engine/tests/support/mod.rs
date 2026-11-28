@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nwdb_core::TraceId;
-use nwdb_engine::{AggQuery, Engine, ListQuery};
+use nwdb_engine::{AggQuery, Engine};
 use nwdb_manifest::{Manifest, ManifestOptions, ManifestState, OpenMode};
 
 use crate::common::*;
@@ -225,16 +225,7 @@ pub fn obsolete_log_files(dir: &Path, flushed: u64) -> usize {
 /// The ids (of the crash-test child's records) the engine holds, each exactly
 /// once, with the token aggregate agreeing.
 pub fn present_ids(e: &Engine) -> BTreeSet<u64> {
-    let all = e
-        .list_traces(&ListQuery {
-            from_ns: i64::MIN,
-            to_ns: i64::MAX,
-            service: None,
-            model: None,
-            error: None,
-            limit: usize::MAX,
-        })
-        .unwrap();
+    let all = e.list_traces(&crate::common::list_all()).unwrap();
     let mut ids = BTreeSet::new();
     for s in &all {
         // Each record is one span, so a trace with two was replayed twice.

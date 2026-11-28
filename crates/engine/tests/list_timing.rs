@@ -50,12 +50,8 @@ fn newest_fifty_over_many_parts() {
 
     let snap = e.snapshot();
     let q = ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
         limit: 50,
+        ..list_all()
     };
     for run in 0..3 {
         let t = Instant::now();

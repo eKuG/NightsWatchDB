@@ -6,18 +6,7 @@ mod common;
 use arrow_array::RecordBatch;
 use common::*;
 use nwdb_core::{BatchLimits, SpanBatchBuilder, SpanId, SpanRecord, TraceId};
-use nwdb_engine::{AggQuery, Engine, ListQuery};
-
-fn list_all() -> ListQuery {
-    ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    }
-}
+use nwdb_engine::{AggQuery, Engine};
 
 fn agg_all() -> AggQuery {
     AggQuery {

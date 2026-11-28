@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::*;
 use nwdb_core::TraceId;
-use nwdb_engine::{Engine, ListQuery, Snapshot};
+use nwdb_engine::{Engine, Snapshot};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -118,14 +118,7 @@ fn a_snapshot_never_sees_a_map_that_disagrees_with_its_parts() {
         })
     };
     let mut looked = 0;
-    let all = ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    };
+    let all = list_all();
     while !done.load(Ordering::SeqCst) {
         let snap = e.snapshot();
         let mut got = snap.split_traces();

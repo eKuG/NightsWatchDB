@@ -76,8 +76,6 @@ pub struct SearchStats {
     pub rows_matched: u64,
     /// Rows whose columns were read.
     pub rows_read: u64,
-    /// Calls that read a range of rows.
-    pub row_ranges_read: u64,
     /// Reads of a split trace in a part that holds it, to find which copy of
     /// each span arrived first: one per part that holds the trace, once per
     /// search, for each split trace that has a matching span in the time
@@ -419,7 +417,6 @@ fn collect(
             j += 1;
         }
         let wanted = &rows[i..j];
-        stats.row_ranges_read += 1;
         let batches = reader.read_rows(
             u64::from(first),
             u64::from(last - first) + 1,

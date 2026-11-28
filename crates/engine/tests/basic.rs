@@ -10,7 +10,7 @@ use common::*;
 use nwdb_core::{Error, TraceId};
 use nwdb_engine::{AggQuery, Engine, ListQuery};
 use nwdb_manifest::{Manifest, ManifestOptions, OpenMode};
-use nwdb_wal::{SyncHook, SyncMode, Wal, WalOptions};
+use nwdb_wal::{SyncHook, Wal, WalOptions};
 
 #[test]
 fn handles_can_cross_threads() {
@@ -29,23 +29,8 @@ fn manifest_state(dir: &std::path::Path) -> Arc<nwdb_manifest::ManifestState> {
     .current()
 }
 
-fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(30);
-    while !cond() {
-        assert!(Instant::now() < end, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn list_all() -> ListQuery {
-    ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    }
+fn wait_until(what: &str, cond: impl FnMut() -> bool) {
+    wait_with_timeout(what, Duration::from_secs(30), cond);
 }
 
 fn sample(trace: u128, base: i64) -> Vec<TSpan> {
@@ -682,10 +667,9 @@ fn a_log_that_starts_too_late_refuses_to_start() {
     let (wal, _) = Wal::open(
         &wal_dir,
         WalOptions {
-            sync: SyncMode::None,
             min_next_lsn: Some(3),
             allow_lost_log: true,
-            ..WalOptions::default()
+            ..wal_no_sync()
         },
     )
     .unwrap();
@@ -706,14 +690,7 @@ fn unknown_tag_or_undecodable_record_in_the_log_is_corrupt() {
     let e = open(opts(dir.path()));
     ingest(&e, &sample(1, 100)).unwrap();
     drop(e);
-    let (wal, _) = Wal::open(
-        dir.path().join("wal"),
-        WalOptions {
-            sync: SyncMode::None,
-            ..WalOptions::default()
-        },
-    )
-    .unwrap();
+    let (wal, _) = Wal::open(dir.path().join("wal"), wal_no_sync()).unwrap();
     wal.append_blocking(&[77, 1, 2, 3]).unwrap();
     wal.shutdown().unwrap();
     let r = Engine::open(opts(dir.path()), decoders());

@@ -1,4 +1,4 @@
-//! Second review of the start-up and query fixes. Each test fails on the code
+//! A second set of tests for the start-up and query fixes. Each test fails on the code
 //! it was written against and names the defect it shows.
 
 mod common;
@@ -11,14 +11,10 @@ use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use common::*;
 use nwdb_core::{Error, RecordDecoder};
-use nwdb_engine::{AggQuery, Engine, ListQuery};
+use nwdb_engine::{AggQuery, Engine};
 use nwdb_manifest::{MAX_NEXT_PART_ID, PART_ID_LEFTOVER_WINDOW};
-use nwdb_wal::{SyncMode, Wal, WalOptions};
+use nwdb_wal::Wal;
 use support::{disk_state, tree, tree_of};
-
-fn one(trace: u128) -> Vec<TSpan> {
-    vec![TSpan::new(trace, 1, 100 + trace as i64).root()]
-}
 
 /// A database whose log holds records 1..=5, none flushed, followed by a
 /// record whose tag no decoder knows (as a door added by a newer version
@@ -29,14 +25,7 @@ fn log_with_an_unknown_tag_at_the_end(dir: &Path) {
         ingest(&e, &one(t)).unwrap();
     }
     drop(e);
-    let (wal, _) = Wal::open(
-        dir.join("wal"),
-        WalOptions {
-            sync: SyncMode::None,
-            ..WalOptions::default()
-        },
-    )
-    .unwrap();
+    let (wal, _) = Wal::open(dir.join("wal"), wal_no_sync()).unwrap();
     wal.append_blocking(&[77, 1, 2, 3]).unwrap();
     wal.shutdown().unwrap();
 }
@@ -148,14 +137,7 @@ fn token_sums_do_not_depend_on_flush_timing() {
     let a = with_input(1, 10, i64::MAX);
     let b = with_input(2, 20, 1);
     let c = with_input(3, 30, -1);
-    let list = ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    };
+    let list = list_all();
     let agg = AggQuery {
         from_ns: i64::MIN,
         to_ns: i64::MAX,
@@ -337,14 +319,7 @@ fn a_refused_replay_changes_nothing(bad_record: &[u8], refusing: Decoders, fix: 
     drop(e);
     let saved = tempfile::tempdir().unwrap();
     support::copy_dir(&dir.path().join("wal"), saved.path());
-    let (wal, _) = Wal::open(
-        dir.path().join("wal"),
-        WalOptions {
-            sync: SyncMode::None,
-            ..WalOptions::default()
-        },
-    )
-    .unwrap();
+    let (wal, _) = Wal::open(dir.path().join("wal"), wal_no_sync()).unwrap();
     wal.append_blocking(bad_record).unwrap();
     wal.shutdown().unwrap();
     let next = disk_state(dir.path()).0.next_part_id;
@@ -414,14 +389,7 @@ fn a_replay_refused_for_the_wrong_table_changes_nothing() {
 /// `aggregate_tokens`, and whether or not the spans were flushed together.
 #[test]
 fn a_negative_token_count_counts_as_zero() {
-    let list = ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    };
+    let list = list_all();
     let agg = AggQuery {
         from_ns: i64::MIN,
         to_ns: i64::MAX,

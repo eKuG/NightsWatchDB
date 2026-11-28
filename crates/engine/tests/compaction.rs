@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use common::list_all as all;
 use common::*;
 use nwdb_core::{Error, TraceId, part_dir_name};
-use nwdb_engine::{CompactionOptions, Engine, EngineOptions, ListQuery, Stage, StageHook};
+use nwdb_engine::{CompactionOptions, Engine, EngineOptions, Stage, StageHook};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use search_model::Lines;
@@ -23,23 +24,8 @@ use support::disk_state;
 /// The test windows are 1000 ns wide (see `common::opts`).
 const W: i64 = 1_000;
 
-fn all() -> ListQuery {
-    ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    }
-}
-
-fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let t = Instant::now();
-    while !cond() {
-        assert!(t.elapsed() < Duration::from_secs(60), "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+fn wait_for(what: &str, cond: impl FnMut() -> bool) {
+    wait_with_timeout(what, Duration::from_secs(60), cond);
 }
 
 /// Feeds an engine and a model: one part per window per flush.

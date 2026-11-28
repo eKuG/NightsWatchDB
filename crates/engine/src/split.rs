@@ -37,10 +37,10 @@ impl SplitMap {
         self.map.iter().map(|(id, h)| (id, &h[..]))
     }
 
-    /// The map for `parts`, given the map for `parts[..old_len]` (an empty map
-    /// and 0 at start-up). The parts after `old_len` are the new ones.
-    pub(crate) fn extend(&self, parts: &[Arc<LivePart>], old_len: usize) -> SplitMap {
-        let added: Vec<usize> = (old_len..parts.len()).collect();
+    /// The map for `parts`, given an empty map (at start-up): all the parts
+    /// are new.
+    pub(crate) fn extend(&self, parts: &[Arc<LivePart>]) -> SplitMap {
+        let added: Vec<usize> = (0..parts.len()).collect();
         self.extend_at(parts, &added)
     }
 

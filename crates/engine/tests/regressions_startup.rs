@@ -1,4 +1,4 @@
-//! Review tests: start-up on on-disk states built by hand. Each test fails on
+//! Start-up on on-disk states built by hand. Each test fails on
 //! the code it was written against and names the defect it shows.
 
 mod common;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use nwdb_core::Error;
-use nwdb_engine::{Engine, EngineOptions};
+use nwdb_engine::Engine;
 use nwdb_manifest::{Manifest, ManifestOptions, OpenMode};
 
 fn manifest_state(dir: &Path) -> std::sync::Arc<nwdb_manifest::ManifestState> {
@@ -18,17 +18,6 @@ fn manifest_state(dir: &Path) -> std::sync::Arc<nwdb_manifest::ManifestState> {
     )
     .unwrap()
     .current()
-}
-
-fn one(trace: u128) -> Vec<TSpan> {
-    vec![TSpan::new(trace, 1, 100 + trace as i64).root()]
-}
-
-/// Options whose log keeps one record per file, so trimming is exact.
-fn small_files(dir: &Path) -> EngineOptions {
-    let mut o = opts(dir);
-    o.wal.max_file_bytes = 1;
-    o
 }
 
 fn files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -150,7 +139,7 @@ fn a_damaged_log_file_wholly_inside_parts_does_not_block_start_up() {
 /// The directory lock is a lock on the directory itself, not on a file in
 /// it: there is no `LOCK` file to delete, and removing the files that are
 /// there does not let a second engine open the directory while the first is
-/// still running. (Adjusted from the reviewer's test, which unlinked `LOCK`:
+/// still running. (Adjusted from an earlier test, which unlinked `LOCK`:
 /// that file no longer exists.)
 #[test]
 fn deleting_files_in_the_directory_does_not_let_a_second_engine_open_it() {

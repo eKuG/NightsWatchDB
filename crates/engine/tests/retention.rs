@@ -80,12 +80,8 @@ fn expired(window_start: i64, retention: i64, now: i64) -> bool {
     window_start + W <= now - retention
 }
 
-fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let t = Instant::now();
-    while !cond() {
-        assert!(t.elapsed() < Duration::from_secs(30), "timed out: {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+fn wait_for(what: &str, cond: impl FnMut() -> bool) {
+    wait_with_timeout(what, Duration::from_secs(30), cond);
 }
 
 #[test]
@@ -416,12 +412,8 @@ fn shutdown_during_a_pass_waits_for_the_step_in_progress_only() {
     );
     e.snapshot()
         .list_traces(&ListQuery {
-            from_ns: i64::MIN,
-            to_ns: i64::MAX,
-            service: None,
-            model: None,
-            error: None,
             limit: 10,
+            ..list_all()
         })
         .unwrap();
 
@@ -541,14 +533,7 @@ fn concurrent_ingest_flush_queries_and_maintenance_agree_with_the_model() {
     for _ in 0..2 {
         let (e, stop) = (e.clone(), stop.clone());
         threads.push(std::thread::spawn(move || {
-            let all = ListQuery {
-                from_ns: i64::MIN,
-                to_ns: i64::MAX,
-                service: None,
-                model: None,
-                error: None,
-                limit: usize::MAX,
-            };
+            let all = list_all();
             let mut looked = 0u64;
             while !stop.load(Ordering::SeqCst) {
                 let snap = e.snapshot();

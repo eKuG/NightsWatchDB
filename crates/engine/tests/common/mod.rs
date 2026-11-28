@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use nwdb_core::{
@@ -19,6 +19,47 @@ use nwdb_engine::{
     AggQuery, CompactionOptions, Engine, EngineOptions, ListQuery, Snapshot, TokenAgg,
 };
 use nwdb_wal::{SyncMode, WalOptions};
+
+/// Lists every trace: the whole time range and no limit.
+pub fn list_all() -> ListQuery {
+    ListQuery {
+        from_ns: i64::MIN,
+        to_ns: i64::MAX,
+        service: None,
+        model: None,
+        error: None,
+        limit: usize::MAX,
+    }
+}
+
+/// Log options that never fsync.
+pub fn wal_no_sync() -> WalOptions {
+    WalOptions {
+        sync: SyncMode::None,
+        ..WalOptions::default()
+    }
+}
+
+/// Polls `cond` every 5 ms until it holds; panics naming `what` after `timeout`.
+pub fn wait_with_timeout(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+    let end = Instant::now() + timeout;
+    while !cond() {
+        assert!(Instant::now() < end, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// One single-span trace, with id `trace`.
+pub fn one(trace: u128) -> Vec<TSpan> {
+    vec![TSpan::new(trace, 1, 100 + trace as i64).root()]
+}
+
+/// Options whose log keeps one record per file, so trimming is exact.
+pub fn small_files(dir: &Path) -> EngineOptions {
+    let mut o = opts(dir);
+    o.wal.max_file_bytes = 1;
+    o
+}
 
 /// The log tag of the test encoding.
 pub const TAG: u8 = 1;
@@ -324,9 +365,8 @@ pub fn opts(dir: &Path) -> EngineOptions {
     let mut o = EngineOptions::new(dir);
     o.window_ns = 1_000;
     o.wal = WalOptions {
-        sync: SyncMode::None,
         sync_interval: Duration::from_millis(1),
-        ..WalOptions::default()
+        ..wal_no_sync()
     };
     // Flushes happen when a test asks, unless it lowers these.
     o.buffer_bytes = 1 << 30;
@@ -546,14 +586,7 @@ impl Model {
             snap.get_trace(TraceId([0xee; 16])).unwrap().is_none(),
             "{what}: unknown trace"
         );
-        let all = ListQuery {
-            from_ns: i64::MIN,
-            to_ns: i64::MAX,
-            service: None,
-            model: None,
-            error: None,
-            limit: usize::MAX,
-        };
+        let all = list_all();
         let mut listed = snap.list_traces(&all).unwrap();
         let mut want = self.list(&all);
         let is_unmerged = |t: &TraceSummary| unmerged.contains(&u128::from_be_bytes(t.trace_id.0));

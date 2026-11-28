@@ -10,19 +10,8 @@ use std::path::Path;
 use common::*;
 use nwdb_core::Error;
 use nwdb_engine::{Engine, EngineOptions};
-use nwdb_wal::{SyncMode, Wal, WalOptions};
+use nwdb_wal::{Wal, WalOptions};
 use support::{copy_dir, tree};
-
-fn one(trace: u128) -> Vec<TSpan> {
-    vec![TSpan::new(trace, 1, 100 + trace as i64).root()]
-}
-
-/// One record per log file, so trimming is exact.
-fn small_files(dir: &Path) -> EngineOptions {
-    let mut o = opts(dir);
-    o.wal.max_file_bytes = 1;
-    o
-}
 
 /// A database with six records in two flushes, shut down cleanly. The model
 /// holds what it must contain.
@@ -159,10 +148,9 @@ fn a_log_that_starts_too_late() {
     let (wal, _) = Wal::open(
         &wal_dir,
         WalOptions {
-            sync: SyncMode::None,
             min_next_lsn: Some(3),
             allow_lost_log: true,
-            ..WalOptions::default()
+            ..wal_no_sync()
         },
     )
     .unwrap();
@@ -269,14 +257,7 @@ fn an_undecodable_record(small_buffer: bool, with_leftover: bool) {
     drop(e);
     let saved = tempfile::tempdir().unwrap();
     copy_dir(&dir.path().join("wal"), saved.path());
-    let (wal, _) = Wal::open(
-        dir.path().join("wal"),
-        WalOptions {
-            sync: SyncMode::None,
-            ..WalOptions::default()
-        },
-    )
-    .unwrap();
+    let (wal, _) = Wal::open(dir.path().join("wal"), wal_no_sync()).unwrap();
     wal.append_blocking(&[77, 1, 2, 3]).unwrap();
     wal.shutdown().unwrap();
     // Part directories the manifest does not reference may be the only

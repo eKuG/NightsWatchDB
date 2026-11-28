@@ -103,7 +103,7 @@ impl CompactionOptions {
 
 /// What the policy knows about one live part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PartInfo {
+pub(crate) struct PartInfo {
     /// The part's id.
     pub id: u64,
     /// Start of the part's window, Unix nanoseconds.
@@ -123,7 +123,7 @@ pub struct PartInfo {
 
 /// Which rule chose a merge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rule {
+pub(crate) enum Rule {
     /// Several parts of similar size.
     Tiered,
     /// A window that has stopped receiving parts.
@@ -132,7 +132,7 @@ pub enum Rule {
 
 /// One merge to do: parts of one window, smallest first.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MergePlan {
+pub(crate) struct MergePlan {
     /// Start of the window, Unix nanoseconds.
     pub window_start_ns: i64,
     /// Width of the window, nanoseconds.
@@ -141,8 +141,6 @@ pub struct MergePlan {
     pub rule: Rule,
     /// Ids of the parts to merge, smallest first.
     pub parts: Vec<u64>,
-    /// Bytes on disk of those parts.
-    pub input_bytes: u64,
 }
 
 /// The identity of a window.
@@ -167,7 +165,7 @@ pub(crate) type WindowKey = (i64, i64);
 /// has been quiet, the final rule rewrites everything once, huge part
 /// included; a window that is a single part is never chosen, so repeated
 /// passes cost nothing.
-pub fn choose_merge(
+pub(crate) fn choose_merge(
     opts: &CompactionOptions,
     parts: &[PartInfo],
     max_pieces: u64,
@@ -221,7 +219,6 @@ pub fn choose_merge(
                 window_ns: width,
                 rule,
                 parts: chosen.iter().map(|p| p.id).collect(),
-                input_bytes: bytes,
             });
         }
     }
@@ -466,7 +463,12 @@ mod tests {
         // Three parts: the largest is dropped and two remain.
         let parts = vec![p(1, 0, 30, 99), p(2, 0, 40, 99), p(3, 0, 70, 99)];
         let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
-        assert_eq!((m.parts, m.input_bytes), (vec![1, 2], 70));
+        let bytes: u64 = parts
+            .iter()
+            .filter(|p| m.parts.contains(&p.id))
+            .map(|p| p.size_bytes)
+            .sum();
+        assert_eq!((m.parts, bytes), (vec![1, 2], 70));
         // A tiered run over the cap is cut the same way.
         let parts: Vec<_> = (1..=4).map(|i| p(i, 0, 30, 1)).collect();
         let m = choose_merge(&o, &parts, u64::MAX, &|_, _| false).unwrap();
@@ -573,15 +575,7 @@ mod tests {
 
         fn add(&mut self, size: u64) {
             self.ingested += size;
-            self.parts.push(PartInfo {
-                id: self.next_id,
-                window_start_ns: 0,
-                window_ns: W,
-                size_bytes: size,
-                pieces: 0,
-                level: 0,
-                live_for: Duration::ZERO,
-            });
+            self.parts.push(p(self.next_id, 0, size, 0));
             self.next_id += 1;
         }
 
@@ -597,18 +591,19 @@ mod tests {
                     .map(|p| p.level)
                     .max()
                     .unwrap();
+                let input_bytes: u64 = self
+                    .parts
+                    .iter()
+                    .filter(|p| m.parts.contains(&p.id))
+                    .map(|p| p.size_bytes)
+                    .sum();
                 self.parts.retain(|p| !m.parts.contains(&p.id));
                 self.parts.push(PartInfo {
-                    id: self.next_id,
-                    window_start_ns: 0,
-                    window_ns: W,
-                    size_bytes: m.input_bytes,
-                    pieces: 0,
                     level: level + 1,
-                    live_for: Duration::ZERO,
+                    ..p(self.next_id, 0, input_bytes, 0)
                 });
                 self.next_id += 1;
-                self.rewritten += m.input_bytes;
+                self.rewritten += input_bytes;
                 self.merges += 1;
                 done.push((m.parts, self.next_id - 1));
             }
@@ -648,15 +643,7 @@ mod tests {
     fn one_huge_part_is_not_rewritten_by_a_trickle_of_small_ones() {
         let o = CompactionOptions::default();
         let huge = 1_000_000u64;
-        let mut sim = Sim::new(vec![PartInfo {
-            id: 1,
-            window_start_ns: 0,
-            window_ns: W,
-            size_bytes: huge,
-            pieces: 0,
-            level: 0,
-            live_for: Duration::ZERO,
-        }]);
+        let mut sim = Sim::new(vec![p(1, 0, huge, 0)]);
         let mut huge_rewrites = 0u64;
         let mut huge_ids = vec![1u64];
         let mut small_ingested = 0;

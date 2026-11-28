@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use nwdb_core::Error;
-use nwdb_engine::{Engine, ListQuery, Stage, StageHook};
+use nwdb_engine::{Engine, Stage, StageHook};
 
 fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let t = Instant::now();
@@ -96,17 +96,6 @@ fn retention_is_not_held_up_by_a_pass_that_keeps_finding_merges() {
         "the expired part was still live {waited:?} after it expired (maintenance interval \
          20 ms); the pass did {merges} merges meanwhile"
     );
-}
-
-fn list_all() -> ListQuery {
-    ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
-        limit: usize::MAX,
-    }
 }
 
 /// The log files and their sizes.

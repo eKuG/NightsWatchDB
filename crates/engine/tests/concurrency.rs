@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::*;
 use nwdb_core::TraceId;
-use nwdb_engine::{AggQuery, ListQuery};
+use nwdb_engine::AggQuery;
 use nwdb_wal::{SyncMode, WalOptions};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -62,16 +62,7 @@ fn ingest_query_and_flush_concurrently() {
                         .windows(2)
                         .all(|w| (w[0].start, w[0].span) < (w[1].start, w[1].span))
                 );
-                let listed = snap
-                    .list_traces(&ListQuery {
-                        from_ns: i64::MIN,
-                        to_ns: i64::MAX,
-                        service: None,
-                        model: None,
-                        error: None,
-                        limit: usize::MAX,
-                    })
-                    .unwrap();
+                let listed = snap.list_traces(&list_all()).unwrap();
                 let agg = snap
                     .aggregate_tokens(&AggQuery {
                         from_ns: i64::MIN,

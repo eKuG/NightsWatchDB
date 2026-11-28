@@ -1,7 +1,7 @@
 //! The engine handle: options, start-up, ingest, the applier and flusher
 //! threads, and shutdown.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, TryLockError};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -737,7 +737,7 @@ impl Engine {
                 closing: false,
                 stop_flusher: false,
                 vis: Visible {
-                    split: Arc::new(SplitMap::default().extend(&parts, 0)),
+                    split: Arc::new(SplitMap::default().extend(&parts)),
                     parts: Arc::new(parts),
                     frozen: None,
                     active: Arc::default(),
@@ -941,7 +941,9 @@ impl Engine {
     /// flushed if there is one, and the batches in the active buffer at this
     /// instant. Queries on it see exactly that state however long they run.
     pub fn snapshot(&self) -> Snapshot {
-        self.inner().snapshot()
+        let inner = self.inner();
+        let c = lock(&inner.core);
+        Snapshot::new(c.vis.clone(), inner.opts.batch_limits, c.flushed_lsn)
     }
 
     /// [`Snapshot::get_trace`] on a fresh snapshot.
@@ -974,6 +976,18 @@ impl Engine {
     /// Counters and positions.
     pub fn stats(&self) -> EngineStats {
         let c = lock(&self.inner().core);
+        let (mut payload_logical_bytes, mut payload_unique_bytes, mut payload_stored_bytes) =
+            (0, 0, 0);
+        let mut windows: HashMap<(i64, i64), usize> = HashMap::new();
+        for p in c.vis.parts.iter() {
+            let payload = &p.meta.payload;
+            payload_logical_bytes += payload.logical_bytes;
+            payload_unique_bytes += payload.unique_bytes;
+            payload_stored_bytes += payload.stored_bytes;
+            *windows
+                .entry((p.meta.window_start_ns, p.meta.window_ns))
+                .or_default() += 1;
+        }
         EngineStats {
             records_ingested: c.records,
             bytes_ingested: c.bytes,
@@ -985,24 +999,9 @@ impl Engine {
             flushing: c.flushing,
             fatal: c.fatal.is_some(),
             last_error: c.last_error.clone(),
-            payload_logical_bytes: c
-                .vis
-                .parts
-                .iter()
-                .map(|p| p.meta.payload.logical_bytes)
-                .sum(),
-            payload_unique_bytes: c
-                .vis
-                .parts
-                .iter()
-                .map(|p| p.meta.payload.unique_bytes)
-                .sum(),
-            payload_stored_bytes: c
-                .vis
-                .parts
-                .iter()
-                .map(|p| p.meta.payload.stored_bytes)
-                .sum(),
+            payload_logical_bytes,
+            payload_unique_bytes,
+            payload_stored_bytes,
             maintenance_passes: c.maintenance_passes,
             retention_parts_removed: c.retention_removed,
             last_maintenance_error: c.last_maintenance_error.clone(),
@@ -1011,17 +1010,7 @@ impl Engine {
             duplicate_spans_dropped: c.compaction.duplicates_dropped,
             merge_input_bytes: c.compaction.input_bytes,
             merge_output_bytes: c.compaction.output_bytes,
-            windows_with_many_parts: {
-                let mut seen = HashSet::new();
-                let mut many = HashSet::new();
-                for p in c.vis.parts.iter() {
-                    let key = (p.meta.window_start_ns, p.meta.window_ns);
-                    if !seen.insert(key) {
-                        many.insert(key);
-                    }
-                }
-                many.len()
-            },
+            windows_with_many_parts: windows.values().filter(|&&n| n > 1).count(),
             merging: c.compaction.merging,
             last_compaction_error: c.compaction.last_error.clone(),
         }
@@ -1063,11 +1052,6 @@ impl Inner {
             .into_iter()
             .flatten()
             .any(|(id, _)| *id == me)
-    }
-
-    pub(crate) fn snapshot(&self) -> Snapshot {
-        let c = lock(&self.core);
-        Snapshot::new(c.vis.clone(), self.opts.batch_limits, c.flushed_lsn)
     }
 
     pub(crate) fn set_fatal_locked(&self, c: &mut Core, msg: String) {

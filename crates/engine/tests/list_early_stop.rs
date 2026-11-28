@@ -37,12 +37,8 @@ fn list_from(sums: &BTreeMap<u128, TraceSummary>, q: &ListQuery) -> Vec<TraceSum
 
 fn all_time(limit: usize) -> ListQuery {
     ListQuery {
-        from_ns: i64::MIN,
-        to_ns: i64::MAX,
-        service: None,
-        model: None,
-        error: None,
         limit,
+        ..list_all()
     }
 }
 

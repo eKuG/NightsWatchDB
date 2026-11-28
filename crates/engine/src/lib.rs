@@ -35,7 +35,7 @@ mod replace_tests;
 #[cfg(test)]
 mod search_tests;
 
-pub use compaction::{CompactionOptions, MergePlan, PartInfo, Rule, choose_merge};
+pub use compaction::CompactionOptions;
 pub use engine::{Clock, Engine, EngineOptions, EngineStats, Stage, StageHook};
 pub use query::{AggQuery, ListQuery, ListStats, Snapshot, TokenAgg};
 pub use search::{SearchHit, SearchQuery, SearchResults, SearchStats};
@@ -46,11 +46,6 @@ pub use nwdb_segment::SearchLimits;
 /// The full-text query model: [`textindex::Query`] and [`textindex::parse`].
 pub use nwdb_textindex as textindex;
 
-use std::sync::{Mutex, MutexGuard};
-
-/// Locks, ignoring poisoning: no code holding the engine's locks leaves its
-/// data half updated, and a panic in a caller's callback must not wedge the
-/// engine.
-pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+// No code holding the engine's locks leaves its data half updated, and a
+// panic in a caller's callback must not wedge the engine.
+pub(crate) use nwdb_core::lock;

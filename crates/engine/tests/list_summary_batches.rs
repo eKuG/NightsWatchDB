@@ -40,12 +40,9 @@ fn brute(spans: &[TSpan], q: &ListQuery) -> Vec<(i64, nwdb_core::TraceId)> {
 
 fn query(to_ns: i64, limit: usize) -> ListQuery {
     ListQuery {
-        from_ns: i64::MIN,
         to_ns,
-        service: None,
-        model: None,
-        error: None,
         limit,
+        ..list_all()
     }
 }
 

@@ -861,7 +861,7 @@ from `FlushFrozen` to `Trimmed` through the stage hook. Two kinds of test run it
   start-up stages are run on a directory with leftovers and a log to replay,
   with a buffer small enough that the replay flushes.
 
-`tests/startup_safety.rs` and `tests/regressions_second_review.rs` check that
+`tests/startup_safety.rs` and `tests/regressions_second_pass.rs` check that
 every refusal, including each kind of refused replay with a buffer so small
 that the replay would flush after every record, leaves the directory byte for
 byte as it was and that restoring what was lost lets it open;
