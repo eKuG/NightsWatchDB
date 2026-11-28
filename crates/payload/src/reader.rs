@@ -9,14 +9,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn blk_corrupt(msg: impl std::fmt::Display) -> Error {
-    Error::corrupt(format!("{BLOCKS_FILE}: {msg}"))
+    Error::corrupt_in(BLOCKS_FILE, msg)
 }
 
-fn missing(name: &str, e: std::io::Error) -> Error {
+/// A short read of a file whose length was checked is `corrupt()`; any other
+/// failure is an I/O error.
+fn eof_or_io(e: std::io::Error, corrupt: impl FnOnce() -> Error) -> Error {
     match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            Error::corrupt(format!("{name}: file is missing from the part"))
-        }
+        std::io::ErrorKind::UnexpectedEof => corrupt(),
         _ => Error::Io(e),
     }
 }
@@ -61,8 +61,10 @@ impl PieceReader {
     }
 
     fn open_with(dir: &Path, recorded: Option<(FileSum, FileSum)>) -> Result<Self> {
-        let idx = File::open(dir.join(INDEX_FILE)).map_err(|e| missing(INDEX_FILE, e))?;
-        let blk = File::open(dir.join(BLOCKS_FILE)).map_err(|e| missing(BLOCKS_FILE, e))?;
+        let idx =
+            File::open(dir.join(INDEX_FILE)).map_err(|e| Error::part_file_open(INDEX_FILE, e))?;
+        let blk =
+            File::open(dir.join(BLOCKS_FILE)).map_err(|e| Error::part_file_open(BLOCKS_FILE, e))?;
         let idx_len = idx.metadata()?.len();
         let blk_len = blk.metadata()?.len();
         if let Some((blocks, index)) = recorded {
@@ -122,16 +124,6 @@ impl PieceReader {
         self.totals
     }
 
-    /// Length of `pieces.blk`.
-    pub fn blocks_file_len(&self) -> u64 {
-        self.totals.stored_bytes
-    }
-
-    /// Length of `pieces.idx`.
-    pub fn index_file_len(&self) -> u64 {
-        self.idx_len
-    }
-
     /// Number of blocks.
     pub fn block_count(&self) -> usize {
         self.index.blocks.len()
@@ -179,11 +171,10 @@ impl PieceReader {
         let mut packed = vec![0u8; loc.clen as usize];
         self.blk
             .read_exact_at(&mut packed, loc.offset)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => {
+            .map_err(|e| {
+                eof_or_io(e, || {
                     blk_corrupt(format!("block {block} ends past the end of the file"))
-                }
-                _ => Error::Io(e),
+                })
             })?;
         if crc32c::crc32c(&packed) != loc.crc {
             return Err(blk_corrupt(format!("block {block}: checksum mismatch")));
@@ -301,13 +292,11 @@ fn sum_of(file: &File, name: &str, opened_len: u64, tail: u64) -> Result<FileSum
     let end = opened_len.saturating_sub(tail);
     while at < end {
         let n = (end - at).min(buf.len() as u64) as usize;
-        file.read_exact_at(&mut buf[..n], at)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => {
-                    Error::corrupt(format!("{name}: file ended before its length"))
-                }
-                _ => Error::Io(e),
-            })?;
+        file.read_exact_at(&mut buf[..n], at).map_err(|e| {
+            eof_or_io(e, || {
+                Error::corrupt(format!("{name}: file ended before its length"))
+            })
+        })?;
         crc = crc32c::crc32c_append(crc, &buf[..n]);
         at += n as u64;
     }
@@ -315,13 +304,11 @@ fn sum_of(file: &File, name: &str, opened_len: u64, tail: u64) -> Result<FileSum
     // before them: read them again, as `open` would.
     if tail > 0 {
         let mut trailer = [0u8; IDX_TRAILER as usize];
-        file.read_exact_at(&mut trailer, end)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => {
-                    Error::corrupt(format!("{name}: file ended before its length"))
-                }
-                _ => Error::Io(e),
-            })?;
+        file.read_exact_at(&mut trailer, end).map_err(|e| {
+            eof_or_io(e, || {
+                Error::corrupt(format!("{name}: file ended before its length"))
+            })
+        })?;
         if u32::from_le_bytes(trailer) != crc {
             return Err(Error::corrupt(format!(
                 "{name}: the file's own checksum, in its last {tail} bytes, does not match the \

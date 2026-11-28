@@ -142,15 +142,6 @@ impl Index {
     }
 }
 
-/// Appends `v` as a little-endian base-128 varint.
-pub(crate) fn put_len(out: &mut Vec<u8>, mut v: u32) {
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
 /// Reads one length from the front of `rest`. The table was walked at open,
 /// so this fails only for a table that was not.
 fn get_len(rest: &mut &[u8]) -> Option<u32> {
@@ -167,7 +158,7 @@ fn get_len(rest: &mut &[u8]) -> Option<u32> {
 }
 
 pub(crate) fn corrupt(msg: impl std::fmt::Display) -> Error {
-    Error::corrupt(format!("{INDEX_FILE}: {msg}"))
+    Error::corrupt_in(INDEX_FILE, msg)
 }
 
 /// The header and block table of the file: everything before the piece
@@ -380,7 +371,7 @@ mod tests {
     fn lens(of: &[u32]) -> Vec<u8> {
         let mut out = Vec::new();
         for &l in of {
-            put_len(&mut out, l);
+            nwdb_core::put_varint(&mut out, u64::from(l));
         }
         out
     }

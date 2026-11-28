@@ -28,7 +28,7 @@
 //! two segments of one kind may follow each other (two adjacent cuts are two
 //! references).
 
-use nwdb_core::Error;
+use nwdb_core::{Error, put_varint};
 use std::ops::Range;
 
 const TAG_INLINE: u8 = 0;
@@ -58,14 +58,6 @@ pub enum Segment<'a> {
     Inline(&'a [u8]),
     /// The piece with this id.
     Piece(u32),
-}
-
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
 }
 
 fn get_varint(buf: &mut &[u8]) -> Result<u64, RopeError> {

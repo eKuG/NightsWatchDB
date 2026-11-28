@@ -186,10 +186,6 @@ pub struct PieceWriter {
     constant_hash: bool,
 }
 
-fn io_other(e: impl std::error::Error + Send + Sync + 'static) -> Error {
-    Error::other(e)
-}
-
 impl PieceWriter {
     /// Creates `pieces.blk` and `pieces.idx` in `dir`, which must exist. An
     /// existing file is an error.
@@ -350,7 +346,7 @@ impl PieceWriter {
         self.open.data.extend_from_slice(bytes);
         let older = self.map.insert(h, id).unwrap_or(NONE);
         self.open.chain.push(older);
-        format::put_len(&mut self.lens, bytes.len() as u32);
+        nwdb_core::put_varint(&mut self.lens, u64::from(bytes.len() as u32));
         self.count += 1;
         self.unique += bytes.len() as u64;
         if self.open.data.len() >= self.opts.block_bytes {
@@ -370,7 +366,7 @@ impl PieceWriter {
         if self.open.data.is_empty() {
             return Ok(());
         }
-        let packed = zstd::bulk::compress(&self.open.data, ZSTD_LEVEL).map_err(io_other)?;
+        let packed = zstd::bulk::compress(&self.open.data, ZSTD_LEVEL).map_err(Error::other)?;
         self.blk.write_all(&packed)?;
         self.blk_crc = crc32c::crc32c_append(self.blk_crc, &packed);
         let block = self.blocks.len() as u32;
