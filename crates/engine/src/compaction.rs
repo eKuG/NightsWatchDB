@@ -527,6 +527,89 @@ mod tests {
         );
     }
 
+    fn ann(id: u64, window: i64, size: u64, live_secs: u64) -> PartInfo {
+        PartInfo {
+            kind: PartKind::Annotations,
+            ..p(id, window, size, live_secs)
+        }
+    }
+
+    #[test]
+    fn kinds_are_never_in_one_plan() {
+        let o = CompactionOptions::default();
+        // Two span parts and two annotation parts of one window: each kind
+        // alone is below the tiered threshold, and together they would not be.
+        let parts = vec![
+            p(1, 0, 10, 1),
+            p(2, 0, 10, 1),
+            ann(3, 0, 10, 1),
+            ann(4, 0, 10, 1),
+        ];
+        assert_eq!(pick(&o, &parts), None);
+        // Quiet: one plan per kind, never both.
+        let parts = vec![p(1, 0, 10, 99), ann(2, 0, 10, 99), ann(3, 0, 10, 99)];
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
+        assert_eq!((m.kind, m.parts), (PartKind::Annotations, vec![2, 3]));
+        // A kind alone with enough parts is chosen, with its kind.
+        let parts: Vec<_> = (1..=4).map(|i| ann(i, 0, 10, 1)).collect();
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
+        assert_eq!((m.rule, m.kind), (Rule::Tiered, PartKind::Annotations));
+        // The piece ceiling does not concern annotation parts.
+        let parts = vec![ann(1, 0, 10, 99), ann(2, 0, 10, 99)];
+        assert!(choose_merge(&o, &parts, 0, &|_| false).is_some());
+    }
+
+    #[test]
+    fn the_window_with_the_most_parts_goes_first_across_kinds() {
+        let o = CompactionOptions::default();
+        let mut parts: Vec<_> = (1..=2).map(|i| p(i, 0, 10, 99)).collect();
+        parts.extend((3..=6).map(|i| ann(i, 1, 10, 99)));
+        parts.extend((7..=9).map(|i| p(i, 2, 10, 99)));
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
+        assert_eq!((m.kind, m.window_start_ns), (PartKind::Annotations, W));
+        // Skip the annotation window: the three span parts of window 2 follow.
+        let m = choose_merge(&o, &parts, u64::MAX, &|k| k.2 == PartKind::Annotations).unwrap();
+        assert_eq!((m.kind, m.window_start_ns), (PartKind::Spans, 2 * W));
+        // A tie goes to the older window, whatever the kind.
+        let parts = vec![
+            ann(1, 5, 10, 99),
+            ann(2, 5, 10, 99),
+            p(3, 2, 10, 99),
+            p(4, 2, 10, 99),
+        ];
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
+        assert_eq!(m.window_start_ns, 2 * W);
+        let parts = vec![
+            ann(1, 5, 10, 99),
+            ann(2, 5, 10, 99),
+            p(3, 7, 10, 99),
+            p(4, 7, 10, 99),
+        ];
+        let m = choose_merge(&o, &parts, u64::MAX, &|_| false).unwrap();
+        assert_eq!((m.kind, m.window_start_ns), (PartKind::Annotations, 5 * W));
+    }
+
+    #[test]
+    fn a_skipped_kind_of_a_window_does_not_hold_back_the_other_kind() {
+        let o = CompactionOptions::default();
+        let parts = vec![
+            ann(1, 0, 10, 99),
+            ann(2, 0, 10, 99),
+            p(3, 0, 10, 99),
+            p(4, 0, 10, 99),
+        ];
+        // The annotation parts of the window are failing or damaged.
+        let skip = |k: MergeKey| k == (0, W, PartKind::Annotations);
+        let m = choose_merge(&o, &parts, u64::MAX, &skip).unwrap();
+        assert_eq!((m.kind, m.parts), (PartKind::Spans, vec![3, 4]));
+        // And the other way round.
+        let skip = |k: MergeKey| k == (0, W, PartKind::Spans);
+        let m = choose_merge(&o, &parts, u64::MAX, &skip).unwrap();
+        assert_eq!((m.kind, m.parts), (PartKind::Annotations, vec![1, 2]));
+        // Both skipped: nothing.
+        assert!(choose_merge(&o, &parts, u64::MAX, &|k| k.0 == 0).is_none());
+    }
+
     #[test]
     fn a_size_of_zero_is_not_a_trap() {
         let o = CompactionOptions::default();

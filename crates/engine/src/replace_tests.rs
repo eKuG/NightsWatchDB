@@ -14,9 +14,9 @@ use std::time::Duration;
 use common::*;
 use nwdb_core::{Error, TraceId, part_dir_name};
 use nwdb_manifest::{Manifest, ManifestOptions, OpenMode};
-use nwdb_segment::{PartReader, PartWriter, WriterOptions};
+use nwdb_segment::{AnnotationReader, PartReader, PartWriter, WriterOptions};
 
-use crate::engine::{LivePart, Stage, StageHook};
+use crate::engine::{LiveAnnotationPart, LivePart, Stage, StageHook};
 use crate::lock;
 use crate::{Engine, Snapshot};
 
@@ -710,5 +710,287 @@ fn a_part_published_while_the_map_is_built_cannot_be_removed_by_that_replacement
     m.check(&e, "after the refusal");
     std::fs::remove_dir_all(dir.path().join("parts").join(part_dir_name(new_id))).unwrap();
     assert_eq!(manifest_ids(dir.path()), ids);
+    e.shutdown().unwrap();
+}
+
+// Both kinds of part in one replacement.
+
+/// The annotation parts `from` (all of one window) merged into one part, the
+/// way a merge would.
+fn merged_annotations(e: &Engine, from: &[u64]) -> LiveAnnotationPart {
+    let inner = e.inner();
+    let parts = lock(&inner.core).vis.ann_parts.clone();
+    let srcs: Vec<_> = parts
+        .iter()
+        .filter(|p| from.contains(&p.meta.part_id))
+        .collect();
+    assert_eq!(srcs.len(), from.len());
+    let id = inner.manifest.reserve_part_ids(1).unwrap().start;
+    let (start, width) = (srcs[0].meta.window_start_ns, srcs[0].meta.window_ns);
+    let readers: Vec<&AnnotationReader> = srcs.iter().map(|p| &p.reader).collect();
+    let (meta, _) =
+        nwdb_segment::merge_annotation_parts(&readers, &inner.parts_dir, id, start, width, 1, None)
+            .unwrap();
+    let reader = AnnotationReader::open(inner.parts_dir.join(part_dir_name(id)), &meta).unwrap();
+    LiveAnnotationPart::new(meta, reader)
+}
+
+/// `(id, window start)` of the live annotation parts.
+fn ann_windows_of(e: &Engine) -> Vec<(u64, i64)> {
+    lock(&e.inner().core)
+        .vis
+        .ann_parts
+        .iter()
+        .map(|p| (p.meta.part_id, p.meta.window_start_ns))
+        .collect()
+}
+
+fn window_count(e: &Engine, w: i64) -> usize {
+    windows_of(e).iter().filter(|x| x.1 == w * 1_000).count()
+}
+
+fn ann_ids(e: &Engine) -> Vec<u64> {
+    e.snapshot()
+        .annotation_part_info()
+        .iter()
+        .map(|x| x.0)
+        .collect()
+}
+
+fn manifest_ann_ids(dir: &Path) -> Vec<u64> {
+    Manifest::open(
+        dir.join("manifest"),
+        OpenMode::MustExist,
+        ManifestOptions::default(),
+    )
+    .unwrap()
+    .current()
+    .parts
+    .iter()
+    .filter(|p| p.kind == nwdb_core::PartKind::Annotations)
+    .map(|p| p.part_id)
+    .collect()
+}
+
+fn values_of(s: &Snapshot, t: u128) -> Vec<Option<f64>> {
+    s.annotations(tid(t), usize::MAX)
+        .unwrap()
+        .0
+        .iter()
+        .map(|a| a.value)
+        .collect()
+}
+
+/// `populated`, then two flushes of annotations (values 1 and 2) on every
+/// trace: ten windows, two annotation parts each, the winner 2.
+fn with_annotations(e: &Engine, m: &mut Model) {
+    populated(e, m);
+    for v in [1.0, 2.0] {
+        annotate(
+            e,
+            (1..=30u128).map(|t| score(t, None, "q", "s", v)).collect(),
+        );
+        e.flush().unwrap();
+    }
+}
+
+#[test]
+fn both_kinds_are_replaced_in_one_step_and_old_snapshots_keep_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(opts(dir.path()));
+    let mut m = Model::default();
+    with_annotations(&e, &mut m);
+    assert_eq!(ann_ids(&e).len(), 20);
+    let spans_before = part_ids(&e).len();
+    let (w3, w4) = (window_count(&e, 3), window_count(&e, 4));
+    let window = |w: i64| -> (Vec<u64>, Vec<u64>) {
+        (
+            windows_of(&e)
+                .into_iter()
+                .filter(|x| x.1 == w * 1_000)
+                .map(|x| x.0)
+                .collect(),
+            ann_windows_of(&e)
+                .into_iter()
+                .filter(|x| x.1 == w * 1_000)
+                .map(|x| x.0)
+                .collect(),
+        )
+    };
+
+    let old = e.snapshot();
+    let stop = Arc::new(AtomicBool::new(false));
+    // Readers: the traces of window 3 (3, 13, 23) always show their spans and
+    // their winner (the merged parts are never missing, one kind is never
+    // swapped before the other); the traces of window 4 show their spans only
+    // together with their annotation, until both are removed.
+    let readers: Vec<_> = (0..2)
+        .map(|_| {
+            let (e, stop) = (e.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut rounds = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let s = e.snapshot();
+                    for t in [3u128, 13, 23] {
+                        assert!(s.get_trace(tid(t)).unwrap().is_some(), "spans of {t}");
+                        assert_eq!(values_of(&s, t), vec![Some(2.0)], "trace {t}");
+                    }
+                    for t in [4u128, 14, 24] {
+                        if s.get_trace(tid(t)).unwrap().is_some() {
+                            assert_eq!(values_of(&s, t), vec![Some(2.0)], "trace {t}");
+                        }
+                    }
+                    rounds += 1;
+                }
+                rounds
+            })
+        })
+        .collect();
+
+    // Window 3: swapped for copies, again and again.
+    for _ in 0..15 {
+        let (spans, anns) = window(3);
+        let mut remove = spans.clone();
+        remove.extend(&anns);
+        let sp = merged(&e, &spans);
+        let an = merged_annotations(&e, &anns);
+        let r = e.inner().replace_any(&remove, vec![sp], vec![an]).unwrap();
+        assert!(r.deletion_errors.is_empty());
+    }
+    // Window 4: removed, both kinds, no replacement.
+    let (spans, anns) = window(4);
+    let remove: Vec<u64> = spans.iter().chain(&anns).copied().collect();
+    let version = e.inner().manifest.current().version;
+    e.inner()
+        .replace_any(&remove, Vec::new(), Vec::new())
+        .unwrap();
+    assert_eq!(e.inner().manifest.current().version, version + 1);
+    stop.store(true, Ordering::SeqCst);
+    for r in readers {
+        assert!(r.join().unwrap() > 0);
+    }
+
+    // The state after: one annotation part for window 3, none for window 4.
+    let now = e.snapshot();
+    assert_eq!(part_ids(&e).len(), spans_before - (w3 - 1) - w4);
+    assert_eq!(ann_ids(&e).len(), 20 - 2 - 2 + 1);
+    assert!(now.get_trace(tid(4)).unwrap().is_none());
+    assert_eq!(values_of(&now, 4), Vec::<Option<f64>>::new());
+    assert_eq!(values_of(&now, 5), vec![Some(2.0)]);
+    check_split(&now, "after");
+    // The old snapshot still reads the removed annotation parts from their
+    // open files.
+    for t in [3u128, 4, 14, 23] {
+        assert_eq!(
+            values_of(&old, t),
+            vec![Some(2.0)],
+            "old snapshot, trace {t}"
+        );
+        assert!(old.get_trace(tid(t)).unwrap().is_some());
+    }
+    // The manifest, the lists and the directories agree.
+    let mut live: Vec<u64> = part_ids(&e);
+    live.extend(ann_ids(&e));
+    live.sort_unstable();
+    assert_eq!(dirs_on_disk(dir.path()), live);
+    assert_eq!(manifest_ann_ids(dir.path()), ann_ids(&e));
+    drop((old, now));
+    e.shutdown().unwrap();
+    let e = open(opts(dir.path()));
+    assert_eq!(ann_ids(&e).len(), 17);
+    assert_eq!(values_of(&e.snapshot(), 13), vec![Some(2.0)]);
+    e.shutdown().unwrap();
+}
+
+#[test]
+fn a_removed_id_must_be_live_in_one_of_the_two_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(opts(dir.path()));
+    let mut m = Model::default();
+    with_annotations(&e, &mut m);
+    let version = e.inner().manifest.current().version;
+    let a = ann_ids(&e)[0];
+    let s = part_ids(&e)[0];
+    for remove in [vec![a, a], vec![s, s], vec![a, 99_999]] {
+        let err = e
+            .inner()
+            .replace_any(&remove, Vec::new(), Vec::new())
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+    }
+    assert_eq!(e.inner().manifest.current().version, version);
+    assert_eq!(ann_ids(&e).len(), 20);
+    // One of each kind in one call is fine.
+    e.inner()
+        .replace_any(&[a, s], Vec::new(), Vec::new())
+        .unwrap();
+    assert_eq!(e.inner().manifest.current().version, version + 1);
+    e.shutdown().unwrap();
+}
+
+/// The annotation list is rebuilt under the gate from the list as it is then,
+/// so annotation parts a flush published while the replacement was between
+/// its stages survive, also in the window being replaced.
+#[test]
+fn a_flush_publishing_annotation_parts_during_a_replacement_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let pause = Pause::new(Stage::ReplaceMapBuilt);
+    let mut o = opts(dir.path());
+    o.stage_hook = Some(pause.hook());
+    let e = open(o);
+    let mut m = Model::default();
+    with_annotations(&e, &mut m);
+    // Window 2 (traces 2, 12, 22) is replaced.
+    let spans: Vec<u64> = windows_of(&e)
+        .into_iter()
+        .filter(|x| x.1 == 2_000)
+        .map(|x| x.0)
+        .collect();
+    let anns: Vec<u64> = ann_windows_of(&e)
+        .into_iter()
+        .filter(|x| x.1 == 2_000)
+        .map(|x| x.0)
+        .collect();
+    let before = ann_ids(&e);
+    let mut remove = spans.clone();
+    remove.extend(&anns);
+    let sp = merged(&e, &spans);
+    let an = merged_annotations(&e, &anns);
+    let replacer = {
+        let e = e.clone();
+        std::thread::spawn(move || e.inner().replace_any(&remove, vec![sp], vec![an]).unwrap())
+    };
+    pause.wait_reached();
+    // Between the stages: annotations of window 2 and of window 5 are
+    // flushed.
+    annotate(
+        &e,
+        vec![score(2, None, "q", "s", 3.0), score(5, None, "q", "s", 3.0)],
+    );
+    e.flush().unwrap();
+    let flushed: Vec<u64> = ann_ids(&e)
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(flushed.len(), 2, "{flushed:?}");
+    pause.release();
+    replacer.join().unwrap();
+
+    let now = e.snapshot();
+    assert_eq!(values_of(&now, 2), vec![Some(3.0)]);
+    assert_eq!(values_of(&now, 5), vec![Some(3.0)]);
+    assert_eq!(values_of(&now, 12), vec![Some(2.0)]);
+    let ids = ann_ids(&e);
+    assert!(flushed.iter().all(|f| ids.contains(f)), "{ids:?}");
+    assert!(anns.iter().all(|a| !ids.contains(a)));
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+    assert_eq!(ids.len(), 20 - anns.len() + 1 + 2);
+    assert_eq!(manifest_ann_ids(dir.path()), ids);
+    drop(now);
+    e.shutdown().unwrap();
+    let e = open(opts(dir.path()));
+    assert_eq!(values_of(&e.snapshot(), 2), vec![Some(3.0)]);
+    assert_eq!(values_of(&e.snapshot(), 5), vec![Some(3.0)]);
+    assert_eq!(ann_ids(&e), ids);
     e.shutdown().unwrap();
 }
