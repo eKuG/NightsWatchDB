@@ -213,6 +213,12 @@ pub enum Stage {
     /// error returned here abandons the merge: the output is deleted and
     /// nothing else changes.
     MergeWritten,
+    /// Retention found an expired window and has not taken the part list the
+    /// replacement is built on yet. An error returned here changes nothing
+    /// (`Fatal` puts the engine in the fatal state). A flush may publish
+    /// after this point; the replacement removes what it publishes into an
+    /// expired window.
+    RetentionDecided,
     /// A replacement of parts has checked its arguments and holds the publish
     /// gate, just before the manifest commit. An error returned here is
     /// handled as if the commit had failed with it: nothing changes (`Fatal`
@@ -491,6 +497,10 @@ pub(crate) struct Core {
     pub maintenance_due: bool,
     pub maintenance_passes: u64,
     pub retention_removed: u64,
+    /// Counts the retention replacements that removed parts, moved with the
+    /// part list in the same step. A flush that decided where annotations go
+    /// from a list with another epoch than the one at its commit starts over.
+    pub retention_epoch: u64,
     pub last_maintenance_error: Option<String>,
     pub compaction: crate::maintenance::CompactionState,
 }
@@ -917,6 +927,7 @@ impl Engine {
                 maintenance_due: true,
                 maintenance_passes: 0,
                 retention_removed: 0,
+                retention_epoch: 0,
                 last_maintenance_error: None,
                 compaction: Default::default(),
             }),

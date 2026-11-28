@@ -203,8 +203,10 @@ time), the maintenance gate (one pass at a time) and the publish gate (a
 manifest commit that changes the part list, together with the publish that
 follows it; see Replacing parts). Where a thread needs two, it takes them in
 the order flush gate or maintenance gate first, then the publish gate, then
-the core mutex. No gate is held while parts are written or directories are
-deleted.
+the core mutex. The publish gate is never held while parts are written or
+directories are deleted (the flush gate is held for a whole flush and the
+maintenance gate for a whole pass); a flush that fails after taking it
+releases it before it removes the directories it wrote.
 
 `Engine` is a cheap clone. `shutdown()` stops accepting and, in the same step,
 tells maintenance to stop (the pass flag and the merge stop flag), waits for
@@ -282,11 +284,17 @@ for queries or for a flush's writing of parts.
    as soon as this flush's window for it ends no earlier than the part being
    walked. The cost is the annotated traces times the parts that can hold
    them, with no per-trace search from the start of each index, and a part is
-   asked only about the ids in its range. If no window results (the trace is
-   in no live part and has no rows in this flush: retention removed it
-   between the write and the flush) the annotation is dropped; the number of
-   drops becomes part of `annotations_dropped` at the publish, so a flush that
-   fails and is retried counts nothing twice.
+   asked only about the ids in its range. With ids that fall evenly over the
+   parts' ranges (random trace ids) the range pruning does not help, and the
+   walk costs about annotated traces times parts / 2 index probes (a trace in
+   the part at rank `r` in the walk costs `r + 1`); with ids that are
+   grouped by window, as ids made in order are, it costs about one probe per
+   annotated trace. If no window results (the trace is in no live part and
+   has no rows in this flush) the annotation is dropped, and that is the only
+   rule that drops one; the number of drops becomes part of
+   `annotations_dropped` at the publish, so a flush that fails and is retried
+   counts nothing twice. The list the decision is based on is read together
+   with the engine's retention epoch (see step 4).
 3. **Write parts.** Reserve fresh part ids from the manifest, one per window
    of spans and one per window of annotations, in one reservation. For each window
    write one part through `PartWriter` in `parts/<id>.tmp`, which syncs and
@@ -306,11 +314,28 @@ for queries or for a flush's writing of parts.
    splitter: annotations are small) and opened with `AnnotationReader`.
    `Stage::PartWritten` is called once per part of either kind, span parts
    first.
-4. **Commit.** Take the publish gate. Under it, before the commit, each
-   annotation part is checked against the windows of the live span parts and
-   of this flush's span parts: one whose window has none (retention removed it
-   since the decision of step 2) is not committed, its directory is deleted
-   and its records count as dropped. Then one manifest commit adds all the
+4. **Commit.** Take the publish gate. A flush that carries annotations then
+   compares the retention epoch with the one it read in step 2. The epoch is a
+   counter that a replacement by retention increments, in the step that
+   publishes it, whenever it removed parts (a merge does not move it: the
+   merged window keeps its content, and the traces in it). If it moved, a
+   replacement removed parts after the decisions of step 2 were made, and
+   nothing here can tell which decisions it changed (a window the annotation
+   was sent to may have lost the trace, or the trace may live on only in a
+   window that was not considered), so the flush does not repair them: it
+   fails with `Unavailable` before the commit, its directories are removed,
+   both frozen buffers are put back in order and nothing is committed or
+   counted, which is the ordinary path of a failed flush. The flusher tries
+   again after its retry delay, and the attempt decides every window again
+   from the list as it is then. A flush without annotations does not look at
+   the epoch. Retries are bounded: an attempt fails only if a replacement that
+   removed parts was published during it, a pass makes such a replacement
+   at most once per `maintenance_interval` (and once at its start), and one
+   needs expired parts, which it removes: a second failure in a row needs new
+   expired parts, from the clock passing another window or from late data
+   flushed into an expired window, and retention that has nothing left to
+   remove does not move the epoch. Under the gate, then, the windows are the
+   ones decided from the list the commit extends. Then one manifest commit adds all the
    parts, span parts and annotation parts, and sets `wal_flushed_lsn` to the
    frozen position. The gate is taken only now, after the long work of step 3.
    A flush that carries only annotations commits too, even when every
@@ -516,11 +541,15 @@ version, so retention is atomic for queries: a snapshot sees the expired parts
 or not, never some of them, and never a window's spans without its annotations
 or the other way round (a test reads the manifest versions: the span parts and
 the annotation parts of the expired windows go in one). The expired set is
-decided before the publish gate is taken; a flush can publish a span part or an
-annotation part into an expiring window in between. When the replacement
-patches in what a flush published meanwhile, it removes, in the same commit,
-the parts of either kind whose window is expired by the same cut-off, so the
-window goes whole. The clock is `EngineOptions::clock` (Unix nanoseconds; a
+decided in one place, by the replacement and from the cut-off alone (the pass
+only checks that something is expired and hands the cut-off over): every live
+part of either kind whose window ends at or before it, taken from the span
+list the replacement is built on and, under the publish gate, from the parts
+a flush published since and from the annotation list as it is then. A flush
+that publishes at any time before the gate closes, even between the pass's
+check and the replacement's first look at the list, so has its parts in an
+expired window removed with the rest, and the window goes whole.
+`retention_parts_removed` counts the parts the commit removed. The clock is `EngineOptions::clock` (Unix nanoseconds; a
 test facility like the stage hook), by default the system clock. A retention
 of zero and a `maintenance_interval` of zero are refused by `open`.
 
@@ -578,13 +607,13 @@ What this means for particular data:
   coming back: of two records of one identity the newer is never in a window
   that ends before the other's, whatever the widths of the windows, so
   expiring the earlier-ending window can take the older record and never the
-  newer one alone. No annotation part is ever committed into a window that has
-  no span part: a flush decides the windows before it takes the publish gate,
-  and under the gate, before its commit, it checks each annotation part against
-  the windows of the live span parts and of its own span parts. A part whose
-  window was removed by retention in between is not committed (its directory is
-  deleted), and its records count as `annotations_dropped`, like those of a
-  trace that is gone (the data they are about has expired).
+  newer one alone. An annotation part is committed only into a window decided
+  from a part list that no retention replacement has changed since (the
+  retention epoch, see The flush, step 4); if one has, the flush fails and
+  decides again. So the window of a committed annotation holds its trace, in a
+  live span part or in the flush's own, at the commit, and a record is counted
+  in `annotations_dropped` only by the rule of the decision: no live span part
+  and no row of the flush holds its trace (the data it is about has expired).
 
 Statistics: `maintenance_passes` (every pass counts, failed ones too),
 `retention_parts_removed` and `last_maintenance_error`. A pass that fails
@@ -842,6 +871,9 @@ unique.
   replaced yet). An error returned here abandons the merge: its directory is
   deleted and nothing else changes (`Fatal` puts the engine in the fatal
   state and the directory is left for the next start).
+- Retention: `RetentionDecided` (a pass found an expired window and the
+  replacement has not looked at the part list yet; no gate is held; an error
+  returned here changes nothing, `Fatal` puts the engine in the fatal state).
 - A replacement of parts: `ReplaceMapBuilt` (the list and split map are
   built, the publish gate is not held; an error returned here changes
   nothing, `Fatal` puts the engine in the fatal state), `BeforeReplaceCommit` (arguments checked, publish
@@ -877,7 +909,14 @@ does not block, and is not blocked by, ingest or flush.
   their own list in the snapshot (`Visible.parts` and the split map hold span
   parts only, so listing, search, token sums and `known_traces` do not see
   them). The windows that hold the trace are those of the span parts that hold
-  it (the split map, or the first part whose in-memory index has it); the
+  it (the split map, or the first part whose in-memory index has it, among
+  the span parts whose window has at least one annotation part: with no
+  annotation part in the snapshot no span part index is searched at all, and
+  a trace of a window without annotation parts reads no block;
+  `AnnotationStats::span_index_probes` counts the searches, and a test pins
+  zero for a database without annotations and one per trace, not one per live
+  part, for traces of windows without annotation parts when a single window
+  has some); the
   records of the trace are read from every annotation part of those windows
   (a lookup reads only the blocks that can hold the trace, typically one per
   part) and merged with the trace's buffered records by `Latest`: per identity
@@ -895,7 +934,11 @@ does not block, and is not blocked by, ingest or flush.
   of a slice as `annotations` would, in the order of the slice, with one pass
   over the buffered annotations for all of them (an index of references sorted
   by trace id, 24 bytes per buffered annotation, then a lookup per trace); the
-  parts are read per trace.
+  parts are read per trace. The buffered records of a trace are held as
+  references, and only the winners that are returned are copied, so a call
+  holds the records it returns (one copy) and nothing in proportion to the
+  buffer besides the index (a test asserts a peak of at most 1.25 times the
+  returned records for 1,000 records of the largest size).
 - `known_traces(ids)`: for each id, whether the trace has rows in a live part
   or in the buffers. The ids are sorted once; each part's in-memory trace
   index is walked forward with the galloping search of the split map, for the
@@ -936,15 +979,25 @@ does not block, and is not blocked by, ingest or flush.
     buffered annotation, or exists only in the buffer, goes the exact way
     (`annotation_exact_lookups`): the winners of the trace are streamed out of
     the merge of its annotation parts and its buffered records, each tested as
-    it comes, and the read stops at the first match. One record is held at a
-    time, besides the trace's buffered records. The buffered annotations are
-    read once per query, on first use, into an index of references sorted by
-    trace id (24 bytes per buffered annotation); a candidate's buffered
-    records are a lookup in it.
+    it comes, and the read stops at the first match. Nothing is copied: the
+    buffered records are looked at through references, and the part records
+    are held one at a time. The buffered annotations are read once per query,
+    on first use, into an index of references sorted by trace id: **24 bytes
+    per buffered annotation per query** (a trace id of 16 bytes and a pointer
+    of 8), so 24 times the number of buffered annotations. Worst case at the
+    default buffer limit (`max_buffered_bytes`, 512 MiB): the smallest
+    annotation counts for 231 bytes (a 1-byte name and source, see the
+    counted size above), so at most 2,324,000 buffered annotations and an
+    index of 55.8 MB (53 MiB), on top of the buffer, once per list query
+    that has a filter and finds a candidate on the exact path; a test pins that a list over a trace with 3,000 buffered
+    versions of 4.5 KiB each peaks below 5% of the buffer and below 1 MiB. A
+    candidate's buffered records are a lookup in it.
   - Every other candidate is in exactly one span part, so all its annotations
-    are in the annotation parts of that part's window (an annotation goes to
-    the window that ends last among its holders, so the one remaining holder's
-    window is the one it went to, see The flush). For that window the set of
+    are in the annotation parts of that part's window: an annotation is
+    committed into a window whose span part held its trace at the commit (see
+    The flush, step 4), and a window's span parts and annotation parts leave
+    together, so while the one holder is live every annotation of the trace is
+    in its window. For that window the set of
     trace ids that match is built once, on first use, by one `Latest` scan
     over all its annotation parts (`annotation_windows_scanned`); a winner that
     is not a delete and passes the test puts its trace id in the set, and
@@ -1105,7 +1158,10 @@ lists of the parts a flush writes have the budgets
   even if a later-ending window still holds part of the trace, so a trace
   spread over windows can be readable with its annotations gone. Annotation parts of one window are merged into one, and a delete record
   stays in the part until the window expires, so a window of mostly deletes
-  does not shrink.
+  does not shrink. A flush that carries annotations fails once with
+  `Unavailable` (and is retried by the flusher; `flush()` returns the error)
+  when a retention replacement that removed parts landed while it was
+  writing its parts.
 - A span id of an annotation is not checked against the trace's spans (spans
   may arrive later), and an annotation for a trace the engine does not know
   yet is refused ("unknown trace"): annotate after the spans were

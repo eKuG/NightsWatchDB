@@ -71,6 +71,9 @@ pub(crate) struct Replaced {
     /// gone from the manifest and from queries either way; the next pass
     /// retries, and a restart deletes them too.
     pub deletion_errors: Vec<String>,
+    /// How many parts the commit removed, of either kind, those a retention
+    /// replacement picked included.
+    pub removed: u64,
 }
 
 impl Replaced {
@@ -132,8 +135,8 @@ impl Inner {
     ///    synced.
     ///
     /// Steps 1 and 2 hold the publish gate, which a flush also holds from its
-    /// commit to its publish; nothing is held while directories are deleted.
-    /// Only one replacement runs at a time (they are made by a maintenance
+    /// commit to its publish; the gate is released before directories are
+    /// deleted. Only one replacement runs at a time (they are made by a maintenance
     /// pass), which is what lets the list be built before the gate.
     ///
     /// An error before the commit changes nothing: `InvalidArgument` if an id
@@ -157,12 +160,16 @@ impl Inner {
         self.replace_parts_expiring(remove, add, add_ann, None)
     }
 
-    /// [`replace_parts`](Self::replace_parts) for retention: `expire_before`
-    /// is the cut-off it decided the expired parts with (a window is expired
-    /// when `window_start_ns + window_ns` is at or below it). A flush may
-    /// publish a span part or an annotation part into an expiring window
-    /// between that decision and the gate; those parts are removed in the
-    /// same commit, so the window goes whole.
+    /// [`replace_parts`](Self::replace_parts) for retention when
+    /// `expire_before` is `Some`: it is the cut-off (a window is expired when
+    /// `window_start_ns + window_ns` is at or below it) and `remove` is
+    /// empty. The parts to remove are decided here and nowhere else: every
+    /// live part, of either kind, in an expired window, from the span list
+    /// the replacement is built on and, under the gate, from the parts a flush
+    /// published since and from the annotation list as it is then. So a
+    /// window goes whole, whatever a flush publishes while the replacement is
+    /// prepared. A retention replacement that removes parts moves
+    /// `retention_epoch` in the step that publishes it.
     pub(crate) fn replace_parts_expiring(
         &self,
         remove: &[u64],
@@ -191,9 +198,17 @@ impl Inner {
             let c = lock(&self.core);
             (c.vis.parts.clone(), c.vis.split.clone())
         };
+        let given: HashSet<u64> = remove.iter().copied().collect();
+        for p in seen.iter().filter(|p| expired(&p.meta)) {
+            if !given.contains(&p.meta.part_id) {
+                remove.push(p.meta.part_id);
+                dirs.push(self.parts_dir.join(part_dir_name(p.meta.part_id)));
+            }
+        }
         let (built, built_split) = change_parts(&seen, &seen_split, &remove, add.clone());
         self.hook_before_commit(Stage::ReplaceMapBuilt)?;
 
+        let removed;
         {
             let gate = lock(&self.publish_gate);
             let (old_parts, old_ann) = {
@@ -215,9 +230,6 @@ impl Inner {
                         "cannot remove part {id}: it is not live or is listed twice"
                     )));
                 }
-            }
-            if remove.is_empty() && add.is_empty() && add_ann.is_empty() {
-                return Ok(Replaced::default());
             }
             // The parts published since the list was seen. Everything that
             // was seen must still be live, or the map built above is for a
@@ -250,7 +262,11 @@ impl Inner {
                 dirs.push(self.parts_dir.join(part_dir_name(id)));
                 remove.push(id);
             }
+            if remove.is_empty() && add.is_empty() && add_ann.is_empty() {
+                return Ok(Replaced::default());
+            }
             let removing: HashSet<u64> = remove.iter().copied().collect();
+            removed = remove.len() as u64;
             // The last point where nothing has changed yet.
             self.hook_before_commit(Stage::BeforeReplaceCommit)?;
 
@@ -296,13 +312,18 @@ impl Inner {
                 c.vis.split = Arc::new(split);
                 c.vis.ann_parts = Arc::new(ann);
                 c.vis.ann_windows = ann_windows;
+                if expire_before.is_some() {
+                    c.retention_epoch += 1;
+                }
             }
             drop(gate);
         }
         self.stage_after_commit(Stage::ReplacePublished);
 
         // 3. The deletion.
-        Ok(self.delete_dirs(dirs))
+        let mut replaced = self.delete_dirs(dirs);
+        replaced.removed = removed;
+        Ok(replaced)
     }
 
     /// Calls the stage hook at a point before the commit of a replacement. An
@@ -476,26 +497,23 @@ impl Inner {
         // retention or an odd clock must not overflow.
         let keep = i128::try_from(retention.as_nanos()).unwrap_or(i128::MAX);
         let cutoff = i128::from(self.now_ns()).saturating_sub(keep);
-        let (parts, ann) = {
+        // Only whether anything is expired is looked at here; which parts go
+        // is decided by the replacement, from the cut-off.
+        let any = {
             let c = lock(&self.core);
-            (c.vis.parts.clone(), c.vis.ann_parts.clone())
+            c.vis
+                .parts
+                .iter()
+                .map(|p| &p.meta)
+                .chain(c.vis.ann_parts.iter().map(|p| &p.meta))
+                .any(|m| i128::from(m.window_start_ns) + i128::from(m.window_ns) <= cutoff)
         };
-        let expired = |m: &nwdb_core::PartMeta| {
-            i128::from(m.window_start_ns) + i128::from(m.window_ns) <= cutoff
-        };
-        let expired: Vec<u64> = parts
-            .iter()
-            .map(|p| &p.meta)
-            .chain(ann.iter().map(|p| &p.meta))
-            .filter(|m| expired(m))
-            .map(|m| m.part_id)
-            .collect();
-        if expired.is_empty() {
+        if !any {
             return Ok(());
         }
-        let replaced =
-            self.replace_parts_expiring(&expired, Vec::new(), Vec::new(), Some(cutoff))?;
-        lock(&self.core).retention_removed += expired.len() as u64;
+        self.hook_before_commit(Stage::RetentionDecided)?;
+        let replaced = self.replace_parts_expiring(&[], Vec::new(), Vec::new(), Some(cutoff))?;
+        lock(&self.core).retention_removed += replaced.removed;
         replaced.into_result()
     }
 

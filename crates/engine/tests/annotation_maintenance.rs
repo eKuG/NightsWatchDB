@@ -128,9 +128,10 @@ fn retention_removes_both_kinds_of_an_expired_window_in_one_manifest_version() {
 }
 
 /// A flush decides the window of an annotation, then retention removes the
-/// trace's span part before the flush commits: the annotation part is not
-/// committed into the window that has no span part any more, its directory is
-/// removed and its record counts as dropped.
+/// trace's span part before the flush commits: the flush commits nothing and
+/// fails (retryable), its directories are removed and the annotation is back
+/// in the buffer, not counted. The next flush decides again: the trace has no
+/// live span part, so the annotation is dropped, once.
 #[test]
 fn an_annotation_part_for_a_window_retention_removed_meanwhile_is_not_committed() {
     let dir = tempfile::tempdir().unwrap();
@@ -157,15 +158,22 @@ fn an_annotation_part_for_a_window_retention_removed_meanwhile_is_not_committed(
     e.flush().unwrap();
     annotate(&e, vec![score(1, None, "q", "s", 1.0)]);
     armed.store(true, Ordering::SeqCst);
-    e.flush().unwrap();
+    assert!(matches!(e.flush(), Err(Error::Unavailable(_))));
     // The span part of window 0 is gone and no annotation part was committed
-    // into its window.
+    // into its window; the annotation waits in the buffer, not counted.
     assert!(ann_info(&e).is_empty(), "{:?}", ann_info(&e));
     assert_eq!(e.stats().parts, 1, "only window 4 is left");
+    assert_eq!(e.stats().annotations_dropped, 0);
+    assert_eq!(e.stats().annotations_written, 0);
+    assert_eq!(e.stats().annotations_buffered, 1);
+    assert_eq!(e.stats().retention_parts_removed, 1);
+    assert_dirs_are_live(dir.path(), &e, "after the failed flush");
+    // The next attempt decides again: no live span part holds the trace.
+    e.flush().unwrap();
+    assert!(ann_info(&e).is_empty(), "{:?}", ann_info(&e));
     assert_eq!(e.stats().annotations_dropped, 1);
     assert_eq!(e.stats().annotations_written, 0);
     assert_eq!(e.stats().annotations_buffered, 0);
-    assert_eq!(e.stats().retention_parts_removed, 1);
     assert_dirs_are_live(dir.path(), &e, "after the flush");
 
     now.store(5 * W, Ordering::SeqCst);
@@ -822,9 +830,7 @@ fn shutdown_while_an_annotation_merge_is_writing_its_output_abandons_it() {
 }
 
 /// Retention removes a window with thousands of annotation parts in one
-/// replacement; the list the replacement publishes is built from a set of the
-/// removed ids, not by searching the list of removed ids for each part (the
-/// work under the publish gate, which flushes wait for).
+/// replacement, whole, and leaves the other window alone.
 #[test]
 fn retention_removes_a_window_of_thousands_of_annotation_parts_in_one_replacement() {
     let dir = tempfile::tempdir().unwrap();
@@ -841,16 +847,14 @@ fn retention_removes_a_window_of_thousands_of_annotation_parts_in_one_replacemen
     let version = disk_state(dir.path()).0.version;
     // Window 0 (trace 1, 750 parts) expires; window 1 does not.
     now.store(2 * W, Ordering::SeqCst);
-    let started = Instant::now();
     e.run_maintenance().unwrap();
-    let took = started.elapsed();
     assert_eq!(e.stats().annotation_parts, 750);
+    assert_eq!(e.stats().retention_parts_removed, 751);
     assert_eq!(
         disk_state(dir.path()).0.version,
         version + 1,
         "one replacement"
     );
-    assert!(took < Duration::from_secs(30), "{took:?}");
     assert!(shown(&e, 1).is_empty());
     assert_eq!(shown(&e, 2).len(), 750);
     e.shutdown().unwrap();
@@ -923,7 +927,11 @@ fn ingest_annotate_flush_query_retention_and_merging_at_once_agree_with_a_model(
                 let mut rounds = 0u32;
                 while !stop.load(Ordering::SeqCst) {
                     match which {
-                        0 => e.flush().unwrap(),
+                        // A flush that retention interrupts is retried.
+                        0 => match e.flush() {
+                            Ok(()) | Err(Error::Unavailable(_)) => {}
+                            Err(e) => panic!("{e}"),
+                        },
                         1 => e.run_maintenance().unwrap(),
                         2 => {
                             let q = nwdb_engine::ListQuery {
@@ -960,7 +968,15 @@ fn ingest_annotate_flush_query_retention_and_merging_at_once_agree_with_a_model(
     for h in background {
         assert!(h.join().unwrap() > 0);
     }
-    e.flush().unwrap();
+    // The maintenance thread may still be removing expired parts: a flush it
+    // interrupts is retried.
+    for attempt in 0.. {
+        match e.flush() {
+            Ok(()) => break,
+            Err(Error::Unavailable(_)) if attempt < 50 => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
     compact_fully(&e);
 
     let expired = |t: u128| {

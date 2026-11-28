@@ -14,19 +14,18 @@ use nwdb_engine::{Engine, Stage};
 const W: i64 = 1_000;
 
 /// A flush decides the window of an annotation before it takes the publish
-/// gate; retention can remove that window's span part before the commit. Under
-/// the gate the flush checks each annotation part against the windows of the
-/// live span parts and of its own span parts: a part whose window is gone is
-/// not committed, its directory is deleted and its records count as dropped.
-/// Otherwise such a part would sit in its window until the window stops being
-/// expired (the clock steps back, or `retention` is raised at a restart), and a
-/// later span in that window would show its older record again once the newer
-/// record's window expired.
+/// gate; retention can remove that window's span part before the commit. The
+/// flush notices that retention removed parts since it decided, commits
+/// nothing and fails; the next attempt decides again and, as no live span part
+/// holds the trace, drops the record. Otherwise such a part would sit in its
+/// window until the window stops being expired (the clock steps back, or
+/// `retention` is raised at a restart), and a later span in that window would
+/// show its older record again once the newer record's window expired.
 ///
 /// Sequence (retention one window): trace 1 in window 5; "q" = 1 is frozen by
 /// a flush that decides window 5; before that flush commits, the clock is at
 /// 7W and a pass removes window 5's span part; the clock goes back to 0. The
-/// annotation part is not committed and "q" = 1 is dropped. A late span of the
+/// flush fails, the next one drops "q" = 1. A late span of the
 /// trace in window 4 is flushed; "q" = 2 goes to window 4. A late span in
 /// window 5 is flushed. The clock reaches 6W: window 4 expires, window 5 does
 /// not.
@@ -64,12 +63,19 @@ fn an_orphaned_annotation_part_does_not_bring_back_an_overwritten_value() {
     e.flush().unwrap();
     annotate(&e, vec![score(1, None, "q", "s", 1.0)]);
     armed.store(true, Ordering::SeqCst);
-    e.flush().unwrap();
-    // Window 5 has no span part any more: the annotation part decided for it
-    // is not committed and its record is dropped.
+    // Window 5 has no span part any more: the flush that decided it commits
+    // nothing and fails, and the record stays in the buffer.
+    assert!(matches!(e.flush(), Err(nwdb_core::Error::Unavailable(_))));
     assert_eq!(e.stats().parts, 0);
     assert_eq!(e.snapshot().annotation_part_info().len(), 0);
+    assert_eq!(e.stats().annotations_dropped, 0);
+    assert_eq!(e.stats().annotations_buffered, 1);
+    // The next flush decides again: no live span part holds the trace, so
+    // the record is dropped.
+    e.flush().unwrap();
+    assert_eq!(e.snapshot().annotation_part_info().len(), 0);
     assert_eq!(e.stats().annotations_dropped, 1);
+    assert_eq!(e.stats().annotations_buffered, 0);
 
     ingest(&e, &[TSpan::new(1, 2, 4 * W + 10)]).unwrap();
     e.flush().unwrap();

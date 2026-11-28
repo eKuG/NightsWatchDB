@@ -278,8 +278,9 @@ impl Inner {
     /// window of an earlier annotation of its identity, and removing the older
     /// window later cannot bring an overwritten value back. An annotation
     /// whose trace has no such window (retention removed it) is dropped.
-    /// Returns the records of each window in identity order, and the number
-    /// dropped. The records are borrowed from the frozen buffer: nothing of it
+    /// Returns the records of each window in identity order, the number
+    /// dropped, and the retention epoch of the part list the decision is based
+    /// on (see `write_and_commit`). The records are borrowed from the frozen buffer: nothing of it
     /// is copied.
     ///
     /// The windows are looked up for all annotated traces together: the live
@@ -292,7 +293,7 @@ impl Inner {
         &self,
         ann_frozen: &'a AnnBuf,
         flush_windows: &HashMap<TraceId, WindowKey>,
-    ) -> (BTreeMap<WindowKey, Vec<&'a Annotation>>, u64) {
+    ) -> (BTreeMap<WindowKey, Vec<&'a Annotation>>, u64, u64) {
         let mut records: Vec<&Annotation> = ann_frozen.iter().flat_map(|b| b.iter()).collect();
         records.sort_by(|a, b| a.identity_cmp(b).then(a.arrival.cmp(&b.arrival)));
         let mut reduced: Vec<&Annotation> = Vec::with_capacity(records.len());
@@ -307,7 +308,12 @@ impl Inner {
         unplaced.dedup();
         let mut window_of: HashMap<TraceId, WindowKey> = HashMap::with_capacity(unplaced.len());
 
-        let live = lock(&self.core).vis.parts.clone();
+        // Read together: the epoch says which retention replacements the list
+        // already reflects.
+        let (live, epoch) = {
+            let c = lock(&self.core);
+            (c.vis.parts.clone(), c.retention_epoch)
+        };
         let mut by_end: Vec<&Arc<LivePart>> = live.iter().collect();
         by_end.sort_by_key(|p| Reverse(window_order((p.meta.window_start_ns, p.meta.window_ns))));
         for p in by_end {
@@ -360,7 +366,7 @@ impl Inner {
                 None => dropped += 1,
             }
         }
-        (out, dropped)
+        (out, dropped, epoch)
     }
 
     fn write_and_commit(
@@ -398,7 +404,7 @@ impl Inner {
             .filter(|t| wanted.contains(&t.trace_id))
             .map(|t| (t.trace_id, (window_start(t.start_ns, window_ns), window_ns)))
             .collect();
-        let (ann_by_window, mut ann_dropped) =
+        let (ann_by_window, ann_dropped, decided_at) =
             self.annotation_windows_of_flush(ann_frozen, &flush_windows);
 
         // Ids come from the manifest and are never reused, even by a retry
@@ -460,32 +466,18 @@ impl Inner {
             // ours must each see the list the other left. Taken only now, so
             // the long work above never holds it.
             gate = Some(lock(&self.publish_gate));
-            // Retention may have removed the window an annotation part was
-            // decided for since the decision was made. An annotation part is
-            // committed only into a window that a live span part, or a span
-            // part of this flush, has: otherwise the data it is about is
-            // expired, and its records are dropped like those of a trace that
-            // is gone. Nothing changes the part list until the publish.
-            let mut span_windows: HashSet<WindowKey> = lock(&self.core)
-                .vis
-                .parts
-                .iter()
-                .map(|p| (p.meta.window_start_ns, p.meta.window_ns))
-                .collect();
-            span_windows.extend(metas.iter().map(|m| (m.window_start_ns, m.window_ns)));
-            let mut kept = Vec::new();
-            for (m, r) in ann_metas.drain(..).zip(ann_readers.drain(..)) {
-                if span_windows.contains(&(m.window_start_ns, m.window_ns)) {
-                    kept.push((m, r));
-                } else {
-                    let _ = std::fs::remove_dir_all(self.parts_dir.join(part_dir_name(m.part_id)));
-                    ann_written -= m.rows;
-                    ann_dropped += m.rows;
-                }
-            }
-            for (m, r) in kept {
-                ann_metas.push(m);
-                ann_readers.push(r);
+            // The windows of the annotations were decided from the part list
+            // read before the parts were written. A retention replacement that
+            // removed parts since may have taken the window of a trace (or the
+            // last holder of it) away, and nothing here can tell which
+            // decisions it changed: the flush gives up and is run again, and
+            // the next attempt decides from the list as it is then. A
+            // replacement changes the epoch under this gate, so nothing can
+            // move it between this check and the commit.
+            if !ann_frozen.is_empty() && lock(&self.core).retention_epoch != decided_at {
+                return Err(Error::unavailable(
+                    "retention removed parts while the flush was placing annotations; it is retried",
+                ));
             }
             self.manifest.commit(Edit {
                 add: metas.iter().chain(&ann_metas).cloned().collect(),

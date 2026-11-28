@@ -289,7 +289,10 @@ fn latest_matches_a_brute_force_model() {
         }
         let want: Vec<_> = model.into_values().collect();
 
-        let mut latest = Latest::new(readers.iter().map(|r| r.cursor(None)).collect(), extra);
+        let mut latest = Latest::new(
+            readers.iter().map(|r| r.cursor(None)).collect(),
+            extra.iter().collect(),
+        );
         let mut got = Vec::new();
         while let Some(a) = latest.next().unwrap() {
             got.push(a);
@@ -313,14 +316,14 @@ fn latest_breaks_ties_by_input_order_and_the_extra_input_is_last() {
     let (r1, r2) = (open(tmp.path(), &m1), open(tmp.path(), &m2));
     let comment = |l: &mut Latest| l.next().unwrap().unwrap().comment.unwrap();
     // Equal arrival: the earlier input.
-    let mut l = Latest::new(vec![r1.cursor(None), r2.cursor(None)], vec![c.clone()]);
+    let mut l = Latest::new(vec![r1.cursor(None), r2.cursor(None)], vec![&c]);
     assert_eq!(comment(&mut l), "first");
     assert!(l.next().unwrap().is_none());
     let mut l = Latest::new(vec![r2.cursor(None), r1.cursor(None)], vec![]);
     assert_eq!(comment(&mut l), "second");
     // A larger arrival wins whatever the order, also in the extra input.
     c.arrival = 6;
-    let mut l = Latest::new(vec![r1.cursor(None), r2.cursor(None)], vec![c.clone()]);
+    let mut l = Latest::new(vec![r1.cursor(None), r2.cursor(None)], vec![&c]);
     assert_eq!(comment(&mut l), "extra");
     let mut late = b.clone();
     late.arrival = 9;
@@ -328,7 +331,7 @@ fn latest_breaks_ties_by_input_order_and_the_extra_input_is_last() {
     let r3 = open(tmp.path(), &m3);
     let mut l = Latest::new(
         vec![r1.cursor(None), r2.cursor(None), r3.cursor(None)],
-        vec![c],
+        vec![&c],
     );
     assert_eq!(comment(&mut l), "second");
     // No inputs at all.

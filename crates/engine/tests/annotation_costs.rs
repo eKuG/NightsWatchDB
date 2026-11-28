@@ -11,7 +11,7 @@ mod common;
 use std::sync::Mutex;
 
 use common::*;
-use nwdb_engine::{Annotation, Engine};
+use nwdb_engine::{Annotation, Engine, ListQuery};
 use nwdb_segment::{MAX_COMMENT_BYTES, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_SOURCE_BYTES};
 use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
 
@@ -120,6 +120,145 @@ fn a_flush_does_not_copy_the_buffered_annotations() {
         grown * 2 < held,
         "a flush of a buffer of {held} bytes peaked {grown} bytes above its start"
     );
+    e.shutdown().unwrap();
+}
+
+/// One annotation of trace 1 with a name, source, label and comment of the
+/// largest sizes; `identity` picks which identity it has.
+fn big_of_trace_1(identity: usize) -> Annotation {
+    let mut a = score(
+        1,
+        Some(1 + identity as u64),
+        &format!("{identity:07}{}", "n".repeat(MAX_NAME_BYTES - 7)),
+        &"s".repeat(MAX_SOURCE_BYTES),
+        1.0,
+    );
+    a.label = Some("l".repeat(MAX_LABEL_BYTES));
+    a.comment = Some("c".repeat(MAX_COMMENT_BYTES));
+    a
+}
+
+/// The filtered list's exact path for a trace with many buffered versions of
+/// one identity, each with a comment: the versions are looked at through
+/// references and never copied, so the query holds the 24 bytes per buffered
+/// annotation of its index and a few records, not the versions. Asserted: the
+/// peak above the start stays below 5% of the heap the buffer holds and below
+/// 1 MiB.
+#[test]
+fn a_filtered_list_over_many_buffered_versions_holds_references_not_copies() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine_with_traces(dir.path());
+    let before = live();
+    // One request each: the items of one request with one identity would be
+    // reduced to the last one before they are logged.
+    for _ in 0..3_000 {
+        annotate(&e, vec![big_of_trace_1(0)]);
+    }
+    let held = (live() - before) as usize;
+    assert_eq!(e.stats().annotations_buffered, 3_000);
+    assert!(held > 12 << 20, "the buffer holds {held} bytes");
+    let snap = e.snapshot();
+    let q = ListQuery {
+        annotation: Some(filter("no-such-name")),
+        ..list_all()
+    };
+    let base = live();
+    reset_peak();
+    let (list, stats) = snap.list_traces_with_stats(&q).unwrap();
+    let grown = (peak() - base) as usize;
+    eprintln!("buffer {held} bytes, list peaked {grown} bytes above its start");
+    assert!(list.is_empty());
+    assert_eq!(
+        stats.annotation_exact_lookups, 1,
+        "trace 1 takes the exact path"
+    );
+    assert!(
+        grown * 20 < held,
+        "{grown} bytes against a buffer of {held}"
+    );
+    assert!(grown < 1 << 20, "{grown} bytes");
+    drop(snap);
+    e.shutdown().unwrap();
+}
+
+/// `annotations(trace, 1000)` over 1000 buffered records of the largest size:
+/// besides the buffer, the call holds the records it returns (one copy) and
+/// nothing proportional to the buffer. Asserted: the peak above the start is
+/// at most 1.25 times the heap of the returned records.
+#[test]
+fn reading_a_trace_s_largest_annotations_holds_about_one_copy() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine_with_traces(dir.path());
+    for k in (0..1_000).step_by(100) {
+        annotate(&e, (k..k + 100).map(big_of_trace_1).collect());
+    }
+    let snap = e.snapshot();
+    let base = live();
+    reset_peak();
+    let (v, more) = snap.annotations(tid(1), 1_000).unwrap();
+    let grown = (peak() - base) as usize;
+    let returned = (live() - base) as usize;
+    eprintln!("returned {returned} bytes, peaked {grown} bytes above the start");
+    assert_eq!(v.len(), 1_000);
+    assert!(!more);
+    assert!(returned > 4 << 20, "{returned}");
+    assert!(
+        grown * 4 <= returned * 5,
+        "peaked {grown} bytes for {returned} bytes returned"
+    );
+    drop(v);
+    drop(snap);
+    e.shutdown().unwrap();
+}
+
+/// The same flush with trace ids drawn at random: every part's id range then
+/// covers nearly every id, so the range pruning does not help and each
+/// annotated trace is probed in the parts walked before the one that holds it
+/// (and in that one): the parts are walked latest window first, so a trace in
+/// the part at rank `r` costs `r + 1` probes, and over all traces that is
+/// about `traces * parts / 2`. Asserted: at least 0.9 and at most 1.0 times
+/// `traces * (parts + 1) / 2`.
+#[test]
+fn a_flush_probes_about_half_the_parts_per_trace_when_the_ids_are_random() {
+    let _serial = serial();
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    const PARTS: usize = 40;
+    const PER: usize = 50;
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(opts(dir.path()));
+    let mut rng = StdRng::seed_from_u64(77);
+    let mut ids: Vec<u128> = Vec::new();
+    for w in 0..PARTS {
+        let batch: Vec<u128> = (0..PER).map(|_| rng.random::<u128>() | 1).collect();
+        let spans: Vec<TSpan> = batch
+            .iter()
+            .map(|&t| TSpan::new(t, 1, w as i64 * 1_000 + 10).root())
+            .collect();
+        ingest(&e, &spans).unwrap();
+        e.flush().unwrap();
+        ids.extend(batch);
+    }
+    assert_eq!(e.stats().parts, PARTS);
+    let all: Vec<Annotation> = ids.iter().map(|&t| score(t, None, "q", "s", 1.0)).collect();
+    for chunk in all.chunks(500) {
+        annotate(&e, chunk.to_vec());
+    }
+    let before = e.annotation_window_probes();
+    e.flush().unwrap();
+    let probes = (e.annotation_window_probes() - before) as usize;
+    let traces = PARTS * PER;
+    let upper = traces * (PARTS + 1) / 2;
+    eprintln!("{probes} index probes for {traces} random-id traces over {PARTS} parts");
+    assert!(probes <= upper, "{probes} probes, at most {upper} possible");
+    assert!(
+        probes * 10 >= upper * 9,
+        "{probes} probes, expected about {upper}"
+    );
+    assert_eq!(e.stats().annotations_dropped, 0);
+    assert_eq!(e.snapshot().annotation_part_info().len(), PARTS);
     e.shutdown().unwrap();
 }
 

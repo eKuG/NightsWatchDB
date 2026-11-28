@@ -81,6 +81,10 @@ pub struct AnnotationStats {
     /// Blocks those parts read (a block is read from disk and decoded once
     /// per lookup; there is no cache).
     pub blocks_read: u64,
+    /// Span part indexes searched to find which windows hold the trace (zero
+    /// when the trace is in the split map, or when no annotation part exists
+    /// in any window).
+    pub span_index_probes: u64,
 }
 
 /// Parameters of [`Snapshot::aggregate_tokens`].
@@ -280,10 +284,11 @@ impl Cursor {
 
 /// The records of `trace` in a [`Snapshot::buffer_index`], in identity order,
 /// several per identity possible.
-fn buffered_of(index: &[(TraceId, &Annotation)], trace: TraceId) -> Vec<Annotation> {
+/// Borrowed: a record is copied only if it wins (see `Latest`).
+fn buffered_of<'a>(index: &[(TraceId, &'a Annotation)], trace: TraceId) -> Vec<&'a Annotation> {
     let lo = index.partition_point(|(t, _)| *t < trace);
     let hi = index.partition_point(|(t, _)| *t <= trace);
-    let mut v: Vec<Annotation> = index[lo..hi].iter().map(|(_, a)| (*a).clone()).collect();
+    let mut v: Vec<&Annotation> = index[lo..hi].iter().map(|(_, a)| *a).collect();
     v.sort_by(|a, b| a.identity_cmp(b));
     v
 }
@@ -505,11 +510,10 @@ impl Snapshot {
 
     /// The records of the buffers for one trace, in identity order, several
     /// per identity possible. Time proportional to the buffered annotations.
-    fn buffer_annotations_of(&self, trace: TraceId) -> Vec<Annotation> {
-        let mut v: Vec<Annotation> = self
+    fn buffer_annotations_of(&self, trace: TraceId) -> Vec<&Annotation> {
+        let mut v: Vec<&Annotation> = self
             .buffered_annotations()
             .filter(|a| a.trace_id == trace)
-            .cloned()
             .collect();
         v.sort_by(|a, b| a.identity_cmp(b));
         v
@@ -539,14 +543,32 @@ impl Snapshot {
     /// The annotation parts that can hold annotations of `trace`: those of the
     /// windows of the span parts that hold it, found as `get_trace` finds the
     /// holders (the split map, or the first part whose index has it).
-    fn annotation_parts_of(&self, trace: TraceId) -> Vec<&Arc<LiveAnnotationPart>> {
+    ///
+    /// Only span parts whose window has an annotation part are searched, so
+    /// with no annotation part nothing is probed. Also returns how many span
+    /// part indexes were searched.
+    fn annotation_parts_of(&self, trace: TraceId) -> (Vec<&Arc<LiveAnnotationPart>>, u64) {
+        if self.vis.ann_windows.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let mut probes = 0;
         let holders: Vec<usize> = match self.vis.split.holders(&trace) {
             Some(h) => h.iter().map(|&x| x as usize).collect(),
+            // A trace in one part: the first part that has it is the only one.
             None => self
                 .vis
                 .parts
                 .iter()
-                .position(|p| p.reader.find_trace(trace).is_some())
+                .position(|p| {
+                    let m = &p.meta;
+                    self.vis
+                        .ann_windows
+                        .contains_key(&(m.window_start_ns, m.window_ns))
+                        && {
+                            probes += 1;
+                            p.reader.find_trace(trace).is_some()
+                        }
+                })
                 .into_iter()
                 .collect(),
         };
@@ -557,12 +579,13 @@ impl Snapshot {
                 (m.window_start_ns, m.window_ns)
             })
             .collect();
-        windows
+        let parts = windows
             .iter()
             .filter_map(|w| self.vis.ann_windows.get(w))
             .flatten()
             .map(|&i| &self.vis.ann_parts[i as usize])
-            .collect()
+            .collect();
+        (parts, probes)
     }
 
     /// The winning annotations of a trace, on the trace and on its spans,
@@ -615,15 +638,15 @@ impl Snapshot {
         &self,
         trace: TraceId,
         limit: usize,
-        buffered: Vec<Annotation>,
+        buffered: Vec<&Annotation>,
     ) -> Result<(Vec<Annotation>, bool, AnnotationStats)> {
-        let parts = self.annotation_parts_of(trace);
+        let (parts, span_index_probes) = self.annotation_parts_of(trace);
         let blocks_before: u64 = parts.iter().map(|p| p.reader.blocks_read()).sum();
         let cursors = parts.iter().map(|p| p.reader.cursor(Some(trace))).collect();
         let mut latest = Latest::new(cursors, buffered);
         let mut out: Vec<Annotation> = Vec::new();
         let mut more = false;
-        while let Some(a) = latest.next()? {
+        while let Some(a) = latest.next_ref()? {
             if a.delete {
                 continue;
             }
@@ -631,7 +654,7 @@ impl Snapshot {
                 more = true;
                 break;
             }
-            out.push(a);
+            out.push(a.into_owned());
         }
         drop(latest);
         let blocks_read = parts
@@ -642,6 +665,7 @@ impl Snapshot {
         let stats = AnnotationStats {
             parts_probed: parts.len() as u64,
             blocks_read,
+            span_index_probes,
         };
         Ok((out, more, stats))
     }
@@ -653,15 +677,16 @@ impl Snapshot {
         &self,
         trace: TraceId,
         f: &AnnotationFilter,
-        buffered: Vec<Annotation>,
+        buffered: Vec<&Annotation>,
     ) -> Result<bool> {
         let cursors = self
             .annotation_parts_of(trace)
+            .0
             .iter()
             .map(|p| p.reader.cursor(Some(trace)))
             .collect();
         let mut latest = Latest::new(cursors, buffered);
-        while let Some(a) = latest.next()? {
+        while let Some(a) = latest.next_ref()? {
             if !a.delete && f.matches(&a) {
                 return Ok(true);
             }
