@@ -3,13 +3,14 @@
 
 mod common;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use common::*;
-use nwdb_engine::{AggQuery, ListQuery};
+use nwdb_core::TraceSummary;
+use nwdb_engine::{AggQuery, Annotation, ListQuery};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 
@@ -399,5 +400,179 @@ fn random_operations_with_compaction_and_retention_agree_with_the_model() {
     e.shutdown().unwrap();
     let e = open(opts(dir.path()));
     model.check(&e, "after the last restart");
+    e.shutdown().unwrap();
+}
+
+/// The winners of every identity, by the documented rule: the last annotation
+/// of an identity wins, and a delete leaves nothing.
+type Identity = (u128, Option<u64>, String, String);
+
+fn model_shown(model: &BTreeMap<Identity, Annotation>, trace: u128) -> Vec<Annotation> {
+    model
+        .range((trace, None, String::new(), String::new())..)
+        .take_while(|(k, _)| k.0 == trace)
+        .map(|(_, a)| a.clone())
+        .filter(|a| !a.delete)
+        .collect()
+}
+
+fn same_annotation(a: &Annotation, b: &Annotation) -> bool {
+    Annotation {
+        arrival: 0,
+        ..a.clone()
+    } == Annotation {
+        arrival: 0,
+        ..b.clone()
+    }
+}
+
+/// Spans, annotations (overwrites and deletes), flushes and restarts at
+/// random: after every step every trace's annotations, and a few listings
+/// with an annotation filter, equal a brute-force model.
+#[test]
+fn random_operations_with_annotations_agree_with_the_model() {
+    let mut rng = StdRng::seed_from_u64(SEED ^ 0xa7);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut e, mut _background) = open_random(dir.path(), &mut rng);
+    let mut model = Model::default();
+    let mut gen_ = Gen {
+        docs: vec![vec![1u8; 300]],
+        next_span: 0,
+        rooted: HashSet::new(),
+        session: Default::default(),
+    };
+    let mut ann: BTreeMap<Identity, Annotation> = BTreeMap::new();
+    let (mut annotated, mut flushes, mut reopens, mut listed) = (0, 0, 0, 0);
+
+    for step in 0..250 {
+        let what = format!("step {step}");
+        match rng.random_range(0..100) {
+            0..25 => {
+                let spans = gen_.request(&mut rng, None);
+                ingest(&e, &spans).unwrap();
+                model.add(&spans);
+            }
+            25..60 => {
+                // A request of annotations; some traces may be unknown.
+                let known: Vec<u128> = model.trace_ids().into_iter().collect();
+                if known.is_empty() {
+                    continue;
+                }
+                let n = rng.random_range(1..5);
+                let items: Vec<Annotation> = (0..n)
+                    .map(|_| {
+                        let trace = if rng.random_bool(0.05) {
+                            TRACES + 5
+                        } else {
+                            known[rng.random_range(0..known.len())]
+                        };
+                        let span = [None, Some(1), Some(2), Some(3)][rng.random_range(0..4)];
+                        let name = ["a", "b", "c"][rng.random_range(0..3)];
+                        let source = ["", "s1", "s2"][rng.random_range(0..3)];
+                        let mut a = score(trace, span, name, source, 0.0);
+                        a.time_ns = rng.random_range(0..100);
+                        match rng.random_range(0..10) {
+                            0..2 => {
+                                a.value = None;
+                                a.delete = true;
+                            }
+                            2..4 => {
+                                a.value = None;
+                                a.label = Some(["x", "y"][rng.random_range(0..2)].into());
+                            }
+                            4..6 => {
+                                a.value = Some(f64::from(rng.random_range(0..10)));
+                                a.comment = Some("c".into());
+                            }
+                            _ => a.value = Some(f64::from(rng.random_range(0..10))),
+                        }
+                        a
+                    })
+                    .collect();
+                let r = annotate(&e, items.clone());
+                let rejected: HashSet<usize> = r.rejected.iter().map(|x| x.0).collect();
+                for (i, a) in items.into_iter().enumerate() {
+                    let t = u128::from_be_bytes(a.trace_id.0);
+                    assert_eq!(rejected.contains(&i), t == TRACES + 5, "{what}: item {i}");
+                    if !rejected.contains(&i) {
+                        let key = (
+                            t,
+                            a.span_id.map(|s| u64::from_be_bytes(s.0)),
+                            a.name.clone(),
+                            a.source.clone(),
+                        );
+                        ann.insert(key, a);
+                        annotated += 1;
+                    }
+                }
+            }
+            60..72 => {
+                e.flush().unwrap();
+                flushes += 1;
+            }
+            72..80 => {
+                if rng.random_bool(0.5) {
+                    e.shutdown().unwrap();
+                }
+                drop(e);
+                (e, _background) = open_random(dir.path(), &mut rng);
+                reopens += 1;
+            }
+            _ => {
+                for _ in 0..3 {
+                    let mut q = random_list(&mut rng);
+                    let limit = q.limit;
+                    q.limit = usize::MAX;
+                    let mut f = filter(["a", "b", "c", "zz"][rng.random_range(0..4)]);
+                    if rng.random_bool(0.3) {
+                        f.source = Some(["", "s1", "s2"][rng.random_range(0..3)].into());
+                    }
+                    if rng.random_bool(0.4) {
+                        f.min = Some(f64::from(rng.random_range(0..10)));
+                    }
+                    if rng.random_bool(0.4) {
+                        f.max = Some(f64::from(rng.random_range(0..10)));
+                    }
+                    if rng.random_bool(0.2) {
+                        f.label = Some(["x", "y"][rng.random_range(0..2)].into());
+                    }
+                    let matches = |t: u128| {
+                        model_shown(&ann, t).iter().any(|a| {
+                            a.name == f.name
+                                && f.source.as_ref().is_none_or(|s| *s == a.source)
+                                && f.min.is_none_or(|m| a.value.is_some_and(|v| v >= m))
+                                && f.max.is_none_or(|m| a.value.is_some_and(|v| v <= m))
+                                && f.label.as_ref().is_none_or(|l| a.label.as_ref() == Some(l))
+                        })
+                    };
+                    let want: Vec<TraceSummary> = model
+                        .list(&q)
+                        .into_iter()
+                        .filter(|s| matches(u128::from_be_bytes(s.trace_id.0)))
+                        .take(limit)
+                        .collect();
+                    q.limit = limit;
+                    q.annotation = Some(f.clone());
+                    assert_eq!(e.list_traces(&q).unwrap(), want, "{what}: {q:?}");
+                    listed += 1;
+                }
+            }
+        }
+        model.check(&e, &what);
+        for t in 1..=TRACES {
+            let got = shown(&e, t);
+            let want = model_shown(&ann, t);
+            assert_eq!(got.len(), want.len(), "{what}: trace {t}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!(same_annotation(g, w), "{what}: trace {t}: {g:?} vs {w:?}");
+            }
+        }
+    }
+    eprintln!(
+        "250 steps: {annotated} annotations, {flushes} flushes, {reopens} restarts, {listed} \
+         filtered listings, {} annotation parts at the end",
+        e.stats().annotation_parts
+    );
+    assert!(annotated > 50 && listed > 5);
     e.shutdown().unwrap();
 }

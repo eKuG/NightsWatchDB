@@ -12,14 +12,17 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use nwdb_core::{
-    BatchLimits, DEFAULT_WINDOW_NS, Error, PayloadSplitter, RecordDecoder, Result, SpanColumns,
-    TraceId, TraceSummary, col,
+    BatchLimits, DEFAULT_WINDOW_NS, Error, PartKind, PayloadSplitter, RecordDecoder, Result,
+    SpanColumns, TraceId, TraceSummary, col,
 };
 use nwdb_manifest::{
     Edit, Manifest, ManifestOptions, OpenMode, has_part_dirs, highest_part_dir_id,
     unreferenced_part_dirs,
 };
-use nwdb_segment::{Annotation, MAX_BATCH_ITEMS, PartReader, decode_batch, encode_batch};
+use nwdb_segment::{
+    Annotation, AnnotationReader, MAX_BATCH_ITEMS, PartReader, check_annotation_format_version,
+    decode_batch, encode_batch,
+};
 use nwdb_wal::{Lsn, MAX_RECORD_BYTES, Wal, WalOptions};
 
 use crate::compaction::CompactionOptions;
@@ -293,6 +296,16 @@ pub struct EngineStats {
     pub bytes_ingested: u64,
     /// Annotations in the active buffer and the buffer being flushed.
     pub annotations_buffered: usize,
+    /// Live annotation parts.
+    pub annotation_parts: usize,
+    /// Bytes on disk of the live annotation parts.
+    pub annotation_bytes: u64,
+    /// Annotation records written into parts by flushes since the engine was
+    /// opened.
+    pub annotations_written: u64,
+    /// Annotations that flushes dropped because no live part held their
+    /// trace any more (retention removed it), since the engine was opened.
+    pub annotations_dropped: u64,
     /// Highest log position whose data is in the buffer or in a part, and
     /// whose sender has been (or is being) acknowledged.
     pub acked_lsn: u64,
@@ -358,6 +371,28 @@ pub(crate) struct LivePart {
     pub live_since: Instant,
 }
 
+/// A live annotation part: its metadata and an open reader.
+pub(crate) struct LiveAnnotationPart {
+    pub meta: nwdb_core::PartMeta,
+    pub reader: AnnotationReader,
+}
+
+/// The window an annotation part belongs to: `(window_start_ns, window_ns)`.
+pub(crate) type WindowKey = (i64, i64);
+
+/// The positions in `parts` of the annotation parts of each window.
+pub(crate) fn annotation_windows(
+    parts: &[Arc<LiveAnnotationPart>],
+) -> HashMap<WindowKey, Vec<u32>> {
+    let mut out: HashMap<WindowKey, Vec<u32>> = HashMap::new();
+    for (i, p) in parts.iter().enumerate() {
+        out.entry((p.meta.window_start_ns, p.meta.window_ns))
+            .or_default()
+            .push(i as u32);
+    }
+    out
+}
+
 impl LivePart {
     pub(crate) fn new(meta: nwdb_core::PartMeta, reader: PartReader) -> Self {
         Self {
@@ -382,6 +417,10 @@ pub(crate) struct Visible {
     /// record, oldest first.
     pub ann_frozen: Option<AnnBuf>,
     pub ann_active: AnnBuf,
+    /// The live annotation parts in part id order, and where the parts of
+    /// each window are. Replaced together, in the same step as `parts`.
+    pub ann_parts: Arc<Vec<Arc<LiveAnnotationPart>>>,
+    pub ann_windows: Arc<HashMap<WindowKey, Vec<u32>>>,
 }
 
 /// Buffered annotations: one entry per log record, so a snapshot copies a
@@ -411,6 +450,8 @@ pub(crate) struct Core {
     pub records: u64,
     pub bytes: u64,
     pub flushes: u64,
+    pub annotations_written: u64,
+    pub annotations_dropped: u64,
     pub last_error: Option<String>,
     pub stop_maintenance: bool,
     /// A flush finished (or the engine started) since the last pass began.
@@ -700,14 +741,30 @@ impl Engine {
         let state = existing.as_ref().map(Manifest::current);
         let flushed = state.as_ref().map_or(0, |s| s.wal_flushed_lsn);
         let mut parts = Vec::new();
+        let mut ann_parts = Vec::new();
         for meta in state.iter().flat_map(|s| s.parts.iter()) {
             // The version the manifest recorded is checked first, so an old
             // database is refused by version and not by what differs in its
             // files.
-            nwdb_segment::check_format_version(meta.format_version)?;
-            let reader = PartReader::open(parts_dir.join(nwdb_core::part_dir_name(meta.part_id)))?;
-            parts.push(Arc::new(LivePart::new(meta.clone(), reader)));
+            let dir = parts_dir.join(nwdb_core::part_dir_name(meta.part_id));
+            match meta.kind {
+                PartKind::Spans => {
+                    nwdb_segment::check_format_version(meta.format_version)?;
+                    parts.push(Arc::new(LivePart::new(
+                        meta.clone(),
+                        PartReader::open(dir)?,
+                    )));
+                }
+                PartKind::Annotations => {
+                    check_annotation_format_version(meta.format_version)?;
+                    ann_parts.push(Arc::new(LiveAnnotationPart {
+                        meta: meta.clone(),
+                        reader: AnnotationReader::open(dir, meta)?,
+                    }));
+                }
+            }
         }
+        ann_parts.sort_by_key(|p: &Arc<LiveAnnotationPart>| p.meta.part_id);
 
         // 3. The log, which must reach back to the manifest's position and
         // must not end below it: the records in between were acknowledged
@@ -800,6 +857,8 @@ impl Engine {
                     active: Arc::default(),
                     ann_frozen: None,
                     ann_active: Arc::default(),
+                    ann_windows: Arc::new(annotation_windows(&ann_parts)),
+                    ann_parts: Arc::new(ann_parts),
                 },
                 active_bytes: 0,
                 active_oldest: None,
@@ -813,6 +872,8 @@ impl Engine {
                 records: 0,
                 bytes: 0,
                 flushes: 0,
+                annotations_written: 0,
+                annotations_dropped: 0,
                 last_error: None,
                 stop_maintenance: false,
                 // A pass right after start-up removes what expired while the
@@ -1142,6 +1203,10 @@ impl Engine {
             flushed_lsn: c.flushed_lsn,
             buffered_bytes: c.active_bytes + c.frozen_bytes,
             parts: c.vis.parts.len(),
+            annotation_parts: c.vis.ann_parts.len(),
+            annotation_bytes: c.vis.ann_parts.iter().map(|p| p.meta.size_bytes()).sum(),
+            annotations_written: c.annotations_written,
+            annotations_dropped: c.annotations_dropped,
             flushes: c.flushes,
             flushing: c.flushing,
             fatal: c.fatal.is_some(),
@@ -1401,7 +1466,9 @@ impl Inner {
                     }
                     let now = Instant::now();
                     let mut wake: Option<Instant> = None;
-                    if c.fatal.is_none() && !c.vis.active.is_empty() {
+                    if c.fatal.is_none()
+                        && !(c.vis.active.is_empty() && c.vis.ann_active.is_empty())
+                    {
                         // `None`: too far away to represent, so the buffer is
                         // never due by age (size, flush and shutdown still
                         // flush it).

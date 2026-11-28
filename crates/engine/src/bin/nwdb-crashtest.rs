@@ -34,10 +34,12 @@
 //!   period, so the maintenance thread merges the parts of a window as soon
 //!   as it has n of them (the first pass runs at start-up), and the stages of
 //!   a merge can be named by the abort variable.
-//! - `NWDB_COMPACT=<n>` turns compaction on with `min_parts` n and no quiet
-//!   period, so the maintenance thread merges the parts of a window as soon
-//!   as it has n of them (the first pass runs at start-up), and the stages of
-//!   a merge can be named by the abort variable.
+//! - `NWDB_ANNOTATE=with` also annotates the trace of each acknowledged record
+//!   (name `q`, source `c`, value the record's id) and prints `N <id> <value>`
+//!   once the annotation is acknowledged. `NWDB_ANNOTATE=existing:<lo>:<hi>`
+//!   ingests nothing and annotates the traces of the records `lo..=hi` in turn,
+//!   with a growing value, printing `N <id> <value>` for each acknowledged
+//!   one; the records must already be in the database.
 
 #[path = "../../tests/common/mod.rs"]
 mod common;
@@ -48,8 +50,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{TAG, TSpan, decoders, encode, opts, to_batches};
-use nwdb_core::Error;
-use nwdb_engine::{Engine, Stage};
+use nwdb_core::{Error, TraceId};
+use nwdb_engine::{Annotation, Engine, Stage};
 use nwdb_wal::{SyncMode, WalOptions};
 
 /// How many records may wait for their acknowledgement at once.
@@ -110,13 +112,6 @@ fn main() {
         o.compaction.quiet = Duration::ZERO;
         o.compaction.retry_backoff = Duration::ZERO;
     }
-    if let Ok(n) = std::env::var("NWDB_COMPACT") {
-        o.compaction.enabled = true;
-        o.compaction.min_parts = n.parse().expect("NWDB_COMPACT");
-        o.compaction.max_parts = o.compaction.max_parts.max(o.compaction.min_parts);
-        o.compaction.quiet = Duration::ZERO;
-        o.compaction.retry_backoff = Duration::ZERO;
-    }
     let seen = AtomicU64::new(0);
     o.stage_hook = Some(Arc::new(move |stage: Stage| {
         match stage {
@@ -136,9 +131,73 @@ fn main() {
     let engine = Engine::open(o, decoders()).expect("open");
 
     say("READY");
+    let mode = std::env::var("NWDB_ANNOTATE").unwrap_or_default();
+    let annotated_in_flight = Arc::new(AtomicU64::new(0));
+    let annotate = |engine: &Engine, id: u64, value: u64| -> bool {
+        let counter = annotated_in_flight.clone();
+        counter.fetch_add(1, Ordering::SeqCst);
+        let c2 = counter.clone();
+        let sent = engine.annotate(
+            vec![Annotation {
+                trace_id: TraceId((u128::from(id) + 1).to_be_bytes()),
+                span_id: None,
+                name: "q".into(),
+                source: "c".into(),
+                time_ns: 1,
+                value: Some(value as f64),
+                label: None,
+                comment: None,
+                delete: false,
+                arrival: 0,
+            }],
+            move |r| {
+                if r.is_ok() {
+                    say(&format!("N {id} {value}"));
+                }
+                c2.fetch_sub(1, Ordering::SeqCst);
+            },
+        );
+        match sent {
+            Ok(r) if r.accepted == 1 => true,
+            Ok(_) => {
+                counter.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+            Err(Error::Unavailable(_)) => {
+                counter.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+            Err(e) => panic!("annotate failed: {e}"),
+        }
+    };
+    if let Some(range) = mode.strip_prefix("existing:") {
+        let (lo, hi) = range.split_once(':').expect("existing:<lo>:<hi>");
+        let (lo, hi): (u64, u64) = (lo.parse().expect("lo"), hi.parse().expect("hi"));
+        let mut k = 0u64;
+        loop {
+            if annotated_in_flight.load(Ordering::SeqCst) >= IN_FLIGHT {
+                std::thread::sleep(Duration::from_micros(100));
+                continue;
+            }
+            if annotate(&engine, lo + k % (hi - lo + 1), k) {
+                k += 1;
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    let to_annotate: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
     let acked = Arc::new(AtomicU64::new(0));
     let mut id = first;
     loop {
+        if mode == "with" {
+            let ids = std::mem::take(&mut *to_annotate.lock().unwrap());
+            for i in ids {
+                while !annotate(&engine, i, i) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
         if (id - first) - acked.load(Ordering::SeqCst) >= IN_FLIGHT {
             std::thread::sleep(Duration::from_micros(100));
             continue;
@@ -147,9 +206,11 @@ fn main() {
         span.attrs = vec![(id % 251) as u8; 200];
         let spans = [span];
         let counter = acked.clone();
+        let pending = to_annotate.clone();
         let sent = engine.ingest(TAG, encode(&spans), to_batches(&spans), move |r| {
             if r.is_ok() {
                 say(&format!("A {id}"));
+                pending.lock().unwrap().push(id);
             }
             counter.fetch_add(1, Ordering::SeqCst);
         });

@@ -3,17 +3,23 @@
 //! The order of the steps is what makes a crash at any point recoverable; the
 //! README walks through each one.
 
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, MutexGuard};
 
 use arrow_array::RecordBatch;
 use nwdb_core::{
-    Error, PartMeta, Result, SpanBatchBuilder, SpanColumns, part_dir_name, window_start,
+    Error, PartMeta, Result, SpanBatchBuilder, SpanColumns, TraceId, part_dir_name, window_start,
 };
 use nwdb_manifest::Edit;
-use nwdb_segment::{PartReader, PartWriter, WriterOptions};
+use nwdb_segment::{
+    Annotation, AnnotationReader, AnnotationWriter, PartReader, PartWriter, WriterOptions,
+};
 
-use crate::engine::{Inner, LivePart, Stage, run_hook};
+use crate::engine::{
+    AnnBuf, Inner, LiveAnnotationPart, LivePart, Stage, WindowKey, annotation_windows, run_hook,
+};
 use crate::lock;
 use crate::rows::group_traces;
 use crate::split::change_parts;
@@ -23,6 +29,11 @@ use crate::split::change_parts;
 struct Written<'a> {
     metas: Vec<PartMeta>,
     readers: Vec<PartReader>,
+    ann_metas: Vec<PartMeta>,
+    ann_readers: Vec<AnnotationReader>,
+    /// Annotation records written into parts, and annotations dropped.
+    ann_written: u64,
+    ann_dropped: u64,
     gate: MutexGuard<'a, ()>,
 }
 
@@ -70,12 +81,12 @@ impl Inner {
     /// [`do_flush`](Self::do_flush) for a caller that already holds the flush
     /// gate (shutdown, for its final flush).
     pub(crate) fn flush_locked(&self, trim: bool) -> Result<()> {
-        let (frozen, lsn) = {
+        let (frozen, ann_frozen, lsn) = {
             let mut c = lock(&self.core);
             if let Some(f) = &c.fatal {
                 return Err(Error::fatal(f.clone()));
             }
-            if c.vis.frozen.is_some() {
+            if c.vis.frozen.is_some() || c.vis.ann_frozen.is_some() {
                 // Freezing again would overwrite the buffer whose data may
                 // not be in a part, and the next commit would then cover
                 // records that are in neither a part nor the log.
@@ -83,7 +94,10 @@ impl Inner {
                 self.set_fatal_locked(&mut c, msg.clone());
                 return Err(Error::fatal(msg));
             }
-            if c.vis.active.is_empty() && c.applied_lsn == c.flushed_lsn {
+            if c.vis.active.is_empty()
+                && c.vis.ann_active.is_empty()
+                && c.applied_lsn == c.flushed_lsn
+            {
                 drop(c);
                 return self.rotate_and_trim_log();
             }
@@ -92,22 +106,26 @@ impl Inner {
             // log order; the freeze happens under the same lock as an insert.
             let frozen = std::mem::take(&mut c.vis.active);
             c.vis.frozen = Some(frozen.clone());
+            let ann_frozen = std::mem::take(&mut c.vis.ann_active);
+            c.vis.ann_frozen = Some(ann_frozen.clone());
             c.frozen_bytes = std::mem::take(&mut c.active_bytes);
             c.active_oldest = None;
             c.flushing = true;
-            (frozen, c.applied_lsn)
+            (frozen, ann_frozen, c.applied_lsn)
         };
 
         // A panic after the freeze must not unwind past this point with the
         // frozen buffer in place: it is a fatal error, and a restart recovers
         // from the log.
-        let outcome = catch_unwind(AssertUnwindSafe(|| self.write_and_commit(&frozen, lsn)))
-            .unwrap_or_else(|panic| {
-                Err(Error::fatal(format!(
-                    "a flush panicked: {}",
-                    panic_message(panic.as_ref())
-                )))
-            });
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            self.write_and_commit(&frozen, &ann_frozen, lsn)
+        }))
+        .unwrap_or_else(|panic| {
+            Err(Error::fatal(format!(
+                "a flush panicked: {}",
+                panic_message(panic.as_ref())
+            )))
+        });
         match outcome {
             Ok(written) => {
                 // The publish gate is held since before the commit, so no
@@ -117,12 +135,29 @@ impl Inner {
                 let Written {
                     metas,
                     readers,
+                    ann_metas,
+                    ann_readers,
+                    ann_written,
+                    ann_dropped,
                     gate,
                 } = written;
-                let (old_parts, old_split) = {
+                let (old_parts, old_split, old_ann) = {
                     let c = lock(&self.core);
-                    (c.vis.parts.clone(), c.vis.split.clone())
+                    (
+                        c.vis.parts.clone(),
+                        c.vis.split.clone(),
+                        c.vis.ann_parts.clone(),
+                    )
                 };
+                let mut ann_parts: Vec<Arc<LiveAnnotationPart>> = old_ann.as_ref().clone();
+                ann_parts.extend(
+                    ann_metas
+                        .into_iter()
+                        .zip(ann_readers)
+                        .map(|(meta, reader)| Arc::new(LiveAnnotationPart { meta, reader })),
+                );
+                ann_parts.sort_by_key(|p| p.meta.part_id);
+                let ann_windows = Arc::new(annotation_windows(&ann_parts));
                 let added = metas
                     .into_iter()
                     .zip(readers)
@@ -136,6 +171,11 @@ impl Inner {
                     // the data exactly once.
                     c.vis.parts = Arc::new(parts);
                     c.vis.split = split;
+                    c.vis.ann_parts = Arc::new(ann_parts);
+                    c.vis.ann_windows = ann_windows;
+                    c.vis.ann_frozen = None;
+                    c.annotations_written += ann_written;
+                    c.annotations_dropped += ann_dropped;
                     c.vis.frozen = None;
                     c.frozen_bytes = 0;
                     c.flushed_lsn = lsn;
@@ -172,6 +212,10 @@ impl Inner {
                     c.active_oldest.get_or_insert_with(std::time::Instant::now);
                     c.vis.active = Arc::new(batches);
                     c.vis.frozen = None;
+                    let mut anns: Vec<_> = ann_frozen.as_ref().clone();
+                    anns.extend(c.vis.ann_active.iter().cloned());
+                    c.vis.ann_active = Arc::new(anns);
+                    c.vis.ann_frozen = None;
                     c.active_bytes += std::mem::take(&mut c.frozen_bytes);
                 }
                 Err(e)
@@ -221,7 +265,71 @@ impl Inner {
         rotated
     }
 
-    fn write_and_commit(&self, frozen: &[Arc<RecordBatch>], lsn: u64) -> Result<Written<'_>> {
+    /// Reduces the frozen annotations to one record per identity (the
+    /// largest `arrival`) and puts each in a window: the largest of the
+    /// window its trace's rows go to in this flush and the windows of the live
+    /// span parts that hold the trace. Taking the largest means an annotation
+    /// is never in an older window than an earlier one of its identity, so
+    /// removing the older window later cannot bring an overwritten value
+    /// back. An annotation whose trace has no such window (retention removed
+    /// it) is dropped. Returns the records of each window in identity order,
+    /// and the number dropped.
+    fn annotation_windows_of_flush(
+        &self,
+        ann_frozen: &AnnBuf,
+        flush_windows: &HashMap<TraceId, WindowKey>,
+    ) -> (BTreeMap<WindowKey, Vec<Annotation>>, u64) {
+        let mut records: Vec<Annotation> =
+            ann_frozen.iter().flat_map(|b| b.iter().cloned()).collect();
+        records.sort_by(|a, b| a.identity_cmp(b).then(a.arrival.cmp(&b.arrival)));
+        let mut reduced: Vec<Annotation> = Vec::with_capacity(records.len());
+        for a in records {
+            match reduced.last() {
+                Some(last) if last.identity_cmp(&a).is_eq() => {
+                    let n = reduced.len() - 1;
+                    reduced[n] = a;
+                }
+                _ => reduced.push(a),
+            }
+        }
+        let live = lock(&self.core).vis.parts.clone();
+        let mut by_window: Vec<&Arc<LivePart>> = live.iter().collect();
+        by_window.sort_by_key(|p| Reverse((p.meta.window_start_ns, p.meta.window_ns)));
+        let newest_part = by_window
+            .first()
+            .map(|p| (p.meta.window_start_ns, p.meta.window_ns));
+        let wanted: HashSet<TraceId> = reduced.iter().map(|a| a.trace_id).collect();
+        let mut window_of: HashMap<TraceId, Option<WindowKey>> = HashMap::new();
+        for id in wanted {
+            let mut best = flush_windows.get(&id).copied();
+            // The parts are in descending window order, so the first holder
+            // is the largest window; nothing to look for if this flush's
+            // window is already past every part.
+            if best.is_none_or(|b| Some(b) < newest_part)
+                && let Some(p) = by_window.iter().find(|p| p.reader.find_trace(id).is_some())
+            {
+                let w = (p.meta.window_start_ns, p.meta.window_ns);
+                best = Some(best.map_or(w, |b| b.max(w)));
+            }
+            window_of.insert(id, best);
+        }
+        let mut out: BTreeMap<WindowKey, Vec<Annotation>> = BTreeMap::new();
+        let mut dropped = 0;
+        for a in reduced {
+            match window_of[&a.trace_id] {
+                Some(w) => out.entry(w).or_default().push(a),
+                None => dropped += 1,
+            }
+        }
+        (out, dropped)
+    }
+
+    fn write_and_commit(
+        &self,
+        frozen: &[Arc<RecordBatch>],
+        ann_frozen: &AnnBuf,
+        lsn: u64,
+    ) -> Result<Written<'_>> {
         run_hook(&self.opts.stage_hook, Stage::FlushFrozen)?;
         let cols = frozen
             .iter()
@@ -241,14 +349,34 @@ impl Inner {
             }
         }
 
+        let wanted: HashSet<TraceId> = ann_frozen
+            .iter()
+            .flat_map(|b| b.iter().map(|a| a.trace_id))
+            .collect();
+        let flush_windows: HashMap<TraceId, WindowKey> = grouped
+            .traces
+            .iter()
+            .filter(|t| wanted.contains(&t.trace_id))
+            .map(|t| (t.trace_id, (window_start(t.start_ns, window_ns), window_ns)))
+            .collect();
+        let (ann_by_window, ann_dropped) =
+            self.annotation_windows_of_flush(ann_frozen, &flush_windows);
+
         // Ids come from the manifest and are never reused, even by a retry
-        // after an error.
-        let ids = self.manifest.reserve_part_ids(windows.len() as u64)?;
+        // after an error. Span parts take the first ids, annotation parts the
+        // next.
+        let mut ids = self
+            .manifest
+            .reserve_part_ids((windows.len() + ann_by_window.len()) as u64)?;
         let mut metas: Vec<PartMeta> = Vec::new();
         let mut readers: Vec<PartReader> = Vec::new();
+        let mut ann_metas: Vec<PartMeta> = Vec::new();
+        let mut ann_readers: Vec<AnnotationReader> = Vec::new();
+        let mut ann_written = 0u64;
         let mut gate = None;
         let result: Result<()> = (|| {
-            for ((w, range), id) in windows.iter().zip(ids) {
+            for (w, range) in windows.iter() {
+                let id = ids.next().expect("an id was reserved for each window");
                 let mut writer =
                     PartWriter::create(&self.parts_dir, id, *w, window_ns, self.writer_options())?;
                 let mut builder = SpanBatchBuilder::new(self.opts.batch_limits);
@@ -273,13 +401,28 @@ impl Inner {
                 readers.push(PartReader::open(self.parts_dir.join(part_dir_name(id)))?);
                 run_hook(&self.opts.stage_hook, Stage::PartWritten)?;
             }
+            for ((start, ns), records) in &ann_by_window {
+                let id = ids.next().expect("an id was reserved for each window");
+                let mut writer = AnnotationWriter::create(&self.parts_dir, id, *start, *ns)?;
+                for a in records {
+                    writer.append(a)?;
+                }
+                let meta = writer.finish(0)?;
+                ann_written += records.len() as u64;
+                ann_metas.push(meta);
+                ann_readers.push(AnnotationReader::open(
+                    self.parts_dir.join(part_dir_name(id)),
+                    ann_metas.last().expect("just pushed"),
+                )?);
+                run_hook(&self.opts.stage_hook, Stage::PartWritten)?;
+            }
             run_hook(&self.opts.stage_hook, Stage::AllPartsWritten)?;
             // From here to the publish no replacement may commit: its edit and
             // ours must each see the list the other left. Taken only now, so
             // the long work above never holds it.
             gate = Some(lock(&self.publish_gate));
             self.manifest.commit(Edit {
-                add: metas.clone(),
+                add: metas.iter().chain(&ann_metas).cloned().collect(),
                 wal_flushed_lsn: Some(lsn),
                 ..Edit::default()
             })?;
@@ -290,6 +433,10 @@ impl Inner {
             Ok(()) => Ok(Written {
                 metas,
                 readers,
+                ann_metas,
+                ann_readers,
+                ann_written,
+                ann_dropped,
                 gate: gate.expect("the publish gate is taken before the commit"),
             }),
             Err(e) => {
@@ -298,7 +445,7 @@ impl Inner {
                 if !matches!(e, Error::Fatal(_)) {
                     // Nothing was published, so the directories are garbage.
                     // If this fails they are removed at the next start-up.
-                    for m in &metas {
+                    for m in metas.iter().chain(&ann_metas) {
                         let _ =
                             std::fs::remove_dir_all(self.parts_dir.join(part_dir_name(m.part_id)));
                     }

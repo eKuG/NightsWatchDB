@@ -16,7 +16,8 @@ use nwdb_core::{
     SpanColumns, SpanId, SpanRecord, TraceId, TraceSummary,
 };
 use nwdb_engine::{
-    AggQuery, CompactionOptions, Engine, EngineOptions, ListQuery, Snapshot, TokenAgg,
+    AggQuery, Annotated, Annotation, AnnotationFilter, CompactionOptions, Engine, EngineOptions,
+    ListQuery, Snapshot, TokenAgg,
 };
 use nwdb_wal::{SyncMode, WalOptions};
 
@@ -701,4 +702,109 @@ pub fn count_files(dir: &Path, prefix: &str) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+// Annotations.
+
+pub fn tid(t: u128) -> TraceId {
+    TraceId(t.to_be_bytes())
+}
+
+pub fn sid(s: u64) -> SpanId {
+    SpanId(s.to_be_bytes())
+}
+
+pub fn score(trace: u128, span: Option<u64>, name: &str, source: &str, v: f64) -> Annotation {
+    Annotation {
+        trace_id: tid(trace),
+        span_id: span.map(sid),
+        name: name.into(),
+        source: source.into(),
+        time_ns: 5,
+        value: Some(v),
+        label: None,
+        comment: None,
+        delete: false,
+        arrival: 0,
+    }
+}
+
+pub fn delete(trace: u128, span: Option<u64>, name: &str, source: &str) -> Annotation {
+    Annotation {
+        value: None,
+        delete: true,
+        ..score(trace, span, name, source, 0.0)
+    }
+}
+
+pub fn with_label(mut a: Annotation, label: &str) -> Annotation {
+    a.label = Some(label.into());
+    a
+}
+
+/// Annotates and waits for the acknowledgement when something was logged.
+pub fn annotate(e: &Engine, items: Vec<Annotation>) -> Annotated {
+    let (tx, rx) = mpsc::channel();
+    let r = e
+        .annotate(items, move |r| {
+            let _ = tx.send(r);
+        })
+        .expect("annotate");
+    if r.accepted > 0 {
+        rx.recv_timeout(Duration::from_secs(60))
+            .expect("callback was not called")
+            .expect("durable");
+    } else {
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "the callback of a request with nothing logged must not be called"
+        );
+    }
+    r
+}
+
+pub fn shown(e: &Engine, t: u128) -> Vec<Annotation> {
+    let (v, more) = e.snapshot().annotations(tid(t), usize::MAX).unwrap();
+    assert!(!more);
+    v
+}
+
+/// (span, name, source, value) of what is shown.
+pub fn brief(v: &[Annotation]) -> Vec<(Option<u64>, String, String, Option<f64>)> {
+    v.iter()
+        .map(|a| {
+            (
+                a.span_id.map(|s| u64::from_be_bytes(s.0)),
+                a.name.clone(),
+                a.source.clone(),
+                a.value,
+            )
+        })
+        .collect()
+}
+
+pub fn filter(name: &str) -> AnnotationFilter {
+    AnnotationFilter {
+        name: name.into(),
+        source: None,
+        min: None,
+        max: None,
+        label: None,
+    }
+}
+
+pub fn listed(e: &Engine, f: AnnotationFilter) -> Vec<u128> {
+    listed_limit(e, f, usize::MAX)
+}
+
+pub fn listed_limit(e: &Engine, f: AnnotationFilter, limit: usize) -> Vec<u128> {
+    e.list_traces(&ListQuery {
+        annotation: Some(f),
+        limit,
+        ..list_all()
+    })
+    .unwrap()
+    .iter()
+    .map(|s| u128::from_be_bytes(s.trace_id.0))
+    .collect()
 }

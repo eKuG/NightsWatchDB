@@ -20,6 +20,8 @@ use crate::common::*;
 /// What the child printed before it died.
 pub struct ChildRun {
     pub acked: Vec<u64>,
+    /// `(record id, value)` of each annotation the child saw acknowledged.
+    pub annotated: Vec<(u64, u64)>,
     /// A flush was in progress (frozen, not yet trimmed) at the last marker.
     pub flushing_at_end: bool,
     pub success: bool,
@@ -73,6 +75,7 @@ pub fn run_child(
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let mut acked = Vec::new();
+        let mut annotated = Vec::new();
         let mut flushing = false;
         let mut aborted_at = None;
         for line in out.lines() {
@@ -85,12 +88,16 @@ pub fn run_child(
                     let _ = tx.send(());
                 }
                 Some(("A", id)) => acked.push(id.parse::<u64>().unwrap()),
+                Some(("N", rest)) => {
+                    let (id, v) = rest.split_once(' ').unwrap();
+                    annotated.push((id.parse::<u64>().unwrap(), v.parse::<u64>().unwrap()));
+                }
                 Some(("F", f)) => flushing = f == "1",
                 Some(("ABORT", stage)) => aborted_at = Some(stage.to_string()),
                 _ => {}
             }
         }
-        (acked, flushing, aborted_at)
+        (acked, annotated, flushing, aborted_at)
     });
     let started = Instant::now();
     let mut killed_at = None;
@@ -116,9 +123,10 @@ pub fn run_child(
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    let (acked, flushing_at_end, aborted_at) = reader.join().unwrap();
+    let (acked, annotated, flushing_at_end, aborted_at) = reader.join().unwrap();
     ChildRun {
         acked,
+        annotated,
         flushing_at_end,
         success: status.success(),
         aborted_at,
