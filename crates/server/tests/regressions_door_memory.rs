@@ -10,18 +10,21 @@
 //! It is the only test in this file because the allocator counts the whole
 //! process.
 
+use common::{frame, hpack_str, read_frame};
 use nwdb_server::{Server, ServerOptions};
 use nwdb_testkit::alloc::{Counting, live};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as V};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
+
+mod common;
 
 const PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
@@ -76,20 +79,6 @@ fn zstd_frame(prefix: &[u8], byte: u8, n: usize) -> Vec<u8> {
     f
 }
 
-fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
-    out.push(kind);
-    out.push(flags);
-    out.extend_from_slice(&stream.to_be_bytes());
-    out.extend_from_slice(payload);
-}
-
-fn hpack_str(out: &mut Vec<u8>, s: &str) {
-    assert!(s.len() < 127);
-    out.push(s.len() as u8);
-    out.extend_from_slice(s.as_bytes());
-}
-
 /// The request headers of an export with zstd compression, in HPACK without
 /// Huffman coding or indexing.
 fn headers() -> Vec<u8> {
@@ -110,15 +99,6 @@ fn headers() -> Vec<u8> {
         hpack_str(&mut h, value);
     }
     h
-}
-
-fn read_frame(s: &mut TcpStream) -> (u8, u8) {
-    let mut head = [0u8; 9];
-    s.read_exact(&mut head).unwrap();
-    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
-    let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload).unwrap();
-    (head[3], head[4])
 }
 
 /// Connects, exchanges settings, and sends one export per stream id with the

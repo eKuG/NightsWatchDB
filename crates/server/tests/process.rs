@@ -1,5 +1,6 @@
 //! The binary itself: usage errors and signals.
 
+use common::hpack_str;
 use nwdb_testkit::proto::ld;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -7,6 +8,8 @@ use std::net::TcpStream;
 use std::os::unix::ffi::OsStringExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+mod common;
 
 const BIN: &str = env!("CARGO_BIN_EXE_nightswatchdb");
 
@@ -65,11 +68,6 @@ fn signal(child: &Child) {
         .status()
         .unwrap();
     assert!(status.success());
-}
-
-fn hpack_str(out: &mut Vec<u8>, s: &str) {
-    out.push(s.len() as u8);
-    out.extend_from_slice(s.as_bytes());
 }
 
 /// The bytes of an HTTP/2 connection with one export call that has headers

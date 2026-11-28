@@ -8,46 +8,20 @@
 //! budget, and that wait has no limit.
 
 use bytes::Bytes;
+use common::{Feed, connect};
 use http::Request;
 use http_body_util::BodyExt;
-use hyper::body::{Body, Frame};
 use hyper::client::conn::http2::SendRequest;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{Server, ServerOptions};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
-use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+mod common;
+
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
-
-/// A request body fed from a channel: it ends when the sender is dropped.
-struct Feed(mpsc::UnboundedReceiver<Bytes>);
-
-impl Body for Feed {
-    type Data = Bytes;
-    type Error = Infallible;
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        self.0.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b))))
-    }
-}
-
-async fn connect(addr: SocketAddr) -> SendRequest<Feed> {
-    let io = TokioIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-    let (send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    send
-}
 
 /// Starts an export whose body is fed through the returned sender, and
 /// returns the gRPC status of the reply once there is one.

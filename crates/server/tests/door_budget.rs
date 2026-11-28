@@ -8,10 +8,10 @@
 //! process.
 
 use bytes::Bytes;
+use common::connect;
 use http::Request;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http2::SendRequest;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{Server, ServerOptions};
 use nwdb_testkit::alloc::{Counting, live};
 use nwdb_testkit::proto::ld;
@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
+
+mod common;
 
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
@@ -47,15 +49,6 @@ fn spans(n: u32) -> Vec<u8> {
         })
         .collect();
     ld(1, &scopes)
-}
-
-async fn connect(addr: std::net::SocketAddr) -> SendRequest<Full<Bytes>> {
-    let io = TokioIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-    let (send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    send
 }
 
 async fn export(send: &mut SendRequest<Full<Bytes>>, encoding: &str, message: &Bytes) -> String {

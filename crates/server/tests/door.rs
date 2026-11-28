@@ -3,26 +3,24 @@
 //! every byte of the call, which a gRPC library would not allow.
 
 use bytes::Bytes;
+use common::opts;
+use common::{Feed, connect};
+use common::{frame, hpack_str};
 use http::Request;
 use http_body_util::BodyExt;
-use hyper::body::{Body, Frame};
 use hyper::client::conn::http2::SendRequest;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use nwdb_server::{MAX_MESSAGE, Server, ServerOptions};
+use nwdb_server::{MAX_MESSAGE, Server};
 use nwdb_testkit::proto::varint;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
-use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream as TokioTcp;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+mod common;
 
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
@@ -34,29 +32,6 @@ const UNIMPLEMENTED: u8 = 12;
 const UNAVAILABLE: u8 = 14;
 
 // ---- client ----
-
-/// A request body fed from a channel: it ends when the sender is dropped.
-struct Feed(mpsc::UnboundedReceiver<Bytes>);
-
-impl Body for Feed {
-    type Data = Bytes;
-    type Error = Infallible;
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        self.0.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b))))
-    }
-}
-
-async fn connect(addr: SocketAddr) -> SendRequest<Feed> {
-    let io = TokioIo::new(TokioTcp::connect(addr).await.unwrap());
-    let (send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    send
-}
 
 struct Reply {
     http: u16,
@@ -230,13 +205,6 @@ fn zstd_with_claim(claim: u32, run: usize) -> Vec<u8> {
 }
 
 // ---- server fixtures ----
-
-fn opts(dir: &Path) -> ServerOptions {
-    let mut o = ServerOptions::new(dir);
-    o.otlp_grpc_addr = "127.0.0.1:0".parse().unwrap();
-    o.api_addr = "127.0.0.1:0".parse().unwrap();
-    o
-}
 
 fn trace_status(api: SocketAddr, trace: u8) -> u16 {
     let mut s = TcpStream::connect(api).unwrap();
@@ -882,19 +850,6 @@ async fn an_unsized_zstd_frame_beyond_the_limit_is_resource_exhausted() {
 
 // ---- the stream limit, from a client that does not obey it ----
 
-fn h2_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
-    out.push(kind);
-    out.push(flags);
-    out.extend_from_slice(&stream.to_be_bytes());
-    out.extend_from_slice(payload);
-}
-
-fn hpack_str(out: &mut Vec<u8>, s: &str) {
-    out.push(s.len() as u8);
-    out.extend_from_slice(s.as_bytes());
-}
-
 /// The request headers of an export, in HPACK without Huffman coding or
 /// indexing.
 fn export_headers() -> Vec<u8> {
@@ -911,7 +866,7 @@ fn export_headers() -> Vec<u8> {
 }
 
 /// One HTTP/2 frame: type, flags, stream, payload.
-fn read_h2_frame(s: &mut TcpStream) -> std::io::Result<(u8, u8, u32, Vec<u8>)> {
+fn read_frame(s: &mut TcpStream) -> std::io::Result<(u8, u8, u32, Vec<u8>)> {
     let mut head = [0u8; 9];
     s.read_exact(&mut head)?;
     let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
@@ -935,12 +890,12 @@ async fn a_65th_stream_opened_regardless_is_refused() {
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
-        h2_frame(&mut out, 4, 0, 0, &[]);
+        frame(&mut out, 4, 0, 0, &[]);
         s.write_all(&out).unwrap();
         // The server's settings, which must be acknowledged; they carry the
         // stream limit (setting 3).
         let limit = loop {
-            let (kind, flags, _, payload) = read_h2_frame(&mut s).unwrap();
+            let (kind, flags, _, payload) = read_frame(&mut s).unwrap();
             if kind == 4 && flags & 1 == 0 {
                 break payload
                     .chunks(6)
@@ -950,14 +905,14 @@ async fn a_65th_stream_opened_regardless_is_refused() {
         };
         assert_eq!(limit, Some(64));
         let mut out = Vec::new();
-        h2_frame(&mut out, 4, 1, 0, &[]);
+        frame(&mut out, 4, 1, 0, &[]);
         // 64 calls that are never ended, then a 65th.
         for i in 0..65u32 {
-            h2_frame(&mut out, 1, 0x4, 1 + 2 * i, &export_headers());
+            frame(&mut out, 1, 0x4, 1 + 2 * i, &export_headers());
         }
         s.write_all(&out).unwrap();
         loop {
-            let (kind, _, stream, payload) = read_h2_frame(&mut s).unwrap();
+            let (kind, _, stream, payload) = read_frame(&mut s).unwrap();
             if kind == 3 {
                 // RST_STREAM carries a four byte error code.
                 break (stream, u32::from_be_bytes(payload[..4].try_into().unwrap()));

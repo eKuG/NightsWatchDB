@@ -12,10 +12,11 @@
 //! It is the only test in this file because the allocator counts the whole
 //! process.
 
+use common::{frame, hpack_str, read_frame};
 use nwdb_server::{DECODE_FACTOR, DECODE_FIXED, Server, ServerOptions};
 use nwdb_testkit::alloc::{live, peak, reset_peak};
 use nwdb_testkit::proto::ld;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -26,6 +27,8 @@ use std::time::{Duration, Instant};
 static BIG_LIVE: AtomicIsize = AtomicIsize::new(0);
 static BIG_MAX: AtomicIsize = AtomicIsize::new(0);
 static BIG_MADE: AtomicUsize = AtomicUsize::new(0);
+mod common;
+
 const BIG: usize = 1 << 20;
 
 fn big(old: usize, new: usize) {
@@ -94,20 +97,6 @@ fn request() -> Vec<u8> {
     ld(1, &ld(2, &spans))
 }
 
-fn frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
-    out.push(kind);
-    out.push(flags);
-    out.extend_from_slice(&stream.to_be_bytes());
-    out.extend_from_slice(payload);
-}
-
-fn hpack_str(out: &mut Vec<u8>, s: &str) {
-    assert!(s.len() < 127);
-    out.push(s.len() as u8);
-    out.extend_from_slice(s.as_bytes());
-}
-
 /// The request headers of a zstd export, in HPACK without Huffman coding or
 /// indexing.
 fn headers() -> Vec<u8> {
@@ -126,15 +115,6 @@ fn headers() -> Vec<u8> {
         hpack_str(&mut h, value);
     }
     h
-}
-
-fn read_frame(s: &mut TcpStream) -> (u8, u8) {
-    let mut head = [0u8; 9];
-    s.read_exact(&mut head).unwrap();
-    let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
-    let mut payload = vec![0u8; len];
-    s.read_exact(&mut payload).unwrap();
-    (head[3], head[4])
 }
 
 fn connect(addr: SocketAddr) -> TcpStream {

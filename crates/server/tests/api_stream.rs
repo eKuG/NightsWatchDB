@@ -6,10 +6,8 @@
 //! It is the only test in this file because the allocator counts the whole
 //! process.
 
-use bytes::Bytes;
-use http::Request;
-use http_body_util::{BodyExt, Full};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use common::ingest;
+
 use nwdb_server::{Server, ServerOptions};
 use nwdb_testkit::alloc::{Counting, live, peak, reset_peak};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -23,7 +21,8 @@ use std::time::{Duration, Instant};
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
+mod common;
+
 const SIZE: usize = 16 << 20;
 
 fn big_request() -> Vec<u8> {
@@ -54,29 +53,6 @@ fn big_request() -> Vec<u8> {
     .encode_to_vec()
 }
 
-async fn ingest(addr: SocketAddr, payload: Vec<u8>) {
-    let io = TokioIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-    let (mut send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let mut m = vec![0u8];
-    m.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    m.extend_from_slice(&payload);
-    drop(payload);
-    let req = Request::post(format!("http://localhost{EXPORT}"))
-        .header("content-type", "application/grpc")
-        .body(Full::new(Bytes::from(m)))
-        .unwrap();
-    send.ready().await.unwrap();
-    let resp = send.send_request(req).await.unwrap();
-    let (parts, body) = resp.into_parts();
-    let trailers = body.collect().await.unwrap().trailers().cloned();
-    let status = |h: &http::HeaderMap| h.get("grpc-status").map(|v| v.to_str().unwrap().to_owned());
-    let got = status(&parts.headers).or_else(|| trailers.as_ref().and_then(status));
-    assert_eq!(got.as_deref(), Some("0"));
-}
-
 fn get(api: SocketAddr) -> TcpStream {
     let mut s = TcpStream::connect(api).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
@@ -97,7 +73,7 @@ async fn a_large_trace_is_streamed_and_a_client_that_leaves_frees_its_task() {
     o.api_addr = "127.0.0.1:0".parse().unwrap();
     let server = Server::start(o).await.unwrap();
     let api = server.api_addr();
-    ingest(server.otlp_grpc_addr(), big_request()).await;
+    ingest(server.otlp_grpc_addr(), big_request(), true).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // What the engine needs to hand over the rows of the trace: the cost no

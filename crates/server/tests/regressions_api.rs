@@ -1,11 +1,9 @@
 //! The query API: what clients that do not read can do to the others, and
 //! errors that the router never sees.
 
-use bytes::Bytes;
-use http::Request;
-use http_body_util::{BodyExt, Full};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use nwdb_server::{Server, ServerOptions};
+use common::ingest;
+use common::opts;
+use nwdb_server::Server;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value as V};
 use opentelemetry_proto::tonic::resource::v1::Resource;
@@ -13,39 +11,9 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
 use std::time::Duration;
 
-const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
-
-fn opts(dir: &Path) -> ServerOptions {
-    let mut o = ServerOptions::new(dir);
-    o.otlp_grpc_addr = "127.0.0.1:0".parse().unwrap();
-    o.api_addr = "127.0.0.1:0".parse().unwrap();
-    o
-}
-
-async fn ingest(addr: SocketAddr, payload: Vec<u8>) {
-    let io = TokioIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-    let (mut send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    let mut m = vec![0u8];
-    m.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    m.extend_from_slice(&payload);
-    let req = Request::post(format!("http://localhost{EXPORT}"))
-        .header("content-type", "application/grpc")
-        .body(Full::new(Bytes::from(m)))
-        .unwrap();
-    send.ready().await.unwrap();
-    let resp = send.send_request(req).await.unwrap();
-    let (parts, body) = resp.into_parts();
-    let trailers = body.collect().await.unwrap().trailers().cloned();
-    let status = |h: &http::HeaderMap| h.get("grpc-status").map(|v| v.to_str().unwrap().to_owned());
-    let got = status(&parts.headers).or_else(|| trailers.as_ref().and_then(status));
-    assert_eq!(got.as_deref(), Some("0"));
-}
+mod common;
 
 /// A trace of `spans` spans that share one resource of about 60 KB. The
 /// resource is stored once, but the JSON of the trace repeats it in every
@@ -103,7 +71,7 @@ async fn clients_that_do_not_read_cannot_stop_the_api() {
     let dir = tempfile::tempdir().unwrap();
     let server = Server::start(opts(dir.path())).await.unwrap();
     let api = server.api_addr();
-    ingest(server.otlp_grpc_addr(), wide_trace(250)).await;
+    ingest(server.otlp_grpc_addr(), wide_trace(250), false).await;
     assert!(healthz(api).await.starts_with("HTTP/1.1 200"));
 
     let id = "42".repeat(16);
@@ -183,7 +151,7 @@ async fn a_client_that_does_not_read_is_cut_off_and_frees_its_slot() {
     let api = server.api_addr();
     // About 30 MB of JSON, to clients whose receive buffers are tiny: the
     // kernel buffers a few MB, not all of it.
-    ingest(server.otlp_grpc_addr(), wide_trace(500)).await;
+    ingest(server.otlp_grpc_addr(), wide_trace(500), false).await;
 
     let id = "42".repeat(16);
     let target = format!("/api/v1/traces/{id}");

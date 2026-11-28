@@ -2,7 +2,8 @@
 //! from tonic's own pieces and a hand-written HTTP/1.1 client.
 
 use bytes::{Buf, BufMut, Bytes};
-use nwdb_server::{Server, ServerOptions};
+use common::{Resp, dechunk, now_ns, opts};
+use nwdb_server::Server;
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
@@ -21,12 +22,14 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tonic::client::Grpc;
 use tonic::codec::{Codec, CompressionEncoding, DecodeBuf, Decoder, EncodeBuf, Encoder};
 use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
+
+mod common;
 
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 
@@ -99,86 +102,22 @@ async fn export(
 
 // ---- HTTP client ----
 
-/// The body of a chunked response without the chunk framing.
-fn dechunk(mut raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let eol = raw.windows(2).position(|w| w == b"\r\n").unwrap();
-        let size =
-            usize::from_str_radix(std::str::from_utf8(&raw[..eol]).unwrap().trim(), 16).unwrap();
-        if size == 0 {
-            return out;
-        }
-        out.extend_from_slice(&raw[eol + 2..eol + 2 + size]);
-        raw = &raw[eol + 2 + size + 2..];
-    }
-}
-
-struct Resp {
-    status: u16,
-    headers: String,
-    body: Vec<u8>,
-}
-
-impl Resp {
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body)
-            .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&self.body)))
-    }
-}
-
-fn http_blocking(addr: SocketAddr, method: &str, target: &str, accept: Option<&str>) -> Resp {
-    let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    let accept = accept.map_or(String::new(), |a| format!("Accept: {a}\r\n"));
-    write!(
-        s,
-        "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{accept}Content-Length: 0\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut raw = Vec::new();
-    s.read_to_end(&mut raw).unwrap();
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let head = String::from_utf8(raw[..split].to_vec()).unwrap();
-    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    Resp {
-        status,
-        headers: head.to_lowercase(),
-        body: if head.to_lowercase().contains("transfer-encoding: chunked") {
-            dechunk(&raw[split + 4..])
-        } else {
-            raw[split + 4..].to_vec()
-        },
-    }
-}
-
 async fn http(addr: SocketAddr, target: &str) -> Resp {
     http_with(addr, "GET", target, None).await
 }
 
 async fn http_with(addr: SocketAddr, method: &str, target: &str, accept: Option<&str>) -> Resp {
-    let (method, target) = (method.to_owned(), target.to_owned());
-    let accept = accept.map(str::to_owned);
-    tokio::task::spawn_blocking(move || http_blocking(addr, &method, &target, accept.as_deref()))
-        .await
-        .unwrap()
+    let accept = accept.map_or(String::new(), |a| format!("Accept: {a}\r\n"));
+    common::http(
+        addr,
+        method,
+        target,
+        &format!("{accept}Content-Length: 0\r\n"),
+    )
+    .await
 }
 
 // ---- fixtures ----
-
-fn opts(dir: &Path) -> ServerOptions {
-    let mut o = ServerOptions::new(dir);
-    o.otlp_grpc_addr = "127.0.0.1:0".parse().unwrap();
-    o.api_addr = "127.0.0.1:0".parse().unwrap();
-    o
-}
-
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64
-}
 
 fn av(v: V) -> Option<AnyValue> {
     Some(AnyValue { value: Some(v) })

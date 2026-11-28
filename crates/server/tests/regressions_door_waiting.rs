@@ -12,21 +12,19 @@
 //! process.
 
 use bytes::Bytes;
+use common::{Feed, connect};
 use http::Request;
-use hyper::body::{Body, Frame};
 use hyper::client::conn::http2::SendRequest;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use nwdb_server::{Server, ServerOptions};
 use nwdb_testkit::alloc::{Counting, live};
-use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[global_allocator]
 static ALLOC: Counting = Counting;
+
+mod common;
 
 const EXPORT: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
 const BUDGET: usize = 1 << 20;
@@ -34,29 +32,6 @@ const CONNECTIONS: usize = 8;
 const STREAMS: usize = 64;
 /// The largest DATA frame a client may send without asking.
 const FRAME: usize = 16 * 1024;
-
-/// A request body fed from a channel: it ends when the sender is dropped.
-struct Feed(mpsc::UnboundedReceiver<Bytes>);
-
-impl Body for Feed {
-    type Data = Bytes;
-    type Error = Infallible;
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        self.0.poll_recv(cx).map(|b| b.map(|b| Ok(Frame::data(b))))
-    }
-}
-
-async fn connect(addr: SocketAddr) -> SendRequest<Feed> {
-    let io = TokioIo::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-    let (send, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .unwrap();
-    tokio::spawn(conn);
-    send
-}
 
 /// Starts an export, sends `first` and keeps the stream open.
 async fn open(send: &mut SendRequest<Feed>, first: &Bytes) -> mpsc::UnboundedSender<Bytes> {
