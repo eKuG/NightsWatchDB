@@ -75,7 +75,11 @@ the engine writes one log record `[0xA1] + nwdb_segment::encode_batch(items)`
   The start-up pre-check reads them like any record (see Start-up), so one
   that does not decode refuses the start with the directory unchanged.
 
-`EngineStats::annotations_buffered` counts the annotations in the buffers.
+Statistics: `annotations_buffered` (in the active buffer and the buffer being
+flushed), `annotation_parts` and `annotation_bytes` (live annotation parts and
+the sum of their file sizes), `annotations_written` (records written into
+parts by flushes since the engine opened) and `annotations_dropped` (see The
+flush).
 
 A binary that does not know the tag meets it in the log and refuses to start
 with "unknown format tag" before it changes anything, so an older binary cannot
@@ -86,7 +90,7 @@ silently drop annotations.
 ```
 <data_dir>/            exclusively locked (flock on the directory itself) for the life of the engine
 <data_dir>/manifest/   numbered manifest files
-<data_dir>/parts/      one directory per part (and <id>.tmp while being written)
+<data_dir>/parts/      one directory per part, of spans or of annotations (and <id>.tmp while being written)
 <data_dir>/wal/        log files
 ```
 
@@ -109,8 +113,11 @@ finishes before the next.
    `parts/` holds any part directory (final or `.tmp`, whatever its id), the
    manifest is lost and the start is `Corrupt`: refusing is the only safe
    answer. If there is none and the database may not be created, `NotFound`.
-   Otherwise load the manifest state, and open a `PartReader` for every live
-   part. Any failure stops start-up.
+   Otherwise load the manifest state, and open every live part by its kind: a
+   span part through `PartReader` after its format version is checked, an
+   annotation part through `AnnotationReader` after
+   `check_annotation_format_version`. Any failure (another format version, a
+   truncated or missing file) stops start-up with the directory unchanged.
 3. Open the log with `min_next_lsn = wal_flushed_lsn + 1` (position 0 for a
    database with no manifest yet). The log first removes files wholly below
    that position, as a trim would, so damage in them cannot block the start.
@@ -223,17 +230,36 @@ for queries or for a flush's writing of parts.
 
 `do_flush` (one at a time):
 
-1. **Freeze.** Under the core lock, refuse (fatal) if a frozen buffer is
-   already present, then move the whole active buffer to the frozen slot (it stays visible to queries) and record `applied_lsn`. Because
-   requests enter the buffer in log order under the same lock, every log
-   position up to `applied_lsn` is in the frozen buffer or in a part, and the
-   position is always a contiguous prefix.
+1. **Freeze.** Under the core lock, refuse (fatal) if a frozen buffer (of
+   spans or of annotations) is already present, then move the whole active
+   buffer, spans and annotations together, to the frozen slots (they stay
+   visible to queries) and record `applied_lsn`. Because requests enter the
+   buffers in log order under the same lock, every log position up to
+   `applied_lsn` is in a frozen buffer or in a part, and the position is
+   always a contiguous prefix. There is nothing to flush only when both active
+   buffers are empty and `applied_lsn` equals `flushed_lsn`; a buffer that
+   holds only annotations is flushed like any other, by size, by age or on
+   demand.
 2. **Group.** Sort the frozen rows by trace and span id, drop duplicate
    `(trace, span)` pairs (the row with the smallest `arrival` stays, then the
    first in batch order), order each trace's spans by
    `(start_ns, span_id)` and the traces by `(earliest start, trace id)`. A
    trace's window is `window_start` of its earliest span in this buffer.
-3. **Write parts.** Reserve fresh part ids from the manifest. For each window
+   **Annotations.** The frozen annotations are reduced to one record per
+   identity (the largest `arrival`). Each goes to a window, the largest (by
+   `(window_start_ns, window_ns)`) of: the window its trace's rows go to in
+   this flush, if the trace has rows in it, and the windows of the live span
+   parts that hold the trace (found in the parts' in-memory trace indexes,
+   newest window first, stopping at the first holder). The largest, because an
+   annotation must never be in an older window than an earlier annotation of
+   the same identity: removing the older window later would otherwise bring
+   an overwritten value back. If no window results (the trace is in no live
+   part and has no rows in this flush: retention removed it between the
+   write and the flush) the annotation is dropped; the number of drops
+   becomes part of `annotations_dropped` at the publish, so a flush that
+   fails and is retried counts nothing twice.
+3. **Write parts.** Reserve fresh part ids from the manifest, one per window
+   of spans and one per window of annotations, in one reservation. For each window
    write one part through `PartWriter` in `parts/<id>.tmp`, which syncs and
    renames it to `parts/<id>`. Open a `PartReader` for it. The part writer is
    given `EngineOptions::splitter` and `EngineOptions::dedup_window_bytes`:
@@ -242,16 +268,25 @@ for queries or for a flush's writing of parts.
    `nwdb-payload`); without one every value stays in its row. Either way a read
    returns the original bytes, so nothing else here depends on it. The memory
    of a flush is the buffer being written plus, for the part being written,
-   its row group and its de-duplication window (64 MiB by default).
+   its row group and its de-duplication window (64 MiB by default). After
+   the span parts, one annotation part per window that received annotations
+   is written through `AnnotationWriter` (records in identity order, no
+   splitter: annotations are small) and opened with `AnnotationReader`.
+   `Stage::PartWritten` is called once per part of either kind, span parts
+   first.
 4. **Commit.** Take the publish gate, then one manifest commit adds all the
-   parts and sets `wal_flushed_lsn` to the frozen position. The gate is taken
-   only now, after the long work of step 3.
+   parts, span parts and annotation parts, and sets `wal_flushed_lsn` to the
+   frozen position. The gate is taken only now, after the long work of step 3.
+   A flush that carries only annotations commits too, even when every
+   annotation was dropped (the commit then only moves `wal_flushed_lsn`), and
+   rotates and trims the log as after any flush.
 5. **Publish.** Build the new part list and split map (outside the core lock,
    in memory, from the list the last replacement left; see Replacing parts),
    then under the core lock replace the part list and the
-   split map and clear the frozen buffer in one step, so a snapshot sees the
-   data exactly once and its map matches its parts. Then release the publish
-   gate.
+   split map, the annotation part list and its window index, and clear both
+   frozen buffers in one step, so a snapshot sees the data, annotations
+   included, exactly once and its map matches its parts. Then release the
+   publish gate.
 6. **Rotate and trim.** `Wal::rotate` starts a new log file at the current
    write position (nothing happens if the newest file holds no records), then
    `truncate_before(wal_flushed_lsn + 1)` removes the files wholly inside
@@ -298,9 +333,10 @@ that commit returned. A record is therefore always in the log or in live
 parts, and replaying from `wal_flushed_lsn + 1` never replays something already
 in a part.
 
-A non-`Fatal` error in steps 2 to 4 puts the frozen buffer back in front of
-the active one (nothing is lost), removes the parts this attempt wrote, and
-the retry uses fresh ids. `Fatal` from the log, the manifest or a part writer
+A non-`Fatal` error in steps 2 to 4 puts the frozen buffers, spans and
+annotations, back in front of the active ones (nothing is lost, and the
+annotations keep their order), removes the parts this attempt wrote, of either
+kind, and the retry uses fresh ids. `Fatal` from the log, the manifest or a part writer
 puts the engine in the fatal state: ingest and flush return `Fatal`, pending
 callbacks get `Fatal`, reads keep working on what is visible, nothing is
 retried. A restart recovers from the log and the manifest.
@@ -655,7 +691,7 @@ unique.
 - Start-up: `OpenChecked` (every refusing check passed, including the read of
   the records to replay; nothing changed yet),
   `IdsRaised`, `ReplayFinished`, `LeftoversDeleted`.
-- A flush: `FlushFrozen`, `PartWritten` (once per part), `AllPartsWritten`
+- A flush: `FlushFrozen`, `PartWritten` (once per part of either kind, span parts first), `AllPartsWritten`
   (before the commit), `Committed` (before publishing), `Published`
   (before the log is rotated), `LogRotated` (before the trim), `Trimmed`.
 - A merge: `MergeStarting` (before `merge_parts`; nothing is written; an error
@@ -694,9 +730,18 @@ does not block, and is not blocked by, ingest or flush.
 - `annotations(trace, limit)`: the winning annotations of a trace, on the
   trace and on its spans, deletes applied (a deleted identity is absent), in
   identity order (trace-level first, then by span id, name, source), at most
-  `limit`, and a flag that says more exist. Cost: one pass over the annotations
-  in the buffers; the annotation buffers are visible in a snapshot as `Arc`s,
-  like the span buffers.
+  `limit`, and a flag that says more exist. The annotation parts are kept in
+  their own list in the snapshot (`Visible.parts` and the split map hold span
+  parts only, so listing, search, token sums and `known_traces` do not see
+  them). The windows that hold the trace are those of the span parts that hold
+  it (the split map, or the first part whose in-memory index has it); the
+  records of the trace are read from every annotation part of those windows
+  (a lookup reads only the blocks that can hold the trace, typically one per
+  part) and merged with the trace's buffered records by `Latest`: per identity
+  the largest `arrival`, whether it is in a part or the buffer, so a delete in
+  a later part or in the buffer hides an older value. `annotations_with_stats`
+  returns `AnnotationStats` (parts probed, blocks read). A trace that is only
+  in the buffer has only buffered annotations.
 - `known_traces(ids)`: for each id, whether the trace has rows in a live part
   or in the buffers. The ids are sorted once; each part's in-memory trace
   index is walked forward with the galloping search of the split map, for the
@@ -732,8 +777,25 @@ does not block, and is not blocked by, ingest or flush.
   at least `min` and at most `max` if given (an annotation without a value
   matches neither bound) and its `label` if given. It is a per-trace test
   applied to the merged summary after the other filters, like `error`, so the
-  early stop above holds. It is evaluated per candidate trace through
-  `annotations`, which costs one pass over the buffered annotations each.
+  early stop above holds. How it is evaluated, per candidate trace:
+  - A candidate that is split (held by more than one span part), or has any
+    buffered annotation, or exists only in the buffer, goes the exact way:
+    `annotations` and the test on each winner (`annotation_exact_lookups`).
+  - Every other candidate is in exactly one span part, so all its annotations
+    are in the annotation parts of that part's window (an annotation goes to
+    the largest window of its holders, see The flush). For that window the set
+    of trace ids that match is built once, on first use, by one `Latest` scan
+    over all its annotation parts (`annotation_windows_scanned`); a winner that
+    is not a delete and passes the test puts its trace id in the set, and
+    membership answers the filter. At most the two most recently used sets are
+    kept. A set holds at most 1,048,576 trace ids (8 bytes of id plus hash
+    table overhead each, so about 40 MB at most per set): past that the query
+    fails with `InvalidArgument` saying more than that many traces of one
+    window match and the filter must be narrowed.
+  - Cost: a filter that most traces match stops with the newest windows
+    (`limit` results come from one or two windows); a filter that few match
+    reads each window that has annotation parts once, with no per-trace
+    block read.
 - The split map: each part's trace index is sorted by trace id, and when the
   set of parts changes (start-up, a flush publishing parts) the traces that
   are in more than one part are found with a merge over the sorted indexes of
@@ -871,12 +933,22 @@ lists of the parts a flush writes have the budgets
   lasts until retention removes the parts. `get_trace` and `search` always show
   exactly one copy of a span, the one with the smallest `arrival`, before and
   after any merge.
-- Annotations and the flush: flushing while annotations are in the buffer is
-  not supported; do not flush an engine that holds buffered annotations.
-- A trace's annotations are found in the buffer by reading every buffered
+- An annotation lives as long as the newest window that held its trace when it
+  was flushed: it sits in that window's annotation part, and retention (and
+  merging) of annotation parts, which are not done yet, will have to treat
+  those windows. Until then annotation parts are never merged or removed, and
+  one whose window no live span part holds any more is not shown by
+  `annotations`.
+- A span id of an annotation is not checked against the trace's spans (spans
+  may arrive later), and an annotation for a trace the engine does not know
+  yet is refused ("unknown trace"): annotate after the spans were
+  acknowledged.
+- A trace's annotations in the buffer are found by reading every buffered
   annotation, and `known_traces` reads the trace id column of every buffered
   batch for ids it did not find in a part; both cost time proportional to the
   buffer.
+- The annotation filter of a list builds one set of matching trace ids per
+  window it meets, up to 1,048,576 ids.
 - A trace's rows are found in the buffers by reading the trace id column of
   every buffered batch; `list_traces` summarises the whole buffer per call. Both
   cost time proportional to the buffer, and are fine for a buffer of a few
@@ -936,6 +1008,13 @@ from `FlushFrozen` to `Trimmed` through the stage hook. Two kinds of test run it
   exactly once, queries work, and a new record is accepted and flushed. The
   start-up stages are run on a directory with leftovers and a log to replay,
   with a buffer small enough that the replay flushes.
+
+`tests/crash_annotations.rs` runs the child with `NWDB_ANNOTATE`: it annotates
+the traces it ingests (or, alone, traces that are already stored), aborts at
+each stage of a flush that carries spans and annotations, of a flush that
+carries only annotations, and of a start-up that replays annotation records,
+and checks that every acknowledged annotation is the winner exactly once after
+the restart and that no part directory is left over.
 
 `tests/startup_safety.rs` and `tests/regressions_second_pass.rs` check that
 every refusal, including each kind of refused replay with a buffer so small

@@ -434,6 +434,21 @@ fn the_list_filter_over_parts_the_buffer_and_both() {
         "name; 4 is deleted"
     );
     assert_eq!(listed(&e, f("nothing")), none);
+    // Trace 6 reaches the listing through its older part only; its annotation
+    // is in the newer window, which the exact path finds through the split
+    // map.
+    let early = ListQuery {
+        annotation: Some(f("score")),
+        to_ns: 2 * W,
+        ..list_all()
+    };
+    let ids: Vec<u128> = e
+        .list_traces(&early)
+        .unwrap()
+        .iter()
+        .map(|s| u128::from_be_bytes(s.trace_id.0))
+        .collect();
+    assert_eq!(ids, vec![6, 5, 3, 2, 1]);
     let with = |g: fn(&mut AnnotationFilter)| {
         let mut x = f("score");
         g(&mut x);

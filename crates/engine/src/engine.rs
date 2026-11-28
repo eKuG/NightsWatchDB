@@ -634,7 +634,7 @@ impl Engine {
     /// create the data directory if allowed and lock it (`Conflict` if
     /// another engine holds it); read the manifest without changing it
     /// (never treating a missing manifest next to part directories as an
-    /// empty database) and open every live part; open the log and check it
+    /// empty database) and open every live part by its kind; open the log and check it
     /// reaches back to the manifest's position (`Corrupt` if it does not, or
     /// if it ends below it, see [`EngineOptions::accept_lost_log`]); read
     /// every record to be replayed once and check it (`Corrupt` for an
