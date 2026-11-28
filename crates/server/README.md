@@ -371,12 +371,15 @@ curl http://127.0.0.1:4320/healthz
 `retention_parts_removed`, `last_maintenance_error` and the compaction
 counters `merges_done`, `parts_merged_away`, `duplicate_spans_dropped`,
 `merge_input_bytes`, `merge_output_bytes`, `windows_with_many_parts` (windows
-that now have more than one part), `merging` (a merge is running),
+that now have more than one part of a kind, span parts and annotation parts
+counted apart; `0` means everything is settled), `merging` (a merge is running),
 `last_compaction_error`, and for annotations `annotations_buffered` (in the
 memory buffers, not yet in parts), `annotation_parts` and `annotation_bytes`
 (the annotation parts on disk and their size), `annotations_written` (records
-written into parts since the start) and `annotations_dropped` (annotations
-whose trace was gone when they were to be written). The three `payload_*`
+written into parts since the start), `annotations_dropped` (annotations
+whose trace was gone when they were to be written) and `annotations_superseded`
+(records that merges of annotation parts left out because a newer record of the
+same annotation existed). The three `payload_*`
 fields are for the flushed parts: the large text (prompts, completions, tool definitions and
 results, and other long values) their spans hold, counting every use; the same
 text with each distinct piece counted once per part; and what that takes on
