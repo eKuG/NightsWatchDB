@@ -147,7 +147,7 @@ impl Manifest {
     /// The writer lock. It guards `()`, so a panic in another thread cannot
     /// leave anything half updated.
     fn lock_writer(&self) -> MutexGuard<'_, ()> {
-        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+        nwdb_core::lock(&self.writer)
     }
 
     fn check_poisoned(&self) -> Result<()> {
@@ -245,7 +245,7 @@ impl Manifest {
     /// is written and before the link, with the writer lock held.
     #[doc(hidden)]
     pub fn set_commit_hook(&self, hook: Option<CommitHook>) {
-        *self.commit_hook.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+        *nwdb_core::lock(&self.commit_hook) = hook;
     }
 
     /// Test only: makes the directory sync after the link fail.
@@ -287,11 +287,7 @@ impl Manifest {
         f.sync_all()?;
         drop(f);
 
-        let hook = self
-            .commit_hook
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let hook = nwdb_core::lock(&self.commit_hook).clone();
         if let Some(h) = hook {
             h();
         }
@@ -343,7 +339,7 @@ impl Manifest {
     /// Returns [`Error::InvalidArgument`] if the ids would pass
     /// [`MAX_NEXT_PART_ID`]; nothing is reserved then.
     pub fn reserve_part_ids(&self, n: u64) -> Result<Range<u64>> {
-        let mut reserved = self.next_reserved.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reserved = nwdb_core::lock(&self.next_reserved);
         let start = (*reserved).max(self.current().next_part_id);
         let end = start
             .checked_add(n)

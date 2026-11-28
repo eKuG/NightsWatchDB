@@ -1,54 +1,24 @@
-//! Regression tests for the defects found in review. The first two tests are
-//! the reviewer's, adapted only for the API changes the fixes made
+//! Regression tests for fixed defects. The first two tests are the original
+//! ones, adapted only for the API changes the fixes made
 //! (`Manifest::open` takes an `OpenMode`, `reserve_part_ids` returns a
 //! `Result`, and `commit` now rejects an implausible `next_part_id`, so the
 //! damaged file is written by hand).
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use nwdb_core::{Error, PartMeta, part_dir_name};
+use nwdb_core::{Error, part_dir_name};
 use nwdb_manifest::{
     Edit, MAX_NEXT_PART_ID, Manifest, ManifestOptions, ManifestState, OpenMode,
     highest_part_dir_id, unreferenced_part_dirs,
 };
 
-fn part(id: u64) -> PartMeta {
-    PartMeta {
-        part_id: id,
-        level: 0,
-        window_start_ns: 0,
-        window_ns: 900_000_000_000,
-        rows: 1,
-        traces: 1,
-        min_start_ns: 0,
-        max_end_ns: 1,
-        files: BTreeMap::new(),
-        created_unix_ms: 0,
-        format_version: 1,
-        payload: Default::default(),
-    }
-}
+mod common;
+use common::{add, vname};
 
-fn add(ids: &[u64]) -> Edit {
-    Edit {
-        add: ids.iter().map(|&i| part(i)).collect(),
-        ..Edit::default()
-    }
-}
-
-fn opts() -> ManifestOptions {
-    ManifestOptions::default()
-}
-
-fn vfile(v: u64) -> String {
-    format!("{v:020}.json")
-}
-
-/// Finding 1 (reviewer's test): a missing manifest directory must not make
+/// Finding 1 (original test): a missing manifest directory must not make
 /// every part deletable. `MustExist` refuses; `Create` yields version 0, and
 /// `unreferenced_part_dirs` then refuses to list final part directories.
 #[test]
@@ -56,7 +26,7 @@ fn a_missing_manifest_does_not_make_every_part_deletable() {
     let tmp = tempfile::tempdir().unwrap();
     let parts = tmp.path().join("parts");
     let dir = tmp.path().join("manifest");
-    let m = Manifest::open(&dir, OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(&dir, OpenMode::Create, ManifestOptions::default()).unwrap();
     m.commit(Edit {
         wal_flushed_lsn: Some(500),
         ..add(&[1, 2])
@@ -69,7 +39,7 @@ fn a_missing_manifest_does_not_make_every_part_deletable() {
     fs::remove_dir_all(&dir).unwrap();
 
     // Restart: the directory must exist.
-    let err = Manifest::open(&dir, OpenMode::MustExist, opts())
+    let err = Manifest::open(&dir, OpenMode::MustExist, ManifestOptions::default())
         .err()
         .unwrap();
     assert!(matches!(err, Error::NotFound(_)), "{err}");
@@ -77,18 +47,18 @@ fn a_missing_manifest_does_not_make_every_part_deletable() {
 
     // Even if the directory is opened as version 0, the parts are never
     // offered for deletion.
-    let m = Manifest::open(&dir, OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(&dir, OpenMode::Create, ManifestOptions::default()).unwrap();
     assert_eq!(m.current().version, 0);
     let err = unreferenced_part_dirs(&parts, &m.current()).unwrap_err();
     assert!(matches!(err, Error::Corrupt(_)), "{err}");
 }
 
-/// Finding 5 (reviewer's test): a loaded `next_part_id` near `u64::MAX` is
+/// Finding 5 (original test): a loaded `next_part_id` near `u64::MAX` is
 /// rejected on load, so reservation can never panic.
 #[test]
 fn a_loaded_next_part_id_cannot_make_reservation_panic() {
     let tmp = tempfile::tempdir().unwrap();
-    let m = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
 
     // An edit asking for it is invalid.
     for n in [u64::MAX, MAX_NEXT_PART_ID + 1] {
@@ -119,8 +89,8 @@ fn a_loaded_next_part_id_cannot_make_reservation_panic() {
         next_part_id: u64::MAX,
         ..ManifestState::empty()
     };
-    fs::write(tmp.path().join(vfile(1)), bad.encode().unwrap()).unwrap();
-    let err = Manifest::open(tmp.path(), OpenMode::Create, opts())
+    fs::write(tmp.path().join(vname(1)), bad.encode().unwrap()).unwrap();
+    let err = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default())
         .err()
         .unwrap();
     assert!(matches!(err, Error::Corrupt(_)), "{err}");
@@ -133,18 +103,18 @@ fn open_modes() {
 
     // MustExist: missing directory.
     let dir = tmp.path().join("nested").join("manifest");
-    let err = Manifest::open(&dir, OpenMode::MustExist, opts())
+    let err = Manifest::open(&dir, OpenMode::MustExist, ManifestOptions::default())
         .err()
         .unwrap();
     assert!(matches!(err, Error::NotFound(_)), "{err}");
 
     // Create makes it (including parents) and starts at version 0.
-    let m = Manifest::open(&dir, OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(&dir, OpenMode::Create, ManifestOptions::default()).unwrap();
     assert_eq!(*m.current(), ManifestState::empty());
 
     // MustExist: existing but empty (a temp file is not a manifest).
     fs::write(dir.join(".tmp-1-1-1"), "x").unwrap();
-    let err = Manifest::open(&dir, OpenMode::MustExist, opts())
+    let err = Manifest::open(&dir, OpenMode::MustExist, ManifestOptions::default())
         .err()
         .unwrap();
     assert!(matches!(err, Error::NotFound(_)), "{err}");
@@ -152,7 +122,7 @@ fn open_modes() {
     // Once a version exists both modes load it.
     m.commit(add(&[1])).unwrap();
     for mode in [OpenMode::MustExist, OpenMode::Create] {
-        let again = Manifest::open(&dir, mode, opts()).unwrap();
+        let again = Manifest::open(&dir, mode, ManifestOptions::default()).unwrap();
         assert_eq!(again.current().version, 1);
     }
 }
@@ -181,14 +151,14 @@ fn version_zero_with_parts_refuses_but_temp_dirs_are_listed() {
 #[test]
 fn directory_sync_failure_after_publish_poisons_the_handle() {
     let tmp = tempfile::tempdir().unwrap();
-    let m = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
     let durable = m.commit(add(&[1])).unwrap();
 
     m.set_fail_dir_sync(true);
     let err = m.commit(add(&[2])).unwrap_err();
     assert!(matches!(err, Error::Fatal(_)), "{err}");
     // The file is on disk, but current() did not advance.
-    assert!(tmp.path().join(vfile(2)).exists());
+    assert!(tmp.path().join(vname(2)).exists());
     assert_eq!(*m.current(), *durable);
 
     // Even once the disk "recovers", the handle stays unusable.
@@ -196,10 +166,11 @@ fn directory_sync_failure_after_publish_poisons_the_handle() {
     assert!(matches!(m.commit(add(&[3])).unwrap_err(), Error::Fatal(_)));
     assert!(matches!(m.reload().unwrap_err(), Error::Fatal(_)));
     assert_eq!(*m.current(), *durable);
-    assert!(!tmp.path().join(vfile(3)).exists());
+    assert!(!tmp.path().join(vname(3)).exists());
 
     // A restart recovers whatever was published.
-    let again = Manifest::open(tmp.path(), OpenMode::MustExist, opts()).unwrap();
+    let again =
+        Manifest::open(tmp.path(), OpenMode::MustExist, ManifestOptions::default()).unwrap();
     assert_eq!(again.current().version, 2);
 }
 
@@ -208,8 +179,8 @@ fn directory_sync_failure_after_publish_poisons_the_handle() {
 #[test]
 fn failures_before_the_link_do_not_poison() {
     let tmp = tempfile::tempdir().unwrap();
-    let a = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
-    let b = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
+    let a = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
+    let b = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
     a.commit(add(&[1])).unwrap();
 
     assert!(matches!(
@@ -232,7 +203,8 @@ fn failures_before_the_link_do_not_poison() {
 #[test]
 fn current_does_not_wait_for_a_commit_in_progress() {
     let tmp = tempfile::tempdir().unwrap();
-    let m = Arc::new(Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap());
+    let m =
+        Arc::new(Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap());
     m.commit(add(&[1])).unwrap();
 
     let (entered_tx, entered_rx) = mpsc::channel::<()>();
@@ -269,7 +241,7 @@ fn current_does_not_wait_for_a_commit_in_progress() {
 #[test]
 fn implausible_ids_are_rejected_in_edits() {
     let tmp = tempfile::tempdir().unwrap();
-    let m = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
     for id in [MAX_NEXT_PART_ID, u64::MAX] {
         let err = m.commit(add(&[id])).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
@@ -304,7 +276,7 @@ fn startup_rule_never_reuses_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let parts = tmp.path().join("parts");
     let dir = tmp.path().join("manifest");
-    let m = Manifest::open(&dir, OpenMode::Create, opts()).unwrap();
+    let m = Manifest::open(&dir, OpenMode::Create, ManifestOptions::default()).unwrap();
     m.commit(add(&[1, 2])).unwrap();
     // A crashed flush left ids 3 (final) and 4 (temporary) unreferenced.
     fs::create_dir_all(parts.join(part_dir_name(1))).unwrap();
@@ -313,7 +285,7 @@ fn startup_rule_never_reuses_ids() {
     fs::create_dir_all(parts.join(format!("{}.tmp", part_dir_name(4)))).unwrap();
     drop(m);
 
-    let m = Manifest::open(&dir, OpenMode::MustExist, opts()).unwrap();
+    let m = Manifest::open(&dir, OpenMode::MustExist, ManifestOptions::default()).unwrap();
     let highest = highest_part_dir_id(&parts, m.current().next_part_id)
         .unwrap()
         .unwrap();
@@ -335,8 +307,8 @@ fn startup_rule_never_reuses_ids() {
 #[test]
 fn error_meanings_after_a_lost_race() {
     let tmp = tempfile::tempdir().unwrap();
-    let a = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
-    let b = Manifest::open(tmp.path(), OpenMode::Create, opts()).unwrap();
+    let a = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
+    let b = Manifest::open(tmp.path(), OpenMode::Create, ManifestOptions::default()).unwrap();
     a.commit(add(&[1, 2])).unwrap();
     b.reload().unwrap();
     a.commit(Edit {

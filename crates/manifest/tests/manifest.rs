@@ -11,28 +11,22 @@ use nwdb_manifest::{
     Edit, Manifest, ManifestOptions, ManifestState, OpenMode, unreferenced_part_dirs,
 };
 
+mod common;
+use common::{add_with, base_part, vname};
+
 fn part(id: u64) -> PartMeta {
     PartMeta {
-        part_id: id,
-        level: 0,
-        window_start_ns: 0,
-        window_ns: 900_000_000_000,
         rows: id,
-        traces: 1,
         min_start_ns: 1,
         max_end_ns: 2,
         files: BTreeMap::from([("spans.parquet".to_string(), id.wrapping_mul(10))]),
         created_unix_ms: 1_700_000_000_000,
-        format_version: 1,
-        payload: Default::default(),
+        ..base_part(id)
     }
 }
 
 fn add(ids: &[u64]) -> Edit {
-    Edit {
-        add: ids.iter().map(|&i| part(i)).collect(),
-        ..Edit::default()
-    }
+    add_with(ids, part)
 }
 
 fn open(dir: &Path) -> Manifest {
@@ -46,10 +40,6 @@ fn file_names(dir: &Path) -> Vec<String> {
         .collect();
     v.sort();
     v
-}
-
-fn vname(v: u64) -> String {
-    format!("{v:020}.json")
 }
 
 fn ids(s: &ManifestState) -> Vec<u64> {
