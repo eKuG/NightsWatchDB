@@ -7,6 +7,7 @@
 
 mod codec;
 mod latest;
+mod merge;
 mod part;
 
 use nwdb_core::{Error, Result, SpanId, TraceId};
@@ -14,6 +15,7 @@ use std::cmp::Ordering;
 
 pub use codec::{decode_batch, encode_batch};
 pub use latest::Latest;
+pub use merge::{AnnotationMergeStats, merge_annotation_parts};
 pub use part::{AnnotationCursor, AnnotationReader, AnnotationWriter};
 
 /// Version of the annotation part format (the file `annotations.nwa`).

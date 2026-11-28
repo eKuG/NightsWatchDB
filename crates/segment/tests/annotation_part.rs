@@ -249,30 +249,6 @@ fn the_largest_records_fit_the_block_ceiling() {
     assert_eq!(read(&r, None), records);
 }
 
-fn random_input(rng: &mut StdRng, k: usize, with_deletes: bool) -> Vec<Annotation> {
-    let mut by: BTreeMap<_, Annotation> = BTreeMap::new();
-    for _ in 0..rng.random_range(0..40) {
-        let mut a = score(rng.random_range(1..6), rng.random_range(1..6));
-        a.span_id = if rng.random() {
-            None
-        } else {
-            Some(span(rng.random_range(1..3)))
-        };
-        a.name = format!("n{}", rng.random_range(0..3));
-        a.source = format!("s{}", rng.random_range(0..2));
-        a.comment = Some(format!("input {k}"));
-        a.time_ns = WINDOW_START + k as i64;
-        if with_deletes && rng.random_range(0..4) == 0 {
-            a.delete = true;
-            a.value = None;
-            a.comment = None;
-            // The input number rides in the time.
-        }
-        by.insert((a.trace_id, a.span_id, a.name.clone(), a.source.clone()), a);
-    }
-    by.into_values().collect()
-}
-
 #[test]
 fn latest_matches_a_brute_force_model() {
     for seed in 0..60u64 {

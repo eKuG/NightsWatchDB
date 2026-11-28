@@ -5,6 +5,7 @@ use nwdb_core::{PartMeta, SpanId, TraceId, part_dir_name};
 use nwdb_segment::{ANNOTATION_FILE, Annotation, AnnotationReader, AnnotationWriter};
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const WINDOW_START: i64 = 1_700_000_000_000_000_000;
@@ -37,9 +38,9 @@ pub fn score(trace_n: u128, arrival: u64) -> Annotation {
 
 /// A random printable string of exactly `n` bytes.
 pub fn text(rng: &mut StdRng, n: usize) -> String {
-    (0..n)
-        .map(|_| char::from(b' ' + rng.random_range(0..95u8)))
-        .collect()
+    let mut v = vec![0u8; n];
+    rng.fill_bytes(&mut v);
+    v.iter().map(|b| char::from(b' ' + b % 95)).collect()
 }
 
 /// The largest record: every field at its limit.
@@ -164,4 +165,30 @@ pub fn random_bytes(rng: &mut StdRng, n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
     rng.fill_bytes(&mut v);
     v
+}
+
+/// A random input of up to 40 records over a small pool of identities, in
+/// identity order; `k` marks them.
+pub fn random_input(rng: &mut StdRng, k: usize, with_deletes: bool) -> Vec<Annotation> {
+    let mut by: BTreeMap<_, Annotation> = BTreeMap::new();
+    for _ in 0..rng.random_range(0..40) {
+        let mut a = score(rng.random_range(1..6), rng.random_range(1..6));
+        a.span_id = if rng.random() {
+            None
+        } else {
+            Some(span(rng.random_range(1..3)))
+        };
+        a.name = format!("n{}", rng.random_range(0..3));
+        a.source = format!("s{}", rng.random_range(0..2));
+        a.comment = Some(format!("input {k}"));
+        a.time_ns = WINDOW_START + k as i64;
+        if with_deletes && rng.random_range(0..4) == 0 {
+            a.delete = true;
+            a.value = None;
+            a.comment = None;
+            // The input number rides in the time.
+        }
+        by.insert((a.trace_id, a.span_id, a.name.clone(), a.source.clone()), a);
+    }
+    by.into_values().collect()
 }
