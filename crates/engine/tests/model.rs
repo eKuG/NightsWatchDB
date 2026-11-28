@@ -576,3 +576,194 @@ fn random_operations_with_annotations_agree_with_the_model() {
     assert!(annotated > 50 && listed > 5);
     e.shutdown().unwrap();
 }
+
+/// Spans, annotations (overwrites and deletes), flushes, restarts, merge
+/// passes and retention at random, with the clock moving past one window at a
+/// time: after every step every trace's annotations, the spans, and a few
+/// filtered listings equal a brute-force model. A trace lives in one window
+/// (`trace % 8`), so the model can say what expiry takes: a window's spans and
+/// the annotations of its traces go together, and nothing of them comes back.
+/// Not modelled: a trace spread over windows (its annotations live as long as
+/// the newest window that held the trace when they were flushed), which the
+/// engine tests cover with fixed cases.
+#[test]
+fn random_operations_with_annotations_compaction_and_retention_agree_with_the_model() {
+    const WINDOWS: i64 = 8;
+    let mut rng = StdRng::seed_from_u64(SEED ^ 0xa8);
+    let dir = tempfile::tempdir().unwrap();
+    let now = Arc::new(AtomicI64::new(0));
+    let open_c = |rng: &mut StdRng| {
+        let mut o = compact_opts(dir.path());
+        if rng.random_bool(0.3) {
+            o.flush_interval = Duration::from_millis(15);
+        }
+        // Whether the thread merges as well as the explicit passes.
+        o.compaction.background = rng.random_bool(0.5);
+        o.retention = Some(Duration::from_nanos(1_000));
+        let clock = now.clone();
+        o.clock = Some(Arc::new(move || clock.load(Ordering::SeqCst)));
+        open(o)
+    };
+    let mut e = open_c(&mut rng);
+    let mut model = Model::default();
+    let mut gen_ = Gen {
+        docs: vec![vec![1u8; 300]],
+        next_span: 0,
+        rooted: HashSet::new(),
+        session: Default::default(),
+    };
+    let mut ann: BTreeMap<Identity, Annotation> = BTreeMap::new();
+    let mut floor = 0i64;
+    let (mut annotated, mut merges, mut superseded, mut retired, mut listed) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let tally = |e: &nwdb_engine::Engine, merges: &mut u64, superseded: &mut u64| {
+        let s = e.stats();
+        *merges += s.merges_done;
+        *superseded += s.annotations_superseded;
+    };
+
+    for step in 0..300 {
+        let what = format!("step {step}");
+        match rng.random_range(0..100) {
+            0..25 => {
+                let spans = gen_.request(&mut rng, Some(floor));
+                ingest(&e, &spans).unwrap();
+                model.add(&spans);
+            }
+            25..60 => {
+                let known: Vec<u128> = model.trace_ids().into_iter().collect();
+                if known.is_empty() {
+                    continue;
+                }
+                let items: Vec<Annotation> = (0..rng.random_range(1..5))
+                    .map(|_| {
+                        let trace = known[rng.random_range(0..known.len())];
+                        let span = [None, Some(1), Some(2)][rng.random_range(0..3)];
+                        let name = ["a", "b"][rng.random_range(0..2)];
+                        let source = ["", "s1"][rng.random_range(0..2)];
+                        let mut a = score(trace, span, name, source, 0.0);
+                        match rng.random_range(0..10) {
+                            0..3 => {
+                                a.value = None;
+                                a.delete = true;
+                            }
+                            3..5 => {
+                                a.value = None;
+                                a.label = Some(["x", "y"][rng.random_range(0..2)].into());
+                            }
+                            _ => a.value = Some(f64::from(rng.random_range(0..10))),
+                        }
+                        a
+                    })
+                    .collect();
+                let r = annotate(&e, items.clone());
+                assert!(r.rejected.is_empty(), "{what}: {:?}", r.rejected);
+                for a in items {
+                    let key = (
+                        u128::from_be_bytes(a.trace_id.0),
+                        a.span_id.map(|s| u64::from_be_bytes(s.0)),
+                        a.name.clone(),
+                        a.source.clone(),
+                    );
+                    ann.insert(key, a);
+                    annotated += 1;
+                }
+            }
+            60..68 => e.flush().unwrap(),
+            68..74 => {
+                if rng.random_bool(0.5) {
+                    e.shutdown().unwrap();
+                }
+                tally(&e, &mut merges, &mut superseded);
+                drop(e);
+                e = open_c(&mut rng);
+            }
+            74..80 => e.run_maintenance().unwrap(),
+            80..86 => {
+                e.flush().unwrap();
+                compact_fully(&e);
+                let s = e.stats();
+                assert_eq!(s.windows_with_many_parts, 0, "{what}");
+                assert!(s.parts as i64 <= WINDOWS, "{what}");
+                assert!(s.annotation_parts as i64 <= WINDOWS, "{what}");
+            }
+            86..90 if floor < 6 => {
+                // The clock moves past the end of window `floor`: with a
+                // retention of one window, the windows below the new floor
+                // expire.
+                floor += 1;
+                now.store((floor + 1) * 1_000, Ordering::SeqCst);
+                e.flush().unwrap();
+                e.run_maintenance().unwrap();
+                model.spans.retain(|s| s.start >= floor * 1_000);
+                ann.retain(|k, _| (k.0 % 8) as i64 >= floor);
+                retired += 1;
+            }
+            _ => {
+                for _ in 0..3 {
+                    let mut q = random_list(&mut rng);
+                    let limit = q.limit;
+                    q.limit = usize::MAX;
+                    let mut f = filter(["a", "b", "zz"][rng.random_range(0..3)]);
+                    if rng.random_bool(0.3) {
+                        f.source = Some(["", "s1"][rng.random_range(0..2)].into());
+                    }
+                    if rng.random_bool(0.4) {
+                        f.min = Some(f64::from(rng.random_range(0..10)));
+                    }
+                    if rng.random_bool(0.2) {
+                        f.label = Some(["x", "y"][rng.random_range(0..2)].into());
+                    }
+                    let matches = |t: u128| {
+                        model_shown(&ann, t).iter().any(|a| {
+                            a.name == f.name
+                                && f.source.as_ref().is_none_or(|s| *s == a.source)
+                                && f.min.is_none_or(|m| a.value.is_some_and(|v| v >= m))
+                                && f.label.as_ref().is_none_or(|l| a.label.as_ref() == Some(l))
+                        })
+                    };
+                    let want: Vec<TraceSummary> = model
+                        .list(&q)
+                        .into_iter()
+                        .filter(|s| matches(u128::from_be_bytes(s.trace_id.0)))
+                        .take(limit)
+                        .collect();
+                    q.limit = limit;
+                    q.annotation = Some(f.clone());
+                    assert_eq!(e.list_traces(&q).unwrap(), want, "{what}: {q:?}");
+                    listed += 1;
+                }
+            }
+        }
+        model.check(&e, &what);
+        for t in 1..=TRACES {
+            let got = shown(&e, t);
+            let want = model_shown(&ann, t);
+            assert_eq!(got.len(), want.len(), "{what}: trace {t}");
+            for (g, w) in got.iter().zip(&want) {
+                assert!(same_annotation(g, w), "{what}: trace {t}: {g:?} vs {w:?}");
+            }
+        }
+    }
+    tally(&e, &mut merges, &mut superseded);
+    eprintln!(
+        "300 steps: {annotated} annotations, {merges} merges, {superseded} annotation records \
+         superseded by merges, {retired} retention steps, {listed} filtered listings, {} \
+         annotation parts at the end",
+        e.stats().annotation_parts,
+    );
+    assert!(annotated > 100 && merges > 3 && retired > 0 && listed > 5);
+    assert!(superseded > 0, "no merge dropped an overwritten record");
+    // And one last time, everything merged: exact, also after a restart.
+    e.flush().unwrap();
+    compact_fully(&e);
+    e.shutdown().unwrap();
+    let e = open(opts(dir.path()));
+    model.check(&e, "after the last restart");
+    for t in 1..=TRACES {
+        let got = shown(&e, t);
+        let want = model_shown(&ann, t);
+        assert_eq!(got.len(), want.len(), "after the last restart: trace {t}");
+    }
+    e.shutdown().unwrap();
+}
