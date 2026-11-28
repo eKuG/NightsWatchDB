@@ -191,13 +191,7 @@ fn fix(out: &mut Vec<u8>, msg: &[u8], kind: Kind, depth: usize) -> bool {
     true
 }
 
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
+use nwdb_core::put_varint;
 
 fn put_len(out: &mut Vec<u8>, n: u32, payload: &[u8]) {
     put_val(out, n, Val::Len(payload));

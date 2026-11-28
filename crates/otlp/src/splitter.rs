@@ -8,7 +8,7 @@
 //! # What is cut
 //!
 //! Every string and bytes value of an `AnyValue`, at any depth up to
-//! [`MAX_DEPTH`] (deeper content stays inline), is a candidate when it is at
+//! [`MAX_DEPTH`](crate::MAX_DEPTH) (deeper content stays inline), is a candidate when it is at
 //! least [`OtlpSplitter::min_bytes`] long, or when it sits under a content key
 //! and is not empty. The content keys are the table in [`CONTENT_KEYS`] and
 //! [`CONTENT_PREFIXES`]: the attributes that carry prompts, completions,
@@ -31,10 +31,6 @@ use crate::walk::{Next, Rd, Val};
 use nwdb_core::{PayloadSplitter, RawColumn};
 use nwdb_payload::json_array_elements;
 use std::ops::Range;
-
-/// How deep into nested arrays and key-value lists the splitter looks; the
-/// same bound as the JSON writer's.
-pub const MAX_DEPTH: usize = crate::MAX_DEPTH;
 
 /// Attribute keys whose values are content: prompts, completions, tool
 /// definitions and tool calls.
@@ -163,7 +159,7 @@ impl Walk<'_> {
     }
 
     fn any_value(&mut self, msg: &[u8], content: bool, depth: usize) {
-        if depth > MAX_DEPTH {
+        if depth > crate::MAX_DEPTH {
             return;
         }
         let mut r = Rd::new(msg);

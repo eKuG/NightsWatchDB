@@ -70,10 +70,6 @@ fn assert_same(got: Value, want: Value) {
     assert!(same(&got, &want), "left: {got}\nright: {want}");
 }
 
-fn kv_bytes(key: &[u8], value: &[u8]) -> Vec<u8> {
-    concat(&[&ld(1, key), &ld(2, value)])
-}
-
 fn column(kvs: &[Vec<u8>]) -> Vec<u8> {
     kvs.iter()
         .flat_map(|m| [varint(m.len() as u64), m.clone()].concat())
@@ -416,13 +412,6 @@ fn what_cannot_be_read_is_kept_as_base64_in_its_place() {
 
 #[test]
 fn nesting_deeper_than_the_limit_is_kept_as_base64() {
-    fn nested(levels: usize) -> Vec<u8> {
-        let mut v = vf(3, 1);
-        for _ in 0..levels {
-            v = ld(5, &ld(1, &v));
-        }
-        v
-    }
     // MAX_DEPTH arrays inside each other still render.
     let ok = column(&[kv_bytes(b"d", &nested(MAX_DEPTH - 1))]);
     let mut v = render(write_attrs, &ok)["d"].clone();

@@ -18,25 +18,6 @@ use rand::Rng;
 const SURROGATE: [u8; 3] = [0xed, 0xa0, 0xbd];
 const FFFD3: &str = "\u{fffd}\u{fffd}\u{fffd}";
 
-fn kv_bytes(key: &str, value: &[u8]) -> Vec<u8> {
-    concat(&[&ld(1, key.as_bytes()), &ld(2, value)])
-}
-
-fn nested(levels: usize) -> Vec<u8> {
-    let mut v = vf(3, 1);
-    for _ in 0..levels {
-        v = ld(5, &ld(1, &v));
-    }
-    v
-}
-
-fn prefixed(items: &[Vec<u8>]) -> Vec<u8> {
-    items
-        .iter()
-        .flat_map(|m| [varint(m.len() as u64), m.clone()].concat())
-        .collect()
-}
-
 /// A request with one span; `extra` is spliced into the span, `resource` and
 /// `scope` are message bytes.
 fn request(extra: &[u8], resource: &[u8], scope: &[u8]) -> Vec<u8> {
@@ -69,8 +50,8 @@ fn string_of(v: &Option<opentelemetry_proto::tonic::common::v1::AnyValue>) -> &s
 #[test]
 fn a_string_that_is_not_utf8_is_made_lossy_and_nothing_is_lost() {
     let extra = concat(&[
-        &ld(9, &kv_bytes("a", &ld(1, &SURROGATE))),
-        &ld(9, &kv_bytes("b", &ld(1, b"fine"))),
+        &ld(9, &kv_bytes(b"a", &ld(1, &SURROGATE))),
+        &ld(9, &kv_bytes(b"b", &ld(1, b"fine"))),
         &vf(10, 4),
     ]);
     let (_, out) = through(&request(&extra, &[], &[]));
@@ -84,9 +65,9 @@ fn a_string_that_is_not_utf8_is_made_lossy_and_nothing_is_lost() {
 #[test]
 fn a_value_nested_too_deeply_drops_its_attribute_and_counts_it() {
     let extra = concat(&[
-        &ld(9, &kv_bytes("deep", &nested(70))),
-        &ld(9, &kv_bytes("ok", &ld(1, b"v"))),
-        &ld(9, &kv_bytes("deep2", &nested(40_000))),
+        &ld(9, &kv_bytes(b"deep", &nested(70))),
+        &ld(9, &kv_bytes(b"ok", &ld(1, b"v"))),
+        &ld(9, &kv_bytes(b"deep2", &nested(40_000))),
         &vf(10, 5),
     ]);
     let (_, out) = through(&request(&extra, &[], &[]));
@@ -144,15 +125,15 @@ fn events_and_links_are_repaired_or_dropped_and_counted() {
 #[test]
 fn resource_and_scope_are_repaired() {
     let resource = concat(&[
-        &ld(1, &kv_bytes("host.name", &ld(1, &SURROGATE))),
-        &ld(1, &kv_bytes("deep", &nested(70))),
-        &ld(1, &kv_bytes("ok", &ld(1, b"v"))),
+        &ld(1, &kv_bytes(b"host.name", &ld(1, &SURROGATE))),
+        &ld(1, &kv_bytes(b"deep", &nested(70))),
+        &ld(1, &kv_bytes(b"ok", &ld(1, b"v"))),
         &vf(2, 2),
     ]);
     let scope = concat(&[
         &ld(1, b"lib"),
-        &ld(3, &kv_bytes("a", &ld(1, &SURROGATE))),
-        &ld(3, &kv_bytes("deep", &nested(70))),
+        &ld(3, &kv_bytes(b"a", &ld(1, &SURROGATE))),
+        &ld(3, &kv_bytes(b"deep", &nested(70))),
     ]);
     let (_, out) = through(&request(&[], &resource, &scope));
     let rs = &out.resource_spans[0];

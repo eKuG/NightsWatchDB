@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{concat, ld, varint, vf};
+use common::{concat, kv_bytes, ld, nested, prefixed, varint, vf};
 
 use nwdb_otlp::{write_attrs, write_events, write_links, write_resource};
 use std::io::{self, Write};
@@ -82,31 +82,9 @@ fn measure(f: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> (isize, usize) {
     (PEAK.load(Ordering::SeqCst) - base, c.0)
 }
 
-fn prefixed(items: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for m in items {
-        out.extend(varint(m.len() as u64));
-        out.extend_from_slice(m);
-    }
-    out
-}
-
 fn repeat(item: &[u8], bytes: usize) -> Vec<u8> {
     let one = prefixed(&[item.to_vec()]);
     one.repeat(bytes / one.len())
-}
-
-fn kv(key: &[u8], value: &[u8]) -> Vec<u8> {
-    concat(&[&ld(1, key), &ld(2, value)])
-}
-
-/// An `AnyValue` holding `levels` arrays inside each other, around an int.
-fn nested(levels: usize) -> Vec<u8> {
-    let mut v = vf(3, 1);
-    for _ in 0..levels {
-        v = ld(5, &ld(1, &v));
-    }
-    v
 }
 
 #[test]
@@ -120,7 +98,7 @@ fn the_json_writers_need_a_constant_amount_of_memory() {
         .flat_map(|i| {
             ld(
                 3,
-                &kv(format!("key{i}").as_bytes(), &ld(1, b"some text value")),
+                &kv_bytes(format!("key{i}").as_bytes(), &ld(1, b"some text value")),
             )
         })
         .collect();
@@ -132,15 +110,15 @@ fn the_json_writers_need_a_constant_amount_of_memory() {
     );
     // Values nested as deeply as accepted, many times, and one hostile column
     // far deeper than that.
-    let deep = repeat(&kv(b"deep", &nested(63)), 6 * mb);
-    let hostile = prefixed(&[kv(b"deep", &nested(20_000))]);
+    let deep = repeat(&kv_bytes(b"deep", &nested(63)), 6 * mb);
+    let hostile = prefixed(&[kv_bytes(b"deep", &nested(20_000))]);
     // One string of several megabytes, valid and not.
-    let long = prefixed(&[kv(b"long", &ld(1, &vec![b'a'; 6 * mb]))]);
-    let broken = prefixed(&[kv(b"long", &ld(1, &vec![0xff; 6 * mb]))]);
+    let long = prefixed(&[kv_bytes(b"long", &ld(1, &vec![b'a'; 6 * mb]))]);
+    let broken = prefixed(&[kv_bytes(b"long", &ld(1, &vec![0xff; 6 * mb]))]);
     // Bytes that are not messages at all.
     let junk = vec![0xffu8; 6 * mb];
     // A resource with many attributes.
-    let resource = repeat_field(&kv(b"k", &ld(1, b"v")), 1, 6 * mb);
+    let resource = repeat_field(&kv_bytes(b"k", &ld(1, b"v")), 1, 6 * mb);
 
     type W = fn(&mut dyn Write, &[u8]) -> io::Result<()>;
     let cases: Vec<(&str, W, &[u8])> = vec![

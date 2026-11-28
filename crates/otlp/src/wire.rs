@@ -199,11 +199,4 @@ pub(crate) fn utf8(b: &[u8]) -> R<&str> {
     std::str::from_utf8(b).map_err(|_| Fault::new("invalid UTF-8"))
 }
 
-/// Appends `v` as a protobuf varint.
-pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
+pub(crate) use nwdb_core::put_varint;
