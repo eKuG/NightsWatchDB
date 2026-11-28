@@ -6,6 +6,16 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
+/// Replaces `mine` with `theirs` if `theirs` is non-null and `mine` is null or
+/// larger.
+fn keep_smaller(mine: &mut Option<String>, theirs: Option<&str>) {
+    if let Some(t) = theirs
+        && mine.as_deref().is_none_or(|m| t < m)
+    {
+        *mine = Some(t.to_owned());
+    }
+}
+
 /// What is known about a whole trace, derived from all of its spans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceSummary {
@@ -76,15 +86,8 @@ impl TraceSummary {
             self.root_name = other.root_name.clone();
             self.root_service = other.root_service.clone();
         }
-        let smaller = |mine: &mut Option<String>, theirs: &Option<String>| {
-            if let Some(t) = theirs
-                && mine.as_ref().is_none_or(|m| t < m)
-            {
-                *mine = Some(t.clone());
-            }
-        };
-        smaller(&mut self.session_id, &other.session_id);
-        smaller(&mut self.user_id, &other.user_id);
+        keep_smaller(&mut self.session_id, other.session_id.as_deref());
+        keep_smaller(&mut self.user_id, other.user_id.as_deref());
 
         self.start_ns = self.start_ns.min(other.start_ns);
         self.end_ns = self.end_ns.max(other.end_ns);
@@ -241,16 +244,8 @@ impl SummaryBuilder {
         {
             acc.models.insert(m.to_owned());
         }
-        for (mine, theirs) in [
-            (&mut acc.session_id, s.session_id),
-            (&mut acc.user_id, s.user_id),
-        ] {
-            if let Some(t) = theirs
-                && mine.as_deref().is_none_or(|m| t < m)
-            {
-                *mine = Some(t.to_owned());
-            }
-        }
+        keep_smaller(&mut acc.session_id, s.session_id);
+        keep_smaller(&mut acc.user_id, s.user_id);
         Ok(())
     }
 

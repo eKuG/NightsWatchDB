@@ -16,6 +16,7 @@
 //! - The per-trace summary ([`TraceSummary`], [`SummaryBuilder`],
 //!   [`summary_schema`]) and its batch form ([`SummaryBatchBuilder`],
 //!   [`SummaryColumns`]).
+//! - Two small helpers several crates need: [`put_varint`] and [`lock`].
 //! - The metadata record that describes one immutable part ([`PartMeta`]).
 //! - The interface between ingest doors and the engine for replaying the
 //!   write-ahead log ([`RecordDecoder`]).
@@ -48,6 +49,7 @@ mod record;
 mod schema;
 mod summary;
 mod summary_batch;
+mod util;
 mod window;
 
 pub use builder::SpanBatchBuilder;
@@ -63,4 +65,5 @@ pub use record::SpanRecord;
 pub use schema::{col, span_schema};
 pub use summary::{SummaryBuilder, TraceSummary, summary_schema};
 pub use summary_batch::{SummaryBatchBuilder, SummaryColumns};
+pub use util::{lock, put_varint};
 pub use window::{DEFAULT_WINDOW_NS, window_start};

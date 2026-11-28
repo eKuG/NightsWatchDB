@@ -44,6 +44,21 @@ impl Error {
         Self::Corrupt(msg.to_string())
     }
 
+    /// Builds [`Error::Corrupt`] with the message `"{file}: {msg}"`.
+    pub fn corrupt_in(file: impl Display, msg: impl Display) -> Self {
+        Self::corrupt(format!("{file}: {msg}"))
+    }
+
+    /// Maps the failure to open the file `name` of a part: a missing file is
+    /// [`Error::Corrupt`] (the part is incomplete), anything else
+    /// [`Error::Io`].
+    pub fn part_file_open(name: impl Display, e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => Self::corrupt_in(name, "file is missing from the part"),
+            _ => Self::Io(e),
+        }
+    }
+
     /// Builds [`Error::InvalidArgument`].
     pub fn invalid_argument(msg: impl Display) -> Self {
         Self::InvalidArgument(msg.to_string())
@@ -92,6 +107,17 @@ mod tests {
             Error::invalid_argument("x"),
             Error::InvalidArgument(_)
         ));
+        assert_eq!(
+            Error::corrupt_in("f", "x").to_string(),
+            "corrupt data: f: x"
+        );
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            Error::part_file_open("f", gone).to_string(),
+            "corrupt data: f: file is missing from the part"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(Error::part_file_open("f", denied), Error::Io(_)));
         assert!(matches!(Error::not_found("x"), Error::NotFound(_)));
         assert!(matches!(Error::conflict("x"), Error::Conflict(_)));
         assert_eq!(Error::fatal("x").to_string(), "fatal: x");

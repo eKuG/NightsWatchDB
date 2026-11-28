@@ -1,4 +1,5 @@
 use crate::origin::{ORIGIN_COLUMNS, slot};
+use crate::schema::check_batch;
 use crate::{Error, Origin, Result, SpanId, SpanRecord, TraceId, span_schema};
 use arrow_array::types::Int32Type;
 use arrow_array::{
@@ -51,7 +52,6 @@ impl<V> Dict<'_, V> {
 /// read from them is resolved through the batch's own dictionary.
 #[derive(Clone, Copy)]
 pub struct SpanColumns<'a> {
-    batch: &'a RecordBatch,
     trace_id: &'a FixedSizeBinaryArray,
     span_id: &'a FixedSizeBinaryArray,
     parent_span_id: &'a FixedSizeBinaryArray,
@@ -114,39 +114,7 @@ impl<'a> SpanColumns<'a> {
     ///
     /// Returns [`Error::InvalidArgument`] naming the first offending column.
     pub fn try_new(batch: &'a RecordBatch) -> Result<Self> {
-        let schema = span_schema();
-        if batch.num_columns() != schema.fields().len() {
-            return Err(Error::invalid_argument(format!(
-                "span batch has {} columns, expected {}",
-                batch.num_columns(),
-                schema.fields().len()
-            )));
-        }
-        for (i, want) in schema.fields().iter().enumerate() {
-            let have = batch.schema_ref().field(i);
-            if have.name() != want.name() {
-                return Err(Error::invalid_argument(format!(
-                    "span batch column {i} is `{}`, expected `{}`",
-                    have.name(),
-                    want.name()
-                )));
-            }
-            let array = batch.column(i);
-            if array.data_type() != want.data_type() {
-                return Err(Error::invalid_argument(format!(
-                    "span batch column `{}` has type {}, expected {}",
-                    want.name(),
-                    array.data_type(),
-                    want.data_type()
-                )));
-            }
-            if !want.is_nullable() && array.null_count() > 0 {
-                return Err(Error::invalid_argument(format!(
-                    "span batch column `{}` must not contain nulls",
-                    want.name()
-                )));
-            }
-        }
+        check_batch("span", &span_schema(), batch)?;
 
         // Types were verified above, so the downcasts cannot fail.
         fn get<'b, T: 'static>(batch: &'b RecordBatch, name: &str) -> Result<&'b T> {
@@ -177,7 +145,6 @@ impl<'a> SpanColumns<'a> {
         }
         use crate::col;
         Ok(Self {
-            batch,
             trace_id: get(batch, col::TRACE_ID)?,
             span_id: get(batch, col::SPAN_ID)?,
             parent_span_id: get(batch, col::PARENT_SPAN_ID)?,
@@ -218,14 +185,9 @@ impl<'a> SpanColumns<'a> {
         })
     }
 
-    /// The batch these columns read from.
-    pub fn batch(&self) -> &'a RecordBatch {
-        self.batch
-    }
-
     /// Number of rows.
     pub fn len(&self) -> usize {
-        self.batch.num_rows()
+        self.trace_id.len()
     }
 
     /// True if the batch has no rows.
@@ -261,15 +223,7 @@ impl<'a> SpanColumns<'a> {
     ///
     /// Panics if `row >= self.len()`.
     pub fn origin(&self, row: usize) -> Origin<'a> {
-        Origin {
-            resource: self.resource.get(row),
-            service_name: self.service_name.get(row),
-            resource_schema_url: self.resource_schema_url.get(row),
-            scope: self.scope.get(row),
-            scope_name: self.scope_name.get(row),
-            scope_version: self.scope_version.get(row),
-            scope_schema_url: self.scope_schema_url.get(row),
-        }
+        Origin::of(&self.record(row))
     }
 
     /// Reads one row, borrowing its values from the batch.

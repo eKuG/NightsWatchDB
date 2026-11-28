@@ -3,6 +3,7 @@
 //! [`SpanBatchBuilder`](crate::SpanBatchBuilder) and
 //! [`SpanColumns`](crate::SpanColumns).
 
+use crate::schema::check_batch;
 use crate::{Error, Result, TraceId, TraceSummary, summary_schema};
 use arrow_array::builder::{
     BooleanBuilder, FixedSizeBinaryBuilder, Int64Builder, ListBuilder, StringBuilder, UInt32Builder,
@@ -123,7 +124,6 @@ impl SummaryBatchBuilder {
 /// afterwards cannot fail.
 #[derive(Debug, Clone, Copy)]
 pub struct SummaryColumns<'a> {
-    batch: &'a RecordBatch,
     trace_id: &'a FixedSizeBinaryArray,
     start_ns: &'a Int64Array,
     end_ns: &'a Int64Array,
@@ -153,39 +153,7 @@ impl<'a> SummaryColumns<'a> {
     ///
     /// Returns [`Error::InvalidArgument`] naming the first offending column.
     pub fn try_new(batch: &'a RecordBatch) -> Result<Self> {
-        let schema = summary_schema();
-        if batch.num_columns() != schema.fields().len() {
-            return Err(Error::invalid_argument(format!(
-                "summary batch has {} columns, expected {}",
-                batch.num_columns(),
-                schema.fields().len()
-            )));
-        }
-        for (i, want) in schema.fields().iter().enumerate() {
-            let have = batch.schema_ref().field(i);
-            if have.name() != want.name() {
-                return Err(Error::invalid_argument(format!(
-                    "summary batch column {i} is `{}`, expected `{}`",
-                    have.name(),
-                    want.name()
-                )));
-            }
-            let array = batch.column(i);
-            if array.data_type() != want.data_type() {
-                return Err(Error::invalid_argument(format!(
-                    "summary batch column `{}` has type {}, expected {}",
-                    want.name(),
-                    array.data_type(),
-                    want.data_type()
-                )));
-            }
-            if !want.is_nullable() && array.null_count() > 0 {
-                return Err(Error::invalid_argument(format!(
-                    "summary batch column `{}` must not contain nulls",
-                    want.name()
-                )));
-            }
-        }
+        check_batch("summary", &summary_schema(), batch)?;
 
         // Types were verified above, so the downcasts cannot fail.
         fn get<T: 'static>(batch: &RecordBatch, i: usize) -> Result<&T> {
@@ -196,7 +164,6 @@ impl<'a> SummaryColumns<'a> {
                 .ok_or_else(|| Error::invalid_argument(format!("summary batch column {i}")))
         }
         Ok(Self {
-            batch,
             trace_id: get(batch, 0)?,
             start_ns: get(batch, 1)?,
             end_ns: get(batch, 2)?,
@@ -212,14 +179,9 @@ impl<'a> SummaryColumns<'a> {
         })
     }
 
-    /// The batch these columns read from.
-    pub fn batch(&self) -> &'a RecordBatch {
-        self.batch
-    }
-
     /// Number of rows.
     pub fn len(&self) -> usize {
-        self.batch.num_rows()
+        self.trace_id.len()
     }
 
     /// True if the batch has no rows.
@@ -309,7 +271,7 @@ mod tests {
         let batch = b.finish();
         let cols = SummaryColumns::try_new(&batch).unwrap();
         assert_eq!(cols.summary(0), sample(2));
-        assert_eq!(cols.batch().num_rows(), 1);
+        assert_eq!(cols.len(), 1);
     }
 
     #[test]

@@ -74,6 +74,8 @@
 //! Core does not parse these bytes; the ingest crates write them and the
 //! query layer reads them.
 
+use crate::{Error, Result};
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::{Arc, OnceLock};
 
@@ -127,6 +129,45 @@ pub mod col {
         DROPPED_LINKS_COUNT = "dropped_links_count",
         ARRIVAL = "arrival",
     }
+}
+
+/// Checks that `batch` has `schema`'s columns in order, with its names and
+/// data types, and no nulls in a column `schema` declares non-nullable.
+/// `what` ("span" or "summary") starts every message.
+pub(crate) fn check_batch(what: &str, schema: &SchemaRef, batch: &RecordBatch) -> Result<()> {
+    if batch.num_columns() != schema.fields().len() {
+        return Err(Error::invalid_argument(format!(
+            "{what} batch has {} columns, expected {}",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
+    }
+    for (i, want) in schema.fields().iter().enumerate() {
+        let have = batch.schema_ref().field(i);
+        if have.name() != want.name() {
+            return Err(Error::invalid_argument(format!(
+                "{what} batch column {i} is `{}`, expected `{}`",
+                have.name(),
+                want.name()
+            )));
+        }
+        let array = batch.column(i);
+        if array.data_type() != want.data_type() {
+            return Err(Error::invalid_argument(format!(
+                "{what} batch column `{}` has type {}, expected {}",
+                want.name(),
+                array.data_type(),
+                want.data_type()
+            )));
+        }
+        if !want.is_nullable() && array.null_count() > 0 {
+            return Err(Error::invalid_argument(format!(
+                "{what} batch column `{}` must not contain nulls",
+                want.name()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The Arrow schema of the span table. Built once and shared.
