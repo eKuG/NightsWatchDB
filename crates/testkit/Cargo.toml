@@ -1,0 +1,20 @@
+[package]
+name = "nwdb-testkit"
+description = "Test support shared by the NightsWatchDB crates: a counting allocator, resident memory readers, a polling wait and small builders. Used only as a dev-dependency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+rust-version.workspace = true
+
+[dependencies]
+nwdb-core = { path = "../core" }
+
+[lints.rust]
+# The counting allocator implements `GlobalAlloc`, which is an unsafe trait.
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

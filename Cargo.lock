@@ -872,6 +872,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nwdb-testkit"
+version = "0.0.1"
+dependencies = [
+ "nwdb-core",
+]
+
+[[package]]
 name = "nwdb-textindex"
 version = "0.0.1"
 dependencies = [
