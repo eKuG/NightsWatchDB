@@ -14,6 +14,7 @@ mod support;
 
 use nwdb_core::part_dir_name;
 use nwdb_segment::{Annotation, AnnotationReader, merge_annotation_parts};
+use nwdb_testkit::mem::peak as resident;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::os::unix::fs::FileExt;
@@ -27,17 +28,6 @@ const NAME: &str = "the_merge_does_not_grow_with_the_inputs";
 const PARTS: u64 = 8;
 /// Records per input: about 4 KiB each, so 2 MiB and 8 MiB an input.
 const RECORDS: [u128; 2] = [500, 2000];
-
-fn resident() -> usize {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
-    line.split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse::<usize>()
-        .unwrap()
-        * 1024
-}
 
 /// Inputs of two kinds of identity, so that three quarters of the records are superseded:
 /// the even inputs hold the even traces, the odd inputs the odd ones, and

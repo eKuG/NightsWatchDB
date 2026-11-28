@@ -260,11 +260,11 @@ fn a_buffer_of_only_annotations_is_flushed_by_age() {
     o.flush_interval = Duration::from_millis(100);
     let e = open(o);
     ingest(&e, &one(1)).unwrap();
-    wait_with_timeout("the spans are flushed", Duration::from_secs(30), || {
+    nwdb_testkit::wait_for("the spans are flushed", Duration::from_secs(30), || {
         e.stats().parts == 1
     });
     annotate(&e, vec![score(1, None, "q", "s", 1.0)]);
-    wait_with_timeout(
+    nwdb_testkit::wait_for(
         "the annotations are flushed",
         Duration::from_secs(30),
         || e.stats().annotation_parts == 1,
@@ -288,7 +288,7 @@ fn a_buffer_of_only_annotations_is_flushed_by_size() {
         .map(|i| score(1, None, &format!("n{i}"), "s", f64::from(i)))
         .collect();
     annotate(&e, items);
-    wait_with_timeout(
+    nwdb_testkit::wait_for(
         "the annotations are flushed by size",
         Duration::from_secs(30),
         || e.stats().annotation_parts == 1,
